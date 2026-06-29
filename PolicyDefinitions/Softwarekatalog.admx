@@ -43,32 +43,8 @@
             <decimal value="0" />
           </falseValue>
         </boolean>
-      </elements>
-    </policy>
-    <policy name="Softwarekatalog_Catalog" class="Machine" displayName="$(string.Softwarekatalog_Catalog)" explainText="$(string.Softwarekatalog_Catalog_Help)" key="Software\Policies\STL\Softwarekatalog" valueName="CatalogPolicy" presentation="$(presentation.Softwarekatalog_Catalog)">
-      <parentCategory ref="Softwarekatalog" />
-      <supportedOn ref="windows:SUPPORTED_Windows7" />
-      <enabledValue>
-        <decimal value="1" />
-      </enabledValue>
-      <disabledValue>
-        <decimal value="0" />
-      </disabledValue>
-      <elements>
-        <list id="Catalog" key="Software\Policies\STL\Softwarekatalog\Catalog" valuePrefix="Catalog" additive="false" explicitValue="true" required="false" />
-      </elements>
-    </policy>
-    <policy name="Softwarekatalog_Required" class="Machine" displayName="$(string.Softwarekatalog_Required)" explainText="$(string.Softwarekatalog_Required_Help)" key="Software\Policies\STL\Softwarekatalog" valueName="RequiredPolicy" presentation="$(presentation.Softwarekatalog_Required)">
-      <parentCategory ref="Softwarekatalog" />
-      <supportedOn ref="windows:SUPPORTED_Windows7" />
-      <enabledValue>
-        <decimal value="1" />
-      </enabledValue>
-      <disabledValue>
-        <decimal value="0" />
-      </disabledValue>
-      <elements>
-        <list id="Required" key="Software\Policies\STL\Softwarekatalog\Required" valuePrefix="Required" additive="false" explicitValue="true" required="false" />
+        <list id="Catalog" key="Software\Policies\STL\Softwarekatalog\Catalog" additive="false" explicitValue="true" required="false" />
+        <list id="Required" key="Software\Policies\STL\Softwarekatalog\Required" additive="false" explicitValue="true" required="false" />
       </elements>
     </policy>
   </policies>
