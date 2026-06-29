@@ -17,7 +17,7 @@ cat > "$out" <<EOF
 # ASCII-only bootstrap generated from setup.ps1. Do not edit.
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessRequest')]
+    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessQueue','ProcessRequest')]
     [string]\$Mode = 'Install',
     [ValidateSet('Install','Uninstall')]
     [string]\$RequestAction = 'Install',

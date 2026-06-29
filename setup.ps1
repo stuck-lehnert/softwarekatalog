@@ -3,7 +3,7 @@ SelfServiceWinget.ps1
 
 Use as:
 - Computer Startup GPO script (default mode = Install)
-- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy / ProcessRequest)
+- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy / ProcessQueue / ProcessRequest)
 
 Behavior:
 User -> GUI / request helper -> named pipe -> daemon task (SYSTEM) -> winget install --scope machine
@@ -20,7 +20,7 @@ C:\ProgramData\__Softwarekatalog\
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessRequest')]
+    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessQueue','ProcessRequest')]
     [string]$Mode = 'Install',
     [ValidateSet('Install','Uninstall')]
     [string]$RequestAction = 'Install',
@@ -42,6 +42,7 @@ $RequestToolPath        = Join-Path $BaseDir 'Request-App.ps1'
 $CatalogGuiPath         = Join-Path $BaseDir 'Software-Catalog.ps1'
 $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
+$QueueStatePath         = Join-Path $BaseDir 'Queue-State.json'
 $LogDir                 = Join-Path $BaseDir 'Logs'
 $LogFile                = Join-Path $LogDir 'service.log'
 $PolicyRoot             = 'HKLM:\Software\Policies\STL\Softwarekatalog'
@@ -53,6 +54,7 @@ $DaemonTaskName         = 'Softwarekatalog - Daemon'
 $UpgradeTaskName        = 'Softwarekatalog - Winget Upgrade'
 $PipeName               = 'Softwarekatalog'
 $WingetMutexName        = 'Global\Softwarekatalog-Winget'
+$QueueStateMutexName    = 'Global\Softwarekatalog-QueueState'
 $PowerShellExe          = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $WScriptExe             = Join-Path $env:SystemRoot 'System32\wscript.exe'
 $AppInstallerFamilyName = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
@@ -340,6 +342,274 @@ function Write-TextFile {
     [System.IO.File]::WriteAllText($Path, $Content, $textEncoding)
 }
 
+function New-QueueStateObject {
+    [pscustomobject][ordered]@{
+        Version = 0
+        UpdatedAt = (Get-Date).ToString('o')
+        Current = $null
+        Queue = @()
+    }
+}
+
+function Read-QueueState {
+    if (-not (Test-Path -LiteralPath $QueueStatePath)) {
+        return New-QueueStateObject
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $QueueStatePath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return New-QueueStateObject
+        }
+
+        $state = $raw | ConvertFrom-Json
+        if (-not $state.PSObject.Properties['Version']) { $state | Add-Member -NotePropertyName Version -NotePropertyValue 0 }
+        if (-not $state.PSObject.Properties['UpdatedAt']) { $state | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue (Get-Date).ToString('o') }
+        if (-not $state.PSObject.Properties['Current']) { $state | Add-Member -NotePropertyName Current -NotePropertyValue $null }
+        if (-not $state.PSObject.Properties['Queue']) {
+            $state | Add-Member -NotePropertyName Queue -NotePropertyValue @()
+        }
+        elseif (-not $state.Queue) {
+            $state.Queue = @()
+        }
+        return $state
+    }
+    catch {
+        Write-Log "Failed to read queue state: $($_.Exception.Message)" 'WARN'
+        return New-QueueStateObject
+    }
+}
+
+function Write-QueueState {
+    param([Parameter(Mandatory)]$State)
+
+    Ensure-Directory -Path $BaseDir
+    $tempPath = Join-Path $BaseDir ("Queue-State-{0}.json.tmp" -f [Guid]::NewGuid().ToString('N'))
+    try {
+        $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $QueueStatePath -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-WithQueueStateLock {
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+
+    $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
+    $hasLock = $false
+    try {
+        $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+        if (-not $hasLock) {
+            throw "Timed out waiting for queue state lock '$QueueStateMutexName'."
+        }
+
+        & $ScriptBlock
+    }
+    finally {
+        if ($hasLock) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Update-QueueState {
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+
+    Invoke-WithQueueStateLock -ScriptBlock {
+        $state = Read-QueueState
+        & $ScriptBlock $state
+        $state.Version = [int64]$state.Version + 1
+        $state.UpdatedAt = (Get-Date).ToString('o')
+        Write-QueueState -State $state
+        return $state
+    }
+}
+
+function Get-QueueStateSnapshot {
+    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState }
+}
+
+function New-QueueItem {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Install','Uninstall','UpgradeAll')][string]$Action,
+        [string]$Alias,
+        [string]$PackageId,
+        [string]$DisplayName,
+        [ValidateSet('User','Required','System')][string]$Source = 'User',
+        [bool]$Required = $false,
+        [string]$RequestedBy,
+        [string]$RequestedBySid
+    )
+
+    [pscustomobject][ordered]@{
+        Id = [Guid]::NewGuid().ToString('N')
+        Action = $Action
+        Alias = $Alias
+        PackageId = $PackageId
+        DisplayName = $DisplayName
+        Source = $Source
+        Required = [bool]$Required
+        RequestedBy = $RequestedBy
+        RequestedBySid = $RequestedBySid
+        State = 'Queued'
+        Stage = 'Queued'
+        StageText = 'In Warteschlange'
+        ProgressPercent = $null
+        IsIndeterminate = $false
+        CreatedAt = (Get-Date).ToString('o')
+        StartedAt = $null
+        FinishedAt = $null
+        ExitCode = $null
+        Message = $null
+    }
+}
+
+function Get-ProgressPercentFromLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    $match = [regex]::Match($Line, '(?<!\d)(100|[1-9]?\d)(?:[\.,]\d+)?\s*%')
+    if (-not $match.Success) { return $null }
+    $raw = $match.Groups[1].Value
+    $value = [int]$raw
+    if ($value -lt 0) { return 0 }
+    if ($value -gt 100) { return 100 }
+    return $value
+}
+
+function Update-QueueItemProgress {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [string]$Stage = 'Running',
+        [string]$StageText = 'Aktion läuft...',
+        [Nullable[int]]$ProgressPercent,
+        [bool]$IsIndeterminate = $true
+    )
+
+    $null = Update-QueueState -ScriptBlock {
+        param($state)
+        foreach ($item in @($state.Queue)) {
+            if (-not $item) { continue }
+            if ($item.Id -eq $Id) {
+                $item.Stage = $Stage
+                $item.StageText = $StageText
+                $item.ProgressPercent = $ProgressPercent
+                $item.IsIndeterminate = $IsIndeterminate
+                $state.Current = [pscustomobject][ordered]@{
+                    Id = $item.Id
+                    Action = $item.Action
+                    Alias = $item.Alias
+                    DisplayName = $item.DisplayName
+                    Stage = $Stage
+                    StageText = $StageText
+                    ProgressPercent = $ProgressPercent
+                    IsIndeterminate = $IsIndeterminate
+                }
+                break
+            }
+        }
+    }
+}
+
+function Get-RequiredAliasSet {
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($alias in @(Get-RequiredAliases)) {
+        if (-not [string]::IsNullOrWhiteSpace($alias)) {
+            [void]$set.Add([string]$alias)
+        }
+    }
+    return $set
+}
+
+function Add-QueueItem {
+    param([Parameter(Mandatory)]$Item)
+
+    $result = $null
+    $null = Update-QueueState -ScriptBlock {
+        param($state)
+        $queue = @($state.Queue)
+
+        foreach ($existing in $queue) {
+            if (-not $existing) { continue }
+            if ($existing.State -in @('Queued','Running') -and $existing.Action -eq $Item.Action -and [string]::Equals([string]$existing.Alias, [string]$Item.Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $script:QueueAddResult = [pscustomobject]@{ Added = $false; Item = $existing }
+                return
+            }
+        }
+
+        $state.Queue = @($queue + $Item)
+        $script:QueueAddResult = [pscustomobject]@{ Added = $true; Item = $Item }
+    }
+
+    $result = $script:QueueAddResult
+    $script:QueueAddResult = $null
+    return $result
+}
+
+function Add-SoftwareRequestToQueue {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Install','Uninstall')][string]$Action,
+        [Parameter(Mandatory)][string]$Alias,
+        [string]$RequestedBy,
+        [string]$RequestedBySid,
+        [ValidateSet('User','Required')][string]$Source = 'User'
+    )
+
+    $normalizedAlias = $Alias.Trim().ToLowerInvariant()
+    $app = Get-AppCatalogObjectByAlias -Alias $normalizedAlias
+    if (-not $app) {
+        throw "Alias '$normalizedAlias' is not in the allowlist."
+    }
+
+    $requiredSet = Get-RequiredAliasSet
+    $isRequired = $requiredSet.Contains($normalizedAlias)
+    if ($Action -eq 'Uninstall' -and $isRequired) {
+        throw 'Pflichtsoftware kann nicht zur Deinstallation angefragt werden.'
+    }
+
+    $item = New-QueueItem `
+        -Action $Action `
+        -Alias $normalizedAlias `
+        -PackageId ([string]$app.PackageId) `
+        -DisplayName ([string]$app.DisplayName) `
+        -Source $Source `
+        -Required:$isRequired `
+        -RequestedBy $RequestedBy `
+        -RequestedBySid $RequestedBySid
+
+    return Add-QueueItem -Item $item
+}
+
+function Ensure-RequiredSoftwareQueued {
+    $addedCount = 0
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return 0 }
+    if (-not (Test-RequiredEnforcementEnabled)) { return 0 }
+
+    $installedSet = Get-InstalledPackageIdSet
+    foreach ($alias in @(Get-RequiredAliases)) {
+        $app = Get-AppCatalogObjectByAlias -Alias $alias
+        if (-not $app) {
+            Write-Log "Required alias '$alias' is not present in catalog policy; skipping." 'WARN'
+            continue
+        }
+
+        if ($installedSet.Contains([string]$app.PackageId)) {
+            continue
+        }
+
+        $result = Add-SoftwareRequestToQueue -Action Install -Alias $alias -RequestedBy 'Policy' -RequestedBySid 'Policy' -Source Required
+        if ($result -and $result.Added) {
+            $addedCount++
+            Write-Log "Queued required software alias '$alias' package '$($app.PackageId)'."
+        }
+    }
+
+    return $addedCount
+}
+
 function Invoke-WithWingetLock {
     param(
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
@@ -405,7 +675,7 @@ function Get-WorkerScriptPath {
 
 function Start-SoftwarekatalogWorker {
     param(
-        [Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessRequest')][string]$WorkerMode,
+        [Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessRequest','ProcessQueue')][string]$WorkerMode,
         [ValidateSet('Install','Uninstall')][string]$WorkerAction = 'Install',
         [string]$WorkerAlias,
         [string]$WorkerRequestedBy,
@@ -434,6 +704,10 @@ function Start-SoftwarekatalogWorker {
 
     $argumentLine = (@($args) | ForEach-Object { ConvertTo-ProcessArgument -Value ([string]$_) }) -join ' '
     Start-Process -FilePath $PowerShellExe -ArgumentList $argumentLine -WindowStyle Hidden | Out-Null
+}
+
+function Start-QueueWorker {
+    Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
 }
 
 function Get-WingetPath {
@@ -614,10 +888,10 @@ if (-not `$AppAlias) {
 `$response = Invoke-CatalogDaemon -Command `$Action -Alias `$alias
 
 if (`$Action -eq 'Uninstall') {
-    Write-Host "Deinstallation für '`$alias' gestartet."
+    Write-Host "Deinstallation für '`$alias' eingereiht."
 }
 else {
-    Write-Host "Installation für '`$alias' gestartet."
+    Write-Host "Installation für '`$alias' eingereiht."
 }
 
 if (`$response.Message) {
@@ -634,6 +908,7 @@ function New-CatalogGui {
     $titleLiteral     = $CatalogDisplayName.Replace("'", "''")
     $logLiteral       = $LogFile.Replace("'", "''")
     $installedLiteral = $InstalledPackagesPath.Replace("'", "''")
+    $queueStateLiteral = $QueueStatePath.Replace("'", "''")
 
 $content = @"
 Add-Type -AssemblyName System.Windows.Forms
@@ -693,8 +968,14 @@ Set-StrictMode -Version Latest
 `$CatalogTitle = '$titleLiteral'
 `$LogFile = '$logLiteral'
 `$InstalledPackagesPath = '$installedLiteral'
+`$QueueStatePath = '$queueStateLiteral'
 `$AllowUserInstalls = `$true
 `$AllowUserUninstall = `$true
+`$RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+`$LastStateVersion = -1
+`$LastQueue = @()
+`$LastCurrent = `$null
+`$LastInstalledIds = @()
 
 function Set-FormIcon {
     param([Parameter(Mandatory=`$true)]`$Form)
@@ -802,9 +1083,19 @@ function New-AppRequest {
 }
 
 function Get-CatalogApps {
-    `$response = Invoke-CatalogDaemon -Command 'GetCatalog'
+    `$response = Invoke-CatalogDaemon -Command 'GetState'
     `$script:AllowUserInstalls = [bool]`$response.AllowUserInstalls
     `$script:AllowUserUninstall = [bool]`$response.AllowUserUninstall
+    `$script:RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach (`$alias in @(`$response.RequiredAliases)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]`$alias)) {
+            [void]`$script:RequiredAliasSet.Add([string]`$alias)
+        }
+    }
+    `$script:LastStateVersion = [int64]`$response.Version
+    if (`$response.Queue) { `$script:LastQueue = @(`$response.Queue) } else { `$script:LastQueue = @() }
+    `$script:LastCurrent = `$response.Current
+    if (`$response.InstalledPackageIds) { `$script:LastInstalledIds = @(`$response.InstalledPackageIds) } else { `$script:LastInstalledIds = @() }
     return @(`$response.Catalog)
 }
 
@@ -844,11 +1135,29 @@ function Get-InstalledPackageState {
 function Get-AppStatus {
     param(
         [Parameter(Mandatory=`$true)]`$App,
-        [Parameter(Mandatory=`$true)]`$InstalledSet
+        [Parameter(Mandatory=`$true)]`$InstalledSet,
+        [Parameter(Mandatory=`$true)]`$QueueItems
     )
+
+    foreach (`$queued in @(`$QueueItems)) {
+        if (-not `$queued) { continue }
+        if (`$queued.State -in @('Queued','Running') -and [string]::Equals([string]`$queued.Alias, [string]`$App.Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (`$queued.State -eq 'Running') {
+                if (`$queued.Action -eq 'Uninstall') { return 'Wird deinstalliert' }
+                return 'Wird installiert'
+            }
+
+            if (`$queued.Action -eq 'Uninstall') { return 'Deinstallation in Warteschlange' }
+            return 'In Warteschlange'
+        }
+    }
 
     if (`$InstalledSet.Contains(`$App.PackageId)) {
         return 'Installiert'
+    }
+
+    if (`$script:RequiredAliasSet.Contains([string]`$App.Alias)) {
+        return 'In Warteschlange'
     }
 
     return 'Installierbar'
@@ -867,14 +1176,14 @@ Set-FormIcon -Form `$form
 
 `$headerPanel = New-Object System.Windows.Forms.Panel
 `$headerPanel.Location = New-Object System.Drawing.Point(12, 12)
-`$headerPanel.Size = New-Object System.Drawing.Size(940, 84)
+`$headerPanel.Size = New-Object System.Drawing.Size(940, 52)
 `$headerPanel.Anchor = 'Top, Left, Right'
 `$headerPanel.BackColor = [System.Drawing.SystemColors]::Window
 `$headerPanel.BorderStyle = 'FixedSingle'
 
 `$headerAccent = New-Object System.Windows.Forms.Panel
 `$headerAccent.Location = New-Object System.Drawing.Point(0, 0)
-`$headerAccent.Size = New-Object System.Drawing.Size(6, 82)
+`$headerAccent.Size = New-Object System.Drawing.Size(6, 50)
 `$headerAccent.Anchor = 'Top, Left, Bottom'
 `$headerAccent.BackColor = [System.Drawing.ColorTranslator]::FromHtml('#0F6CBD')
 
@@ -888,8 +1197,8 @@ Set-FormIcon -Form `$form
 `$headerPanel.Controls.Add(`$headerTitle)
 
 `$groupApps = New-Object System.Windows.Forms.Panel
-`$groupApps.Location = New-Object System.Drawing.Point(12, 104)
-`$groupApps.Size = New-Object System.Drawing.Size(940, 352)
+`$groupApps.Location = New-Object System.Drawing.Point(12, 72)
+`$groupApps.Size = New-Object System.Drawing.Size(940, 384)
 `$groupApps.Anchor = 'Top, Left, Right, Bottom'
 `$groupApps.BackColor = [System.Drawing.SystemColors]::Window
 `$groupApps.BorderStyle = 'FixedSingle'
@@ -902,7 +1211,7 @@ Set-FormIcon -Form `$form
 
 `$list = New-Object System.Windows.Forms.ListView
 `$list.Location = New-Object System.Drawing.Point(12, 34)
-`$list.Size = New-Object System.Drawing.Size(916, 306)
+`$list.Size = New-Object System.Drawing.Size(916, 338)
 `$list.Anchor = 'Top, Left, Right, Bottom'
 `$list.View = 'Details'
 `$list.FullRowSelect = `$true
@@ -944,7 +1253,7 @@ function Sort-ListByColumn {
 
 `$infoPanel = New-Object System.Windows.Forms.Panel
 `$infoPanel.Location = New-Object System.Drawing.Point(12, 466)
-`$infoPanel.Size = New-Object System.Drawing.Size(940, 64)
+`$infoPanel.Size = New-Object System.Drawing.Size(940, 54)
 `$infoPanel.Anchor = 'Left, Right, Bottom'
 `$infoPanel.BorderStyle = 'FixedSingle'
 `$infoPanel.BackColor = [System.Drawing.SystemColors]::Window
@@ -956,7 +1265,7 @@ function Sort-ListByColumn {
 
 `$installedLabel = New-Object System.Windows.Forms.Label
 `$installedLabel.Location = New-Object System.Drawing.Point(10, 30)
-`$installedLabel.Size = New-Object System.Drawing.Size(914, 24)
+`$installedLabel.Size = New-Object System.Drawing.Size(914, 18)
 `$installedLabel.Text = 'Bereits installiert: keine'
 
 `$infoPanel.Controls.Add(`$snapshotLabel)
@@ -972,8 +1281,42 @@ function Update-InstallButtonState {
     `$selectedItem = `$list.SelectedItems[0]
     `$state = `$selectedItem.SubItems[2].Text
 
+    `$isRequired = `$script:RequiredAliasSet.Contains([string]`$selectedItem.SubItems[3].Text)
     `$btnInstall.Enabled = (`$script:AllowUserInstalls -and `$state -eq 'Installierbar')
-    `$btnUninstall.Enabled = (`$script:AllowUserUninstall -and `$state -eq 'Installiert')
+    `$btnUninstall.Enabled = (`$script:AllowUserUninstall -and -not `$isRequired -and `$state -eq 'Installiert')
+}
+
+function Update-ProgressArea {
+    `$current = `$script:LastCurrent
+    `$queuedCount = @(`$script:LastQueue | Where-Object { `$_ -and `$_.State -eq 'Queued' }).Count
+    if (`$current) {
+        `$label = [string]`$current.StageText
+        if ([string]::IsNullOrWhiteSpace(`$label)) { `$label = 'Aktion läuft...' }
+        `$status.Text = "{0} (Warteschlange: {1})" -f `$label, `$queuedCount
+        `$progressBar.Visible = `$true
+        if (`$current.IsIndeterminate -or `$null -eq `$current.ProgressPercent) {
+            `$progressBar.Style = 'Marquee'
+        }
+        else {
+            `$progressBar.Style = 'Continuous'
+            `$value = [int]`$current.ProgressPercent
+            if (`$value -lt 0) { `$value = 0 }
+            if (`$value -gt 100) { `$value = 100 }
+            `$progressBar.Value = `$value
+        }
+    }
+    elseif (`$queuedCount -gt 0) {
+        `$status.Text = "Warteschlange: {0}" -f `$queuedCount
+        `$progressBar.Visible = `$true
+        `$progressBar.Style = 'Continuous'
+        `$progressBar.Value = 0
+    }
+    else {
+        `$status.Text = 'Bereit.'
+        `$progressBar.Visible = `$false
+        `$progressBar.Style = 'Continuous'
+        `$progressBar.Value = 0
+    }
 }
 
 function Load-AppList {
@@ -988,7 +1331,10 @@ function Load-AppList {
 
         `$apps = Get-CatalogApps
         `$installedState = Get-InstalledPackageState
-        `$installedSet = `$installedState.PackageSet
+        `$installedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach (`$id in @(`$script:LastInstalledIds)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]`$id)) { [void]`$installedSet.Add([string]`$id) }
+        }
 
         if (-not `$installedSet) {
             `$installedSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -997,7 +1343,7 @@ function Load-AppList {
         `$installedNames = New-Object 'System.Collections.Generic.List[string]'
 
         foreach (`$app in (`$apps | Sort-Object DisplayName)) {
-            `$state = Get-AppStatus -App `$app -InstalledSet `$installedSet
+            `$state = Get-AppStatus -App `$app -InstalledSet `$installedSet -QueueItems `$script:LastQueue
 
             `$item = New-Object System.Windows.Forms.ListViewItem(`$app.DisplayName)
             [void]`$item.SubItems.Add(`$app.Description)
@@ -1009,6 +1355,12 @@ function Load-AppList {
             if (`$state -eq 'Installiert') {
                 `$item.ForeColor = [System.Drawing.Color]::DarkGreen
                 [void]`$installedNames.Add(`$app.DisplayName)
+            }
+            elseif (`$state -like '*Warteschlange') {
+                `$item.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+            }
+            elseif (`$state -like 'Wird *') {
+                `$item.ForeColor = [System.Drawing.Color]::RoyalBlue
             }
 
             [void]`$list.Items.Add(`$item)
@@ -1040,7 +1392,7 @@ function Load-AppList {
             `$installedLabel.Text = 'Bereits installiert: keine freigegebene Software erkannt'
         }
 
-        `$status.Text = 'Liste aktualisiert.'
+        Update-ProgressArea
     }
     finally {
         `$list.EndUpdate()
@@ -1060,11 +1412,18 @@ function Load-AppList {
 }
 
 `$status = New-Object System.Windows.Forms.Label
-`$status.Location = New-Object System.Drawing.Point(12, 544)
+`$status.Location = New-Object System.Drawing.Point(12, 526)
 `$status.Size = New-Object System.Drawing.Size(700, 20)
 `$status.Anchor = 'Left, Right, Bottom'
 `$status.ForeColor = [System.Drawing.Color]::DimGray
 `$status.Text = 'Bereit.'
+
+`$progressBar = New-Object System.Windows.Forms.ProgressBar
+`$progressBar.Location = New-Object System.Drawing.Point(12, 548)
+`$progressBar.Size = New-Object System.Drawing.Size(700, 12)
+`$progressBar.Anchor = 'Left, Right, Bottom'
+`$progressBar.Style = 'Continuous'
+`$progressBar.Visible = `$false
 
 `$btnInstall = New-Object System.Windows.Forms.Button
 `$btnInstall.Location = New-Object System.Drawing.Point(12, 568)
@@ -1098,8 +1457,11 @@ function Load-AppList {
 `$btnClose.Anchor = 'Right, Bottom'
 `$btnClose.Text = 'Schließen'
 
-`$autoRefreshTimer = New-Object System.Windows.Forms.Timer
-`$autoRefreshTimer.Interval = 15000
+`$script:StateWatcher = `$null
+`$script:SnapshotWatcher = `$null
+`$stateRefreshTimer = New-Object System.Windows.Forms.Timer
+`$stateRefreshTimer.Interval = 500
+`$script:StateRefreshPending = `$false
 
 `$btnInstall.Add_Click({
     try {
@@ -1127,12 +1489,12 @@ function Load-AppList {
             return
         }
 
-        `$status.Text = "Installation läuft: {0}" -f `$selected.DisplayName
+        `$status.Text = "Installation wird eingereiht: {0}" -f `$selected.DisplayName
         `$response = New-AppRequest -Alias `$selected.Alias -Action 'Install'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Installation gestartet: {0}" -f `$selected.DisplayName }
+        `$status.Text = if (`$response.Message) { `$response.Message } else { "Installation eingereiht: {0}" -f `$selected.DisplayName }
 
         [System.Windows.Forms.MessageBox]::Show(
-            ("Installation gestartet:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
+            ("Installation eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
             `$CatalogTitle,
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1177,12 +1539,12 @@ function Load-AppList {
             return
         }
 
-        `$status.Text = "Deinstallation läuft: {0}" -f `$selected.DisplayName
+        `$status.Text = "Deinstallation wird eingereiht: {0}" -f `$selected.DisplayName
         `$response = New-AppRequest -Alias `$selected.Alias -Action 'Uninstall'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Deinstallation gestartet: {0}" -f `$selected.DisplayName }
+        `$status.Text = if (`$response.Message) { `$response.Message } else { "Deinstallation eingereiht: {0}" -f `$selected.DisplayName }
 
         [System.Windows.Forms.MessageBox]::Show(
-            ("Deinstallation gestartet:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
+            ("Deinstallation eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
             `$CatalogTitle,
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1204,8 +1566,9 @@ function Load-AppList {
 `$btnRefresh.Add_Click({
     try {
         `$status.Text = 'Installationsdaten werden aktualisiert...'
-        `$null = Invoke-CatalogDaemon -Command 'RefreshStatus'
+        `$response = Invoke-CatalogDaemon -Command 'RefreshStatus'
         Load-AppList
+        if (`$response.Message) { `$status.Text = `$response.Message }
     }
     catch {
         `$status.Text = "Fehler: " + `$_.Exception.Message
@@ -1218,13 +1581,11 @@ function Load-AppList {
     }
 })
 
-`$autoRefreshTimer.Add_Tick({
-    try {
-        Load-AppList
-    }
-    catch {
-        `$status.Text = "Fehler bei automatischer Aktualisierung: " + `$_.Exception.Message
-    }
+`$stateRefreshTimer.Add_Tick({
+    if (-not `$script:StateRefreshPending) { return }
+    `$script:StateRefreshPending = `$false
+    try { Load-AppList }
+    catch { `$status.Text = "Fehler bei automatischer Aktualisierung: " + `$_.Exception.Message }
 })
 
 `$btnOpenLog.Add_Click({
@@ -1257,10 +1618,45 @@ function Load-AppList {
 
 `$btnClose.Add_Click({ `$form.Close() })
 
-`$form.Add_Shown({ `$autoRefreshTimer.Start() })
+`$form.Add_Shown({
+    try {
+        `$stateDir = Split-Path -Path `$QueueStatePath -Parent
+        `$stateFile = Split-Path -Path `$QueueStatePath -Leaf
+        if (Test-Path -LiteralPath `$stateDir) {
+            `$script:StateWatcher = New-Object System.IO.FileSystemWatcher(`$stateDir, `$stateFile)
+            `$script:StateWatcher.NotifyFilter = [System.IO.NotifyFilters]'LastWrite, FileName, Size'
+            `$script:StateWatcher.Add_Changed({ `$script:StateRefreshPending = `$true })
+            `$script:StateWatcher.Add_Created({ `$script:StateRefreshPending = `$true })
+            `$script:StateWatcher.Add_Renamed({ `$script:StateRefreshPending = `$true })
+            `$script:StateWatcher.EnableRaisingEvents = `$true
+        }
+    }
+    catch {
+        `$status.Text = "Statusueberwachung konnte nicht gestartet werden: " + `$_.Exception.Message
+    }
+
+    try {
+        `$snapshotDir = Split-Path -Path `$InstalledPackagesPath -Parent
+        `$snapshotFile = Split-Path -Path `$InstalledPackagesPath -Leaf
+        if (Test-Path -LiteralPath `$snapshotDir) {
+            `$script:SnapshotWatcher = New-Object System.IO.FileSystemWatcher(`$snapshotDir, `$snapshotFile)
+            `$script:SnapshotWatcher.NotifyFilter = [System.IO.NotifyFilters]'LastWrite, FileName, Size'
+            `$script:SnapshotWatcher.Add_Changed({ `$script:StateRefreshPending = `$true })
+            `$script:SnapshotWatcher.Add_Created({ `$script:StateRefreshPending = `$true })
+            `$script:SnapshotWatcher.Add_Renamed({ `$script:StateRefreshPending = `$true })
+            `$script:SnapshotWatcher.EnableRaisingEvents = `$true
+        }
+    }
+    catch {
+        `$status.Text = "Snapshotueberwachung konnte nicht gestartet werden: " + `$_.Exception.Message
+    }
+    `$stateRefreshTimer.Start()
+})
 `$form.Add_FormClosing({
-    `$autoRefreshTimer.Stop()
-    `$autoRefreshTimer.Dispose()
+    `$stateRefreshTimer.Stop()
+    `$stateRefreshTimer.Dispose()
+    if (`$script:StateWatcher) { `$script:StateWatcher.Dispose() }
+    if (`$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
 })
 
 `$list.Add_SelectedIndexChanged({ Update-InstallButtonState })
@@ -1281,6 +1677,7 @@ function Load-AppList {
 `$form.Controls.Add(`$groupApps)
 `$form.Controls.Add(`$infoPanel)
 `$form.Controls.Add(`$status)
+`$form.Controls.Add(`$progressBar)
 `$form.Controls.Add(`$btnInstall)
 `$form.Controls.Add(`$btnUninstall)
 `$form.Controls.Add(`$btnRefresh)
@@ -1291,7 +1688,6 @@ function Load-AppList {
 `$form.CancelButton = `$btnClose
 
 try {
-    `$null = Invoke-CatalogDaemon -Command 'RefreshStatus'
     Load-AppList
 }
 catch {
@@ -1432,7 +1828,8 @@ function Register-OrUpdateTasks {
 function Invoke-WingetInstall {
     param(
         [Parameter(Mandatory)][string]$WingetPath,
-        [Parameter(Mandatory)][string]$PackageId
+        [Parameter(Mandatory)][string]$PackageId,
+        [string]$QueueItemId
     )
 
     $arguments = @(
@@ -1447,16 +1844,25 @@ function Invoke-WingetInstall {
     )
 
     Write-Log "Executing: `"$WingetPath`" $($arguments -join ' ')"
-    $output = & $WingetPath @arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    if ($QueueItemId) {
+        Update-QueueItemProgress -Id $QueueItemId -Stage 'Install' -StageText 'Installation läuft...' -IsIndeterminate:$true
+    }
 
-    if ($output) {
-        foreach ($line in ($output -split "`r?`n")) {
-            if ($line.Trim()) {
-                Write-Log "winget: $line"
+    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    & $WingetPath @arguments 2>&1 | ForEach-Object {
+        $line = [string]$_
+        [void]$outputLines.Add($line)
+        if ($line.Trim()) {
+            Write-Log "winget: $line"
+            if ($QueueItemId) {
+                $percent = Get-ProgressPercentFromLine -Line $line
+                if ($null -ne $percent) {
+                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Download' -StageText ("Download läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
+                }
             }
         }
     }
+    $exitCode = $LASTEXITCODE
 
     return $exitCode
 }
@@ -1464,7 +1870,8 @@ function Invoke-WingetInstall {
 function Invoke-WingetUninstall {
     param(
         [Parameter(Mandatory)][string]$WingetPath,
-        [Parameter(Mandatory)][string]$PackageId
+        [Parameter(Mandatory)][string]$PackageId,
+        [string]$QueueItemId
     )
 
     $arguments = @(
@@ -1478,22 +1885,34 @@ function Invoke-WingetUninstall {
     )
 
     Write-Log "Executing: `"$WingetPath`" $($arguments -join ' ')"
-    $output = & $WingetPath @arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    if ($QueueItemId) {
+        Update-QueueItemProgress -Id $QueueItemId -Stage 'Uninstall' -StageText 'Deinstallation läuft...' -IsIndeterminate:$true
+    }
 
-    if ($output) {
-        foreach ($line in ($output -split "`r?`n")) {
-            if ($line.Trim()) {
-                Write-Log "winget: $line"
+    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    & $WingetPath @arguments 2>&1 | ForEach-Object {
+        $line = [string]$_
+        [void]$outputLines.Add($line)
+        if ($line.Trim()) {
+            Write-Log "winget: $line"
+            if ($QueueItemId) {
+                $percent = Get-ProgressPercentFromLine -Line $line
+                if ($null -ne $percent) {
+                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Uninstall' -StageText ("Deinstallation läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
+                }
             }
         }
     }
+    $exitCode = $LASTEXITCODE
 
     return $exitCode
 }
 
 function Invoke-WingetUpgradeAll {
-    param([Parameter(Mandatory)][string]$WingetPath)
+    param(
+        [Parameter(Mandatory)][string]$WingetPath,
+        [string]$QueueItemId
+    )
 
     $arguments = @(
         'upgrade'
@@ -1506,22 +1925,34 @@ function Invoke-WingetUpgradeAll {
     )
 
     Write-Log "Executing 2-hour upgrade: `"$WingetPath`" $($arguments -join ' ')"
-    $output = & $WingetPath @arguments 2>&1 | Out-String
-    $exitCode = $LASTEXITCODE
+    if ($QueueItemId) {
+        Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText 'Updates laufen...' -IsIndeterminate:$true
+    }
 
-    if ($output) {
-        foreach ($line in ($output -split "`r?`n")) {
-            if ($line.Trim()) {
-                Write-Log "winget upgrade: $line"
+    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    & $WingetPath @arguments 2>&1 | ForEach-Object {
+        $line = [string]$_
+        [void]$outputLines.Add($line)
+        if ($line.Trim()) {
+            Write-Log "winget upgrade: $line"
+            if ($QueueItemId) {
+                $percent = Get-ProgressPercentFromLine -Line $line
+                if ($null -ne $percent) {
+                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText ("Updates laufen... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
+                }
             }
         }
     }
+    $exitCode = $LASTEXITCODE
 
     return $exitCode
 }
 
 function Update-InstalledPackagesSnapshot {
-    param([Parameter(Mandatory)][string]$WingetPath)
+    param(
+        [Parameter(Mandatory)][string]$WingetPath,
+        [string]$QueueItemId
+    )
 
     Ensure-Directory -Path $BaseDir
 
@@ -1537,6 +1968,9 @@ function Update-InstalledPackagesSnapshot {
     )
 
     Write-Log 'Refreshing installed package snapshot.'
+    if ($QueueItemId) {
+        Update-QueueItemProgress -Id $QueueItemId -Stage 'Snapshot' -StageText 'Installationsdaten werden aktualisiert...' -IsIndeterminate:$true
+    }
     $output = & $WingetPath @arguments 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
 
@@ -1634,7 +2068,7 @@ function Get-InstalledPackageIdSet {
 }
 
 function Invoke-RequiredSoftwarePolicy {
-    param([Parameter(Mandatory)][string]$WingetPath)
+    param([string]$WingetPath)
 
     if (-not (Test-SoftwareCatalogPolicyEnabled)) {
         Write-Log 'Required software policy skipped because Softwarekatalog policy is disabled or not configured.' 'WARN'
@@ -1652,51 +2086,23 @@ function Invoke-RequiredSoftwarePolicy {
         return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0 }
     }
 
-    $installedCount = 0
-    $failedCount = 0
-    $skippedCount = 0
-
-    $result = Invoke-WithWingetLock -ScriptBlock {
-        $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
-        if (-not $snapshotUpdated) {
-            throw 'Could not refresh installed package snapshot before required software enforcement.'
+    if ($WingetPath) {
+        try {
+            Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
+                $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
+            } | Out-Null
         }
-
-        $installedSet = Get-InstalledPackageIdSet
-        foreach ($alias in $requiredAliases) {
-            $app = Get-AppCatalogObjectByAlias -Alias $alias
-            if (-not $app) {
-                Write-Log "Required alias '$alias' is not present in catalog policy; skipping." 'WARN'
-                $skippedCount++
-                continue
-            }
-
-            if ($installedSet.Contains([string]$app.PackageId)) {
-                $skippedCount++
-                continue
-            }
-
-            Write-Log "Installing required software alias '$($app.Alias)' package '$($app.PackageId)'."
-            $exitCode = Invoke-WingetInstall -WingetPath $WingetPath -PackageId ([string]$app.PackageId)
-            if ($exitCode -eq 0) {
-                $installedCount++
-                [void]$installedSet.Add([string]$app.PackageId)
-            }
-            else {
-                $failedCount++
-                Write-Log "Required install failed for alias '$($app.Alias)' package '$($app.PackageId)' with code $exitCode." 'ERROR'
-            }
-        }
-
-        $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
-        [pscustomobject]@{
-            Installed = $installedCount
-            Failed    = $failedCount
-            Skipped   = $skippedCount
+        catch {
+            Write-Log "Could not refresh snapshot before required queueing: $($_.Exception.Message)" 'WARN'
         }
     }
 
-    return @($result)[-1]
+    $queued = Ensure-RequiredSoftwareQueued
+    if ($queued -gt 0) {
+        Start-QueueWorker
+    }
+
+    return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0; Queued = $queued }
 }
 
 function New-CatalogPipeSecurity {
@@ -1803,9 +2209,16 @@ function Invoke-CatalogDaemonCommand {
     $command = $command.Trim().ToLowerInvariant()
 
     switch ($command) {
-        'getcatalog' {
+        { $_ -in @('getcatalog','getstate') } {
+            $requiredQueued = Ensure-RequiredSoftwareQueued
+            if ($requiredQueued -gt 0) {
+                Start-QueueWorker
+            }
             $catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
             $requiredAliases = @(Get-RequiredAliases)
+            $requiredSet = Get-RequiredAliasSet
+            $installedIds = @((Get-InstalledPackageIdSet) | ForEach-Object { [string]$_ })
+            $queueState = Get-QueueStateSnapshot
             return [pscustomobject]@{
                 Success            = $true
                 Command            = $command
@@ -1813,6 +2226,10 @@ function Invoke-CatalogDaemonCommand {
                 RequestedBySid     = $ClientIdentity.Sid
                 Catalog            = $catalog
                 RequiredAliases    = $requiredAliases
+                Queue              = @($queueState.Queue)
+                Current            = $queueState.Current
+                Version            = $queueState.Version
+                InstalledPackageIds = $installedIds
                 AllowUserInstalls  = (Test-UserInstallsAllowed)
                 AllowUserUninstall = (Test-UserUninstallAllowed)
                 EnforceRequired    = (Test-RequiredEnforcementEnabled)
@@ -1822,11 +2239,6 @@ function Invoke-CatalogDaemonCommand {
 
         'applypolicy' {
             Write-Log "Authenticated policy apply requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-
-            if (-not (Test-WingetLockAvailable)) {
-                throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
-            }
-
             Start-SoftwarekatalogWorker -WorkerMode ApplyPolicy
             return [pscustomobject]@{
                 Success        = $true
@@ -1857,16 +2269,19 @@ function Invoke-CatalogDaemonCommand {
                 throw "Alias '$alias' is not in the allowlist."
             }
 
+            $requiredSet = Get-RequiredAliasSet
+            if ($command -eq 'uninstall' -and $requiredSet.Contains($alias)) {
+                throw 'Pflichtsoftware kann nicht deinstalliert werden.'
+            }
+
             $actionText = if ($command -eq 'uninstall') { 'uninstall' } else { 'install' }
             Write-Log "Authenticated request: action=$actionText alias='$alias' package='$packageId' user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
 
-            if (-not (Test-WingetLockAvailable)) {
-                throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
-            }
-
-            Start-SoftwarekatalogWorker -WorkerMode ProcessRequest -WorkerAction $command -WorkerAlias $alias -WorkerRequestedBy $ClientIdentity.Name -WorkerRequestedBySid $ClientIdentity.Sid
+            $queueResult = Add-SoftwareRequestToQueue -Action $command -Alias $alias -RequestedBy $ClientIdentity.Name -RequestedBySid $ClientIdentity.Sid -Source User
+            Start-QueueWorker
 
             $verb = if ($command -eq 'uninstall') { 'Deinstallation' } else { 'Installation' }
+            $message = if ($queueResult.Added) { "$verb eingereiht: $alias" } else { "$verb ist bereits in der Warteschlange: $alias" }
             return [pscustomobject]@{
                 Success         = $true
                 Command         = $command
@@ -1874,7 +2289,9 @@ function Invoke-CatalogDaemonCommand {
                 PackageId       = $packageId
                 RequestedBy     = $ClientIdentity.Name
                 RequestedBySid  = $ClientIdentity.Sid
-                Message         = "$verb gestartet: $alias"
+                QueueId         = $queueResult.Item.Id
+                Queued          = $true
+                Message         = $message
             }
         }
 
@@ -1885,18 +2302,9 @@ function Invoke-CatalogDaemonCommand {
                 throw 'winget is unavailable.'
             }
 
-            try {
-                $result = Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
-                    $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-                    [pscustomobject]@{ SnapshotUpdated = [bool]$snapshotUpdated }
-                }
-            }
-            catch {
-                if ($_.Exception.Message -like 'Timed out waiting for winget lock*') {
-                    throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
-                }
-
-                throw
+            $result = Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
+                $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
+                [pscustomobject]@{ SnapshotUpdated = [bool]$snapshotUpdated }
             }
             $result = @($result)[-1]
 
@@ -1975,40 +2383,184 @@ function Start-CatalogDaemon {
     }
 }
 
-function Invoke-UpgradeAllMode {
+function Reset-RunningQueueItems {
+    $null = Update-QueueState -ScriptBlock {
+        param($state)
+        foreach ($item in @($state.Queue)) {
+            if (-not $item) { continue }
+            if ($item.State -eq 'Running') {
+                $item.State = 'Queued'
+                $item.Stage = 'Queued'
+                $item.StageText = 'Nach Neustart erneut eingereiht'
+                $item.ProgressPercent = $null
+                $item.IsIndeterminate = $false
+                $item.StartedAt = $null
+            }
+        }
+        $state.Current = $null
+    }
+}
+
+function Get-NextQueuedItem {
+    $script:NextQueueItem = $null
+    $null = Update-QueueState -ScriptBlock {
+        param($state)
+        foreach ($item in (@($state.Queue) | Sort-Object CreatedAt)) {
+            if (-not $item) { continue }
+            if ($item.State -eq 'Queued') {
+                $item.State = 'Running'
+                $item.Stage = 'Starting'
+                $item.StageText = 'Vorbereitung...'
+                $item.ProgressPercent = $null
+                $item.IsIndeterminate = $true
+                $item.StartedAt = (Get-Date).ToString('o')
+                $state.Current = [pscustomobject][ordered]@{
+                    Id = $item.Id
+                    Action = $item.Action
+                    Alias = $item.Alias
+                    DisplayName = $item.DisplayName
+                    Stage = $item.Stage
+                    StageText = $item.StageText
+                    ProgressPercent = $item.ProgressPercent
+                    IsIndeterminate = $item.IsIndeterminate
+                }
+                $script:NextQueueItem = $item
+                break
+            }
+        }
+    }
+
+    $item = $script:NextQueueItem
+    $script:NextQueueItem = $null
+    return $item
+}
+
+function Complete-QueueItem {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][ValidateSet('Succeeded','Failed')][string]$State,
+        [int]$ExitCode = 0,
+        [string]$Message
+    )
+
+    $null = Update-QueueState -ScriptBlock {
+        param($queueState)
+        foreach ($item in @($queueState.Queue)) {
+            if (-not $item) { continue }
+            if ($item.Id -eq $Id) {
+                $item.State = $State
+                $item.Stage = $State
+                $item.StageText = $Message
+                $item.ProgressPercent = if ($State -eq 'Succeeded') { 100 } else { $null }
+                $item.IsIndeterminate = $false
+                $item.FinishedAt = (Get-Date).ToString('o')
+                $item.ExitCode = $ExitCode
+                $item.Message = $Message
+                break
+            }
+        }
+        $queueState.Current = $null
+    }
+}
+
+function Invoke-QueuedItem {
+    param(
+        [Parameter(Mandatory)]$Item,
+        [Parameter(Mandatory)][string]$WingetPath
+    )
+
+    if ($Item.Action -eq 'UpgradeAll') {
+        $exitCode = Invoke-WingetUpgradeAll -WingetPath $WingetPath -QueueItemId $Item.Id
+        $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath -QueueItemId $Item.Id
+        if ($exitCode -eq 0) {
+            Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message 'Updates abgeschlossen.'
+        }
+        else {
+            Complete-QueueItem -Id $Item.Id -State Failed -ExitCode $exitCode -Message "Updates fehlgeschlagen (Code $exitCode)."
+        }
+        return
+    }
+
+    $app = Get-AppCatalogObjectByAlias -Alias ([string]$Item.Alias)
+    if (-not $app) {
+        Complete-QueueItem -Id $Item.Id -State Failed -ExitCode 1 -Message 'Alias ist nicht mehr freigegeben.'
+        return
+    }
+
+    $requiredSet = Get-RequiredAliasSet
+    if ($Item.Action -eq 'Uninstall' -and $requiredSet.Contains([string]$Item.Alias)) {
+        Complete-QueueItem -Id $Item.Id -State Failed -ExitCode 1 -Message 'Pflichtsoftware kann nicht deinstalliert werden.'
+        return
+    }
+
+    $installedSet = Get-InstalledPackageIdSet
+    if ($Item.Action -eq 'Install' -and $installedSet.Contains([string]$app.PackageId)) {
+        Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode 0 -Message 'Bereits installiert.'
+        return
+    }
+
+    if ($Item.Action -eq 'Install') {
+        $exitCode = Invoke-WingetInstall -WingetPath $WingetPath -PackageId ([string]$app.PackageId) -QueueItemId $Item.Id
+    }
+    else {
+        $exitCode = Invoke-WingetUninstall -WingetPath $WingetPath -PackageId ([string]$app.PackageId) -QueueItemId $Item.Id
+    }
+
+    $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath -QueueItemId $Item.Id
+    if ($exitCode -eq 0) {
+        Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message 'Abgeschlossen.'
+    }
+    else {
+        Complete-QueueItem -Id $Item.Id -State Failed -ExitCode $exitCode -Message "Fehlgeschlagen (Code $exitCode)."
+    }
+}
+
+function Invoke-ProcessQueueMode {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
 
     $wingetPath = Ensure-WingetAvailable
     if (-not $wingetPath) {
-        Write-Log 'Aborting upgrade because winget is unavailable.' 'ERROR'
+        Write-Log 'Aborting queue processing because winget is unavailable.' 'ERROR'
         return
     }
 
-    $result = Invoke-WithWingetLock -ScriptBlock {
-        $exitCode = Invoke-WingetUpgradeAll -WingetPath $wingetPath
-        $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-        [pscustomobject]@{
-            ExitCode        = $exitCode
-            SnapshotUpdated = [bool]$snapshotUpdated
-        }
-    }
-    $result = @($result)[-1]
+    Invoke-WithWingetLock -ScriptBlock {
+        Reset-RunningQueueItems
+        $null = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
+        $null = Ensure-RequiredSoftwareQueued
 
-    if ($result.ExitCode -eq 0) {
-        Write-Log "2-hour winget upgrade completed successfully. SnapshotUpdated=$($result.SnapshotUpdated)."
+        while ($true) {
+            $item = Get-NextQueuedItem
+            if (-not $item) { break }
+
+            Write-Log "Processing queued item id='$($item.Id)' action='$($item.Action)' alias='$($item.Alias)' source='$($item.Source)' requestedBy='$($item.RequestedBy)'"
+            try {
+                Invoke-QueuedItem -Item $item -WingetPath $wingetPath
+            }
+            catch {
+                Write-Log "Queued item '$($item.Id)' failed: $($_.Exception.Message)" 'ERROR'
+                Complete-QueueItem -Id $item.Id -State Failed -ExitCode 1 -Message $_.Exception.Message
+            }
+        }
+
+        $null = Update-QueueState -ScriptBlock { param($state) $state.Current = $null }
+    }
+}
+
+function Invoke-UpgradeAllMode {
+    Ensure-Directory -Path $BaseDir
+    Ensure-Directory -Path $LogDir
+
+    $item = New-QueueItem -Action UpgradeAll -DisplayName 'winget upgrade --all' -Source System -RequestedBy 'System' -RequestedBySid 'System'
+    $result = Add-QueueItem -Item $item
+    if ($result.Added) {
+        Write-Log 'Queued 2-hour winget upgrade.'
     }
     else {
-        Write-Log "2-hour winget upgrade failed with code $($result.ExitCode). SnapshotUpdated=$($result.SnapshotUpdated)." 'WARN'
+        Write-Log '2-hour winget upgrade is already queued or running.'
     }
-
-    try {
-        $requiredResult = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
-        Write-Log "Required policy after upgrade completed. Installed=$($requiredResult.Installed), Failed=$($requiredResult.Failed), Skipped=$($requiredResult.Skipped)."
-    }
-    catch {
-        Write-Log "Required policy after upgrade failed: $($_.Exception.Message)" 'ERROR'
-    }
+    Start-QueueWorker
 }
 
 function Invoke-ApplyPolicyMode {
@@ -2016,18 +2568,8 @@ function Invoke-ApplyPolicyMode {
     Ensure-Directory -Path $LogDir
 
     $wingetPath = Ensure-WingetAvailable
-    if (-not $wingetPath) {
-        Write-Log 'Aborting policy apply because winget is unavailable.' 'ERROR'
-        return
-    }
-
     $result = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
-    if ($result.Failed -eq 0) {
-        Write-Log "Required policy apply completed. Installed=$($result.Installed), Failed=$($result.Failed), Skipped=$($result.Skipped)."
-    }
-    else {
-        Write-Log "Required policy apply completed with failures. Installed=$($result.Installed), Failed=$($result.Failed), Skipped=$($result.Skipped)." 'WARN'
-    }
+    Write-Log "Required policy apply queued items=$($result.Queued)."
 }
 
 function Invoke-ProcessRequestMode {
@@ -2055,40 +2597,9 @@ function Invoke-ProcessRequestMode {
         return
     }
 
-    $wingetPath = Ensure-WingetAvailable
-    if (-not $wingetPath) {
-        Write-Log "Worker aborting $RequestAction for alias '$alias' because winget is unavailable. RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'ERROR'
-        return
-    }
-
-    Write-Log "Worker starting action=$RequestAction alias='$alias' package='$($app.PackageId)' RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
-
-    $result = Invoke-WithWingetLock -ScriptBlock {
-        if ($RequestAction -eq 'Uninstall') {
-            $exitCode = Invoke-WingetUninstall -WingetPath $wingetPath -PackageId ([string]$app.PackageId)
-        }
-        else {
-            $exitCode = Invoke-WingetInstall -WingetPath $wingetPath -PackageId ([string]$app.PackageId)
-        }
-
-        $snapshotUpdated = $false
-        if ($exitCode -eq 0) {
-            $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-        }
-
-        [pscustomobject]@{
-            ExitCode        = $exitCode
-            SnapshotUpdated = [bool]$snapshotUpdated
-        }
-    }
-    $result = @($result)[-1]
-
-    if ($result.ExitCode -eq 0) {
-        Write-Log "Worker completed action=$RequestAction alias='$alias' package='$($app.PackageId)' SnapshotUpdated=$($result.SnapshotUpdated) RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
-    }
-    else {
-        Write-Log "Worker failed action=$RequestAction alias='$alias' package='$($app.PackageId)' code=$($result.ExitCode) RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'ERROR'
-    }
+    $result = Add-SoftwareRequestToQueue -Action $RequestAction -Alias $alias -RequestedBy $RequestedBy -RequestedBySid $RequestedBySid -Source User
+    Write-Log "Queued worker request action=$RequestAction alias='$alias' added=$($result.Added) RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
+    Start-QueueWorker
 }
 
 function Install-Service {
@@ -2131,6 +2642,7 @@ try {
         'Daemon'     { Start-CatalogDaemon }
         'UpgradeAll' { Invoke-UpgradeAllMode }
         'ApplyPolicy' { Invoke-ApplyPolicyMode }
+        'ProcessQueue' { Invoke-ProcessQueueMode }
         'ProcessRequest' { Invoke-ProcessRequestMode }
         default      { throw "Unsupported mode '$Mode'." }
     }

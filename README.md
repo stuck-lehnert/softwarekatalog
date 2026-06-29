@@ -2,13 +2,16 @@
 
 Windows self-service software catalog backed by `winget`.
 
-Users install approved software through a small GUI or request helper. A SYSTEM scheduled task runs a named-pipe daemon, authenticates the connecting Windows user, validates requests against Group Policy, then runs `winget install --scope machine`.
+Users install approved software through a small GUI or request helper. A SYSTEM scheduled task runs a named-pipe daemon, authenticates the connecting Windows user, validates requests against Group Policy, then queues work for a SYSTEM `winget` worker.
 
 ## What It Does
 
 - Reads allowed software from GPO registry policy.
 - Lets users install/uninstall only catalog entries allowed by policy.
 - Installs required software automatically.
+- Blocks user removal of required software.
+- Queues install, uninstall, and upgrade actions.
+- Shows current queue task and progress in the GUI.
 - Runs `winget upgrade --all` every 2 hours.
 - Tracks installed state from `winget export`, not from request history.
 
