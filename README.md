@@ -48,10 +48,18 @@ The client reads up to 500 catalog entries and 500 required entries.
 
 ## Install
 
+Build the ASCII-only distribution wrapper:
+
+```sh
+make dist
+```
+
+Use `dist/setup.ps1` for deployment. It is ASCII-only and decodes the UTF-8 payload at runtime, avoiding Windows PowerShell 5.1 encoding issues with downloaded scripts.
+
 Run as admin or as computer startup script:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -Mode Install
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\dist\setup.ps1 -Mode Install
 ```
 
 Generated files are written to:

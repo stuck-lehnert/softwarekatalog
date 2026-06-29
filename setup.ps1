@@ -3,7 +3,7 @@ SelfServiceWinget.ps1
 
 Use as:
 - Computer Startup GPO script (default mode = Install)
-- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy)
+- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy / ProcessRequest)
 
 Behavior:
 User -> GUI / request helper -> named pipe -> daemon task (SYSTEM) -> winget install --scope machine
@@ -20,8 +20,13 @@ C:\ProgramData\__Softwarekatalog\
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy')]
-    [string]$Mode = 'Install'
+    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessRequest')]
+    [string]$Mode = 'Install',
+    [ValidateSet('Install','Uninstall')]
+    [string]$RequestAction = 'Install',
+    [string]$AppAlias,
+    [string]$RequestedBy,
+    [string]$RequestedBySid
 )
 
 Set-StrictMode -Version Latest
@@ -360,6 +365,77 @@ function Invoke-WithWingetLock {
     }
 }
 
+function Test-WingetLockAvailable {
+    $mutex = New-Object System.Threading.Mutex($false, $WingetMutexName)
+    $hasLock = $false
+
+    try {
+        $hasLock = $mutex.WaitOne(0)
+        return $hasLock
+    }
+    finally {
+        if ($hasLock) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
+function ConvertTo-ProcessArgument {
+    param([Parameter(Mandatory)][string]$Value)
+
+    if ($Value -match '[\s"]') {
+        return '"{0}"' -f ($Value.Replace('"', '\"'))
+    }
+
+    return $Value
+}
+
+function Get-WorkerScriptPath {
+    if (Test-Path -LiteralPath $LocalScriptPath) {
+        return $LocalScriptPath
+    }
+
+    if ($PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath)) {
+        return $PSCommandPath
+    }
+
+    throw 'Could not determine worker script path.'
+}
+
+function Start-SoftwarekatalogWorker {
+    param(
+        [Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessRequest')][string]$WorkerMode,
+        [ValidateSet('Install','Uninstall')][string]$WorkerAction = 'Install',
+        [string]$WorkerAlias,
+        [string]$WorkerRequestedBy,
+        [string]$WorkerRequestedBySid
+    )
+
+    $workerScript = Get-WorkerScriptPath
+    $args = @(
+        '-NoProfile',
+        '-ExecutionPolicy', 'Bypass',
+        '-File', $workerScript,
+        '-Mode', $WorkerMode
+    )
+
+    if ($WorkerMode -eq 'ProcessRequest') {
+        $args += @('-RequestAction', $WorkerAction, '-AppAlias', $WorkerAlias)
+
+        if (-not [string]::IsNullOrWhiteSpace($WorkerRequestedBy)) {
+            $args += @('-RequestedBy', $WorkerRequestedBy)
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($WorkerRequestedBySid)) {
+            $args += @('-RequestedBySid', $WorkerRequestedBySid)
+        }
+    }
+
+    $argumentLine = (@($args) | ForEach-Object { ConvertTo-ProcessArgument -Value ([string]$_) }) -join ' '
+    Start-Process -FilePath $PowerShellExe -ArgumentList $argumentLine -WindowStyle Hidden | Out-Null
+}
+
 function Get-WingetPath {
     $candidates = @()
 
@@ -491,7 +567,7 @@ function Invoke-CatalogDaemon {
     )
 
     try {
-        `$client.Connect(30000)
+        `$client.Connect(60000)
         `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
         `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
         `$writer.AutoFlush = `$true
@@ -508,6 +584,9 @@ function Invoke-CatalogDaemon {
         }
 
         return `$response
+    }
+    catch [System.TimeoutException] {
+        throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
     }
     finally {
         `$client.Dispose()
@@ -535,10 +614,10 @@ if (-not `$AppAlias) {
 `$response = Invoke-CatalogDaemon -Command `$Action -Alias `$alias
 
 if (`$Action -eq 'Uninstall') {
-    Write-Host "Deinstallation für '`$alias' abgeschlossen."
+    Write-Host "Deinstallation für '`$alias' gestartet."
 }
 else {
-    Write-Host "Installation für '`$alias' abgeschlossen."
+    Write-Host "Installation für '`$alias' gestartet."
 }
 
 if (`$response.Message) {
@@ -687,7 +766,7 @@ function Invoke-CatalogDaemon {
     )
 
     try {
-        `$client.Connect(30000)
+        `$client.Connect(60000)
         `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
         `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
         `$writer.AutoFlush = `$true
@@ -704,6 +783,9 @@ function Invoke-CatalogDaemon {
         }
 
         return `$response
+    }
+    catch [System.TimeoutException] {
+        throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
     }
     finally {
         `$client.Dispose()
@@ -1047,10 +1129,10 @@ function Load-AppList {
 
         `$status.Text = "Installation läuft: {0}" -f `$selected.DisplayName
         `$response = New-AppRequest -Alias `$selected.Alias -Action 'Install'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Installation abgeschlossen: {0}" -f `$selected.DisplayName }
+        `$status.Text = if (`$response.Message) { `$response.Message } else { "Installation gestartet: {0}" -f `$selected.DisplayName }
 
         [System.Windows.Forms.MessageBox]::Show(
-            ("Installation abgeschlossen:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
+            ("Installation gestartet:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
             `$CatalogTitle,
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1097,10 +1179,10 @@ function Load-AppList {
 
         `$status.Text = "Deinstallation läuft: {0}" -f `$selected.DisplayName
         `$response = New-AppRequest -Alias `$selected.Alias -Action 'Uninstall'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Deinstallation abgeschlossen: {0}" -f `$selected.DisplayName }
+        `$status.Text = if (`$response.Message) { `$response.Message } else { "Deinstallation gestartet: {0}" -f `$selected.DisplayName }
 
         [System.Windows.Forms.MessageBox]::Show(
-            ("Deinstallation abgeschlossen:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
+            ("Deinstallation gestartet:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
             `$CatalogTitle,
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Information
@@ -1740,21 +1822,18 @@ function Invoke-CatalogDaemonCommand {
 
         'applypolicy' {
             Write-Log "Authenticated policy apply requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-            $wingetPath = Ensure-WingetAvailable
-            if (-not $wingetPath) {
-                throw 'winget is unavailable.'
+
+            if (-not (Test-WingetLockAvailable)) {
+                throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
             }
 
-            $result = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
+            Start-SoftwarekatalogWorker -WorkerMode ApplyPolicy
             return [pscustomobject]@{
-                Success        = ($result.Failed -eq 0)
+                Success        = $true
                 Command        = $command
                 RequestedBy    = $ClientIdentity.Name
                 RequestedBySid = $ClientIdentity.Sid
-                Installed      = $result.Installed
-                Failed         = $result.Failed
-                Skipped        = $result.Skipped
-                Message        = "Policy angewendet. Installiert=$($result.Installed), Fehler=$($result.Failed), Übersprungen=$($result.Skipped)."
+                Message        = 'Policyanwendung gestartet.'
             }
         }
 
@@ -1781,34 +1860,11 @@ function Invoke-CatalogDaemonCommand {
             $actionText = if ($command -eq 'uninstall') { 'uninstall' } else { 'install' }
             Write-Log "Authenticated request: action=$actionText alias='$alias' package='$packageId' user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
 
-            $wingetPath = Ensure-WingetAvailable
-            if (-not $wingetPath) {
-                throw 'winget is unavailable.'
+            if (-not (Test-WingetLockAvailable)) {
+                throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
             }
 
-            $result = Invoke-WithWingetLock -ScriptBlock {
-                if ($command -eq 'uninstall') {
-                    $exitCode = Invoke-WingetUninstall -WingetPath $wingetPath -PackageId $packageId
-                }
-                else {
-                    $exitCode = Invoke-WingetInstall -WingetPath $wingetPath -PackageId $packageId
-                }
-
-                $snapshotUpdated = $false
-                if ($exitCode -eq 0) {
-                    $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-                }
-
-                [pscustomobject]@{
-                    ExitCode        = $exitCode
-                    SnapshotUpdated = [bool]$snapshotUpdated
-                }
-            }
-            $result = @($result)[-1]
-
-            if ($result.ExitCode -ne 0) {
-                throw "winget $actionText exited with code $($result.ExitCode) for package '$packageId'."
-            }
+            Start-SoftwarekatalogWorker -WorkerMode ProcessRequest -WorkerAction $command -WorkerAlias $alias -WorkerRequestedBy $ClientIdentity.Name -WorkerRequestedBySid $ClientIdentity.Sid
 
             $verb = if ($command -eq 'uninstall') { 'Deinstallation' } else { 'Installation' }
             return [pscustomobject]@{
@@ -1818,9 +1874,7 @@ function Invoke-CatalogDaemonCommand {
                 PackageId       = $packageId
                 RequestedBy     = $ClientIdentity.Name
                 RequestedBySid  = $ClientIdentity.Sid
-                ExitCode        = $result.ExitCode
-                SnapshotUpdated = $result.SnapshotUpdated
-                Message         = "$verb abgeschlossen: $alias"
+                Message         = "$verb gestartet: $alias"
             }
         }
 
@@ -1831,9 +1885,18 @@ function Invoke-CatalogDaemonCommand {
                 throw 'winget is unavailable.'
             }
 
-            $result = Invoke-WithWingetLock -ScriptBlock {
-                $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-                [pscustomobject]@{ SnapshotUpdated = [bool]$snapshotUpdated }
+            try {
+                $result = Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
+                    $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
+                    [pscustomobject]@{ SnapshotUpdated = [bool]$snapshotUpdated }
+                }
+            }
+            catch {
+                if ($_.Exception.Message -like 'Timed out waiting for winget lock*') {
+                    throw 'Der Softwarekatalog-Dienst ist gerade mit einer anderen winget-Aktion beschäftigt. Bitte später erneut versuchen.'
+                }
+
+                throw
             }
             $result = @($result)[-1]
 
@@ -1860,13 +1923,10 @@ function Start-CatalogDaemon {
     Write-Log "Named pipe daemon starting on '\\.\pipe\$PipeName'."
 
     try {
-        $wingetPath = Ensure-WingetAvailable
-        if ($wingetPath) {
-            $null = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
-        }
+        Start-SoftwarekatalogWorker -WorkerMode ApplyPolicy
     }
     catch {
-        Write-Log "Initial required software enforcement failed: $($_.Exception.Message)" 'WARN'
+        Write-Log "Could not start initial required software enforcement worker: $($_.Exception.Message)" 'WARN'
     }
 
     while ($true) {
@@ -1970,6 +2030,67 @@ function Invoke-ApplyPolicyMode {
     }
 }
 
+function Invoke-ProcessRequestMode {
+    Ensure-Directory -Path $BaseDir
+    Ensure-Directory -Path $LogDir
+
+    if ([string]::IsNullOrWhiteSpace($AppAlias)) {
+        throw 'AppAlias is required for ProcessRequest mode.'
+    }
+
+    $alias = $AppAlias.Trim().ToLowerInvariant()
+    $app = Get-AppCatalogObjectByAlias -Alias $alias
+    if (-not $app) {
+        Write-Log "Worker rejected alias '$alias' because it is no longer in catalog policy. RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'WARN'
+        return
+    }
+
+    if ($RequestAction -eq 'Install' -and -not (Test-UserInstallsAllowed)) {
+        Write-Log "Worker rejected install for alias '$alias' because user installs are disabled. RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'WARN'
+        return
+    }
+
+    if ($RequestAction -eq 'Uninstall' -and -not (Test-UserUninstallAllowed)) {
+        Write-Log "Worker rejected uninstall for alias '$alias' because user uninstalls are disabled. RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'WARN'
+        return
+    }
+
+    $wingetPath = Ensure-WingetAvailable
+    if (-not $wingetPath) {
+        Write-Log "Worker aborting $RequestAction for alias '$alias' because winget is unavailable. RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'ERROR'
+        return
+    }
+
+    Write-Log "Worker starting action=$RequestAction alias='$alias' package='$($app.PackageId)' RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
+
+    $result = Invoke-WithWingetLock -ScriptBlock {
+        if ($RequestAction -eq 'Uninstall') {
+            $exitCode = Invoke-WingetUninstall -WingetPath $wingetPath -PackageId ([string]$app.PackageId)
+        }
+        else {
+            $exitCode = Invoke-WingetInstall -WingetPath $wingetPath -PackageId ([string]$app.PackageId)
+        }
+
+        $snapshotUpdated = $false
+        if ($exitCode -eq 0) {
+            $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
+        }
+
+        [pscustomobject]@{
+            ExitCode        = $exitCode
+            SnapshotUpdated = [bool]$snapshotUpdated
+        }
+    }
+    $result = @($result)[-1]
+
+    if ($result.ExitCode -eq 0) {
+        Write-Log "Worker completed action=$RequestAction alias='$alias' package='$($app.PackageId)' SnapshotUpdated=$($result.SnapshotUpdated) RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
+    }
+    else {
+        Write-Log "Worker failed action=$RequestAction alias='$alias' package='$($app.PackageId)' code=$($result.ExitCode) RequestedBy='$RequestedBy' Sid='$RequestedBySid'" 'ERROR'
+    }
+}
+
 function Install-Service {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
@@ -2010,6 +2131,7 @@ try {
         'Daemon'     { Start-CatalogDaemon }
         'UpgradeAll' { Invoke-UpgradeAllMode }
         'ApplyPolicy' { Invoke-ApplyPolicyMode }
+        'ProcessRequest' { Invoke-ProcessRequestMode }
         default      { throw "Unsupported mode '$Mode'." }
     }
 }
