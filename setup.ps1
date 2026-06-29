@@ -62,6 +62,7 @@ $CommonDesktopDir       = [Environment]::GetFolderPath('CommonDesktopDirectory')
 $CommonProgramsDir      = [Environment]::GetFolderPath('CommonPrograms')
 $DesktopShortcutPath    = Join-Path $CommonDesktopDir "$CatalogDisplayName.lnk"
 $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
+$script:DaemonPostResponseWorkers = @()
 
 # ----------------------------
 # Utility functions
@@ -710,6 +711,28 @@ function Start-QueueWorker {
     Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
 }
 
+function Add-DaemonPostResponseWorker {
+    param([Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessQueue')][string]$WorkerMode)
+
+    if (-not $script:DaemonPostResponseWorkers) {
+        $script:DaemonPostResponseWorkers = @()
+    }
+    $script:DaemonPostResponseWorkers = @($script:DaemonPostResponseWorkers + $WorkerMode)
+}
+
+function Invoke-DaemonPostResponseWorkers {
+    foreach ($workerMode in @($script:DaemonPostResponseWorkers | Select-Object -Unique)) {
+        try {
+            Start-SoftwarekatalogWorker -WorkerMode $workerMode
+        }
+        catch {
+            Write-Log "Could not start post-response worker '$workerMode': $($_.Exception.Message)" 'WARN'
+        }
+    }
+
+    $script:DaemonPostResponseWorkers = @()
+}
+
 function Get-WingetPath {
     $candidates = @()
 
@@ -841,13 +864,17 @@ function Invoke-CatalogDaemon {
     )
 
     try {
-        `$client.Connect(60000)
+        `$client.Connect(10000)
         `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
         `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
         `$writer.AutoFlush = `$true
         `$writer.WriteLine(`$json)
 
-        `$line = `$reader.ReadLine()
+        `$readTask = `$reader.ReadLineAsync()
+        if (-not `$readTask.Wait(15000)) {
+            throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
+        }
+        `$line = `$readTask.Result
         if ([string]::IsNullOrWhiteSpace(`$line)) {
             throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
         }
@@ -1047,13 +1074,17 @@ function Invoke-CatalogDaemon {
     )
 
     try {
-        `$client.Connect(60000)
+        `$client.Connect(10000)
         `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
         `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
         `$writer.AutoFlush = `$true
         `$writer.WriteLine(`$json)
 
-        `$line = `$reader.ReadLine()
+        `$readTask = `$reader.ReadLineAsync()
+        if (-not `$readTask.Wait(15000)) {
+            throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
+        }
+        `$line = `$readTask.Result
         if ([string]::IsNullOrWhiteSpace(`$line)) {
             throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
         }
@@ -1462,6 +1493,134 @@ function Load-AppList {
 `$stateRefreshTimer = New-Object System.Windows.Forms.Timer
 `$stateRefreshTimer.Interval = 500
 `$script:StateRefreshPending = `$false
+`$script:RequestWorkerBusy = `$false
+
+function Start-AppRequestAsync {
+    param(
+        [Parameter(Mandatory=`$true)]`$Selected,
+        [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall')][string]`$Action
+    )
+
+    if (`$script:RequestWorkerBusy) {
+        `$status.Text = 'Eine Anfrage wird bereits verarbeitet.'
+        return
+    }
+
+    `$script:RequestWorkerBusy = `$true
+    `$btnInstall.Enabled = `$false
+    `$btnUninstall.Enabled = `$false
+    `$btnRefresh.Enabled = `$false
+
+    `$worker = New-Object System.ComponentModel.BackgroundWorker
+    `$worker.Add_DoWork({
+        param(`$sender, `$eventArgs)
+        `$arg = `$eventArgs.Argument
+        `$response = New-AppRequest -Alias `$arg.Alias -Action `$arg.Action
+        `$eventArgs.Result = [pscustomobject]@{
+            Action = `$arg.Action
+            Alias = `$arg.Alias
+            DisplayName = `$arg.DisplayName
+            Response = `$response
+        }
+    })
+    `$worker.Add_RunWorkerCompleted({
+        param(`$sender, `$eventArgs)
+        try {
+            `$script:RequestWorkerBusy = `$false
+            `$btnRefresh.Enabled = `$true
+
+            if (`$eventArgs.Error) {
+                `$status.Text = 'Fehler: ' + `$eventArgs.Error.Message
+                `$script:StateRefreshPending = `$true
+                [System.Windows.Forms.MessageBox]::Show(
+                    `$eventArgs.Error.Message,
+                    `$CatalogTitle,
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+                return
+            }
+
+            `$result = `$eventArgs.Result
+            if (`$result.Action -eq 'Uninstall') {
+                `$verb = 'Deinstallation'
+            }
+            else {
+                `$verb = 'Installation'
+            }
+            if (`$result.Response.Message) {
+                `$status.Text = [string]`$result.Response.Message
+            }
+            else {
+                `$status.Text = "`$verb eingereiht: {0}" -f `$result.DisplayName
+            }
+
+            [System.Windows.Forms.MessageBox]::Show(
+                ("`$verb eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$result.DisplayName, `$result.Alias),
+                `$CatalogTitle,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information
+            ) | Out-Null
+
+            `$script:StateRefreshPending = `$true
+        }
+        finally {
+            Update-InstallButtonState
+            `$sender.Dispose()
+        }
+    })
+    `$worker.RunWorkerAsync([pscustomobject]@{
+        Action = `$Action
+        Alias = [string]`$Selected.Alias
+        DisplayName = [string]`$Selected.DisplayName
+    })
+}
+
+function Start-RefreshStatusAsync {
+    if (`$script:RequestWorkerBusy) {
+        `$status.Text = 'Eine Anfrage wird bereits verarbeitet.'
+        return
+    }
+
+    `$script:RequestWorkerBusy = `$true
+    `$btnInstall.Enabled = `$false
+    `$btnUninstall.Enabled = `$false
+    `$btnRefresh.Enabled = `$false
+    `$status.Text = 'Installationsdaten-Aktualisierung wird angefordert...'
+
+    `$worker = New-Object System.ComponentModel.BackgroundWorker
+    `$worker.Add_DoWork({
+        param(`$sender, `$eventArgs)
+        `$eventArgs.Result = Invoke-CatalogDaemon -Command 'RefreshStatus'
+    })
+    `$worker.Add_RunWorkerCompleted({
+        param(`$sender, `$eventArgs)
+        try {
+            `$script:RequestWorkerBusy = `$false
+            `$btnRefresh.Enabled = `$true
+
+            if (`$eventArgs.Error) {
+                `$status.Text = 'Fehler: ' + `$eventArgs.Error.Message
+                [System.Windows.Forms.MessageBox]::Show(
+                    `$eventArgs.Error.Message,
+                    `$CatalogTitle,
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
+                ) | Out-Null
+                return
+            }
+
+            `$response = `$eventArgs.Result
+            if (`$response.Message) { `$status.Text = [string]`$response.Message }
+            `$script:StateRefreshPending = `$true
+        }
+        finally {
+            Update-InstallButtonState
+            `$sender.Dispose()
+        }
+    })
+    `$worker.RunWorkerAsync()
+}
 
 `$btnInstall.Add_Click({
     try {
@@ -1490,17 +1649,10 @@ function Load-AppList {
         }
 
         `$status.Text = "Installation wird eingereiht: {0}" -f `$selected.DisplayName
-        `$response = New-AppRequest -Alias `$selected.Alias -Action 'Install'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Installation eingereiht: {0}" -f `$selected.DisplayName }
-
-        [System.Windows.Forms.MessageBox]::Show(
-            ("Installation eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
-            `$CatalogTitle,
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-
-        Load-AppList
+        `$selectedItem.SubItems[2].Text = 'In Warteschlange'
+        `$selectedItem.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+        Update-InstallButtonState
+        Start-AppRequestAsync -Selected `$selected -Action 'Install'
     }
     catch {
         `$status.Text = "Fehler: " + `$_.Exception.Message
@@ -1540,17 +1692,10 @@ function Load-AppList {
         }
 
         `$status.Text = "Deinstallation wird eingereiht: {0}" -f `$selected.DisplayName
-        `$response = New-AppRequest -Alias `$selected.Alias -Action 'Uninstall'
-        `$status.Text = if (`$response.Message) { `$response.Message } else { "Deinstallation eingereiht: {0}" -f `$selected.DisplayName }
-
-        [System.Windows.Forms.MessageBox]::Show(
-            ("Deinstallation eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$selected.DisplayName, `$selected.Alias),
-            `$CatalogTitle,
-            [System.Windows.Forms.MessageBoxButtons]::OK,
-            [System.Windows.Forms.MessageBoxIcon]::Information
-        ) | Out-Null
-
-        Load-AppList
+        `$selectedItem.SubItems[2].Text = 'Deinstallation in Warteschlange'
+        `$selectedItem.ForeColor = [System.Drawing.Color]::DarkGoldenrod
+        Update-InstallButtonState
+        Start-AppRequestAsync -Selected `$selected -Action 'Uninstall'
     }
     catch {
         `$status.Text = "Fehler: " + `$_.Exception.Message
@@ -1565,10 +1710,7 @@ function Load-AppList {
 
 `$btnRefresh.Add_Click({
     try {
-        `$status.Text = 'Installationsdaten werden aktualisiert...'
-        `$response = Invoke-CatalogDaemon -Command 'RefreshStatus'
-        Load-AppList
-        if (`$response.Message) { `$status.Text = `$response.Message }
+        Start-RefreshStatusAsync
     }
     catch {
         `$status.Text = "Fehler: " + `$_.Exception.Message
@@ -2212,7 +2354,7 @@ function Invoke-CatalogDaemonCommand {
         { $_ -in @('getcatalog','getstate') } {
             $requiredQueued = Ensure-RequiredSoftwareQueued
             if ($requiredQueued -gt 0) {
-                Start-QueueWorker
+                Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
             }
             $catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
             $requiredAliases = @(Get-RequiredAliases)
@@ -2239,7 +2381,7 @@ function Invoke-CatalogDaemonCommand {
 
         'applypolicy' {
             Write-Log "Authenticated policy apply requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-            Start-SoftwarekatalogWorker -WorkerMode ApplyPolicy
+            Add-DaemonPostResponseWorker -WorkerMode ApplyPolicy
             return [pscustomobject]@{
                 Success        = $true
                 Command        = $command
@@ -2278,10 +2420,20 @@ function Invoke-CatalogDaemonCommand {
             Write-Log "Authenticated request: action=$actionText alias='$alias' package='$packageId' user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
 
             $queueResult = Add-SoftwareRequestToQueue -Action $command -Alias $alias -RequestedBy $ClientIdentity.Name -RequestedBySid $ClientIdentity.Sid -Source User
-            Start-QueueWorker
+            Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
 
-            $verb = if ($command -eq 'uninstall') { 'Deinstallation' } else { 'Installation' }
-            $message = if ($queueResult.Added) { "$verb eingereiht: $alias" } else { "$verb ist bereits in der Warteschlange: $alias" }
+            if ($command -eq 'uninstall') {
+                $verb = 'Deinstallation'
+            }
+            else {
+                $verb = 'Installation'
+            }
+            if ($queueResult.Added) {
+                $message = "$verb eingereiht: $alias"
+            }
+            else {
+                $message = "$verb ist bereits in der Warteschlange: $alias"
+            }
             return [pscustomobject]@{
                 Success         = $true
                 Command         = $command
@@ -2297,24 +2449,25 @@ function Invoke-CatalogDaemonCommand {
 
         { $_ -in @('refreshstatus','getstatus') } {
             Write-Log "Authenticated status refresh requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-            $wingetPath = Ensure-WingetAvailable
-            if (-not $wingetPath) {
-                throw 'winget is unavailable.'
+            $started = $false
+            if (Test-WingetLockAvailable) {
+                Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
+                $started = $true
             }
-
-            $result = Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
-                $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-                [pscustomobject]@{ SnapshotUpdated = [bool]$snapshotUpdated }
+            if ($started) {
+                $message = 'Installationsdaten-Aktualisierung gestartet.'
             }
-            $result = @($result)[-1]
+            else {
+                $message = 'Installationsdaten-Aktualisierung läuft bereits.'
+            }
 
             return [pscustomobject]@{
-                Success         = [bool]$result.SnapshotUpdated
+                Success         = $true
                 Command         = $command
                 RequestedBy     = $ClientIdentity.Name
                 RequestedBySid  = $ClientIdentity.Sid
-                SnapshotUpdated = [bool]$result.SnapshotUpdated
-                Message         = 'Installationsdaten aktualisiert.'
+                SnapshotQueued  = $started
+                Message         = $message
             }
         }
 
@@ -2340,6 +2493,7 @@ function Start-CatalogDaemon {
     while ($true) {
         $pipe = $null
         try {
+            $script:DaemonPostResponseWorkers = @()
             $pipe = New-CatalogPipeServer
             $pipe.WaitForConnection()
 
@@ -2351,7 +2505,11 @@ function Start-CatalogDaemon {
 
             $response = $null
             try {
-                $line = $reader.ReadLine()
+                $readTask = $reader.ReadLineAsync()
+                if (-not $readTask.Wait(30000)) {
+                    throw 'Timed out waiting for named pipe request.'
+                }
+                $line = $readTask.Result
                 if ([string]::IsNullOrWhiteSpace($line)) {
                     throw 'Empty request.'
                 }
@@ -2370,6 +2528,7 @@ function Start-CatalogDaemon {
             }
 
             $writer.WriteLine(($response | ConvertTo-Json -Compress -Depth 6))
+            Invoke-DaemonPostResponseWorkers
         }
         catch {
             Write-Log "Named pipe daemon error: $($_.Exception.Message)" 'ERROR'
