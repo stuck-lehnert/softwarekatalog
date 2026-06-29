@@ -6,14 +6,22 @@
     <stringTable>
       <string id="Softwarekatalog">Softwarekatalog</string>
       <string id="Softwarekatalog_Settings">Softwarekatalog konfigurieren</string>
-      <string id="Softwarekatalog_Settings_Help">Aktiviert und konfiguriert den Softwarekatalog. Katalog-Eintraege werden unter HKLM\Software\Policies\STL\Softwarekatalog\Catalog gespeichert. Der Wertname ist der Alias, der Wert hat das Format PackageId|DisplayName|Description. Pflichtsoftware wird unter HKLM\Software\Policies\STL\Softwarekatalog\Required gespeichert. Der Wertname ist der Alias, der Wert ist 1. Der Client liest maximal 500 Eintraege pro Liste.</string>
+      <string id="Softwarekatalog_Settings_Help">Aktiviert den Softwarekatalog und steuert, ob Benutzer Software installieren oder deinstallieren duerfen und ob Pflichtsoftware automatisch installiert wird.</string>
+      <string id="Softwarekatalog_Catalog">Freigegebene Software konfigurieren</string>
+      <string id="Softwarekatalog_Catalog_Help">Konfiguriert freigegebene Software unter HKLM\Software\Policies\STL\Softwarekatalog\Catalog. Der Wertname ist der Alias, der Wert hat das Format PackageId|DisplayName|Description. Der Client liest maximal 500 Eintraege.</string>
+      <string id="Softwarekatalog_Required">Pflichtsoftware konfigurieren</string>
+      <string id="Softwarekatalog_Required_Help">Konfiguriert Pflichtsoftware unter HKLM\Software\Policies\STL\Softwarekatalog\Required. Der Wertname ist ein Alias aus dem Katalog, der Wert ist 1. Der Client liest maximal 500 Eintraege.</string>
     </stringTable>
     <presentationTable>
       <presentation id="Softwarekatalog_Settings">
         <checkBox refId="AllowUserInstalls">Benutzer duerfen Software installieren</checkBox>
         <checkBox refId="AllowUserUninstall">Benutzer duerfen Software deinstallieren</checkBox>
         <checkBox refId="EnforceRequired">Pflichtsoftware automatisch installieren</checkBox>
+      </presentation>
+      <presentation id="Softwarekatalog_Catalog">
         <listBox refId="Catalog">Freigegebene Software. Name = Alias, Wert = PackageId|DisplayName|Description.</listBox>
+      </presentation>
+      <presentation id="Softwarekatalog_Required">
         <listBox refId="Required">Pflichtsoftware. Name = Alias aus Katalog, Wert = 1.</listBox>
       </presentation>
     </presentationTable>

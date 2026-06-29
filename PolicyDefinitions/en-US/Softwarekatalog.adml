@@ -6,14 +6,22 @@
     <stringTable>
       <string id="Softwarekatalog">Software Catalog</string>
       <string id="Softwarekatalog_Settings">Configure Software Catalog</string>
-      <string id="Softwarekatalog_Settings_Help">Enables and configures Software Catalog. Catalog entries are stored below HKLM\Software\Policies\STL\Softwarekatalog\Catalog. Value name is alias, value format is PackageId|DisplayName|Description. Required software is stored below HKLM\Software\Policies\STL\Softwarekatalog\Required. Value name is alias, value is 1. Client reads up to 500 entries per list.</string>
+      <string id="Softwarekatalog_Settings_Help">Enables Software Catalog and controls whether users may install or uninstall software and whether required software is installed automatically.</string>
+      <string id="Softwarekatalog_Catalog">Configure allowed software</string>
+      <string id="Softwarekatalog_Catalog_Help">Configures allowed software below HKLM\Software\Policies\STL\Softwarekatalog\Catalog. Value name is alias, value format is PackageId|DisplayName|Description. Client reads up to 500 entries.</string>
+      <string id="Softwarekatalog_Required">Configure required software</string>
+      <string id="Softwarekatalog_Required_Help">Configures required software below HKLM\Software\Policies\STL\Softwarekatalog\Required. Value name is a catalog alias, value is 1. Client reads up to 500 entries.</string>
     </stringTable>
     <presentationTable>
       <presentation id="Softwarekatalog_Settings">
         <checkBox refId="AllowUserInstalls">Allow users to install software</checkBox>
         <checkBox refId="AllowUserUninstall">Allow users to uninstall software</checkBox>
         <checkBox refId="EnforceRequired">Automatically install required software</checkBox>
+      </presentation>
+      <presentation id="Softwarekatalog_Catalog">
         <listBox refId="Catalog">Allowed software. Name = alias, value = PackageId|DisplayName|Description.</listBox>
+      </presentation>
+      <presentation id="Softwarekatalog_Required">
         <listBox refId="Required">Required software. Name = catalog alias, value = 1.</listBox>
       </presentation>
     </presentationTable>
