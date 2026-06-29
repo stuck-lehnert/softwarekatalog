@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitions revision="1.0" schemaVersion="1.0">
+  <policyNamespaces>
+    <target prefix="stlSoftwarekatalog" namespace="STL.Policies.Softwarekatalog" />
+    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <categories>
+    <category name="Softwarekatalog" displayName="$(string.Softwarekatalog)" />
+  </categories>
+  <policies>
+    <policy name="Softwarekatalog_Settings" class="Machine" displayName="$(string.Softwarekatalog_Settings)" explainText="$(string.Softwarekatalog_Settings_Help)" key="Software\Policies\STL\Softwarekatalog" valueName="Enabled" presentation="$(presentation.Softwarekatalog_Settings)">
+      <parentCategory ref="Softwarekatalog" />
+      <supportedOn ref="windows:SUPPORTED_Windows7" />
+      <enabledValue>
+        <decimal value="1" />
+      </enabledValue>
+      <disabledValue>
+        <decimal value="0" />
+      </disabledValue>
+      <elements>
+        <boolean id="AllowUserInstalls" valueName="AllowUserInstalls">
+          <trueValue>
+            <decimal value="1" />
+          </trueValue>
+          <falseValue>
+            <decimal value="0" />
+          </falseValue>
+        </boolean>
+        <boolean id="AllowUserUninstall" valueName="AllowUserUninstall">
+          <trueValue>
+            <decimal value="1" />
+          </trueValue>
+          <falseValue>
+            <decimal value="0" />
+          </falseValue>
+        </boolean>
+        <boolean id="EnforceRequired" valueName="EnforceRequired">
+          <trueValue>
+            <decimal value="1" />
+          </trueValue>
+          <falseValue>
+            <decimal value="0" />
+          </falseValue>
+        </boolean>
+        <list id="Catalog" key="Software\Policies\STL\Softwarekatalog\Catalog" valuePrefix="Catalog" additive="false" explicitValue="true" />
+        <list id="Required" key="Software\Policies\STL\Softwarekatalog\Required" valuePrefix="Required" additive="false" explicitValue="true" />
+      </elements>
+    </policy>
+  </policies>
+</policyDefinitions>

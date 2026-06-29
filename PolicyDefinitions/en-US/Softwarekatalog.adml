@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0">
+  <displayName>Software Catalog</displayName>
+  <description>Policies for Software Catalog.</description>
+  <resources>
+    <stringTable>
+      <string id="Softwarekatalog">Software Catalog</string>
+      <string id="Softwarekatalog_Settings">Configure Software Catalog</string>
+      <string id="Softwarekatalog_Settings_Help">Enables and configures Software Catalog. Catalog entries are stored below HKLM\Software\Policies\STL\Softwarekatalog\Catalog. Value name is alias, value format is PackageId|DisplayName|Description. Required software is stored below HKLM\Software\Policies\STL\Softwarekatalog\Required. Value name is alias, value is 1. Client reads up to 500 entries per list.</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="Softwarekatalog_Settings">
+        <checkBox refId="AllowUserInstalls">Allow users to install software</checkBox>
+        <checkBox refId="AllowUserUninstall">Allow users to uninstall software</checkBox>
+        <checkBox refId="EnforceRequired">Automatically install required software</checkBox>
+        <listBox refId="Catalog">Allowed software. Name = alias, value = PackageId|DisplayName|Description.</listBox>
+        <listBox refId="Required">Required software. Name = catalog alias, value = 1.</listBox>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>

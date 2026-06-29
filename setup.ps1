@@ -3,7 +3,7 @@ SelfServiceWinget.ps1
 
 Use as:
 - Computer Startup GPO script (default mode = Install)
-- Scheduled task target (Mode = Daemon / UpgradeAll)
+- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy)
 
 Behavior:
 User -> GUI / request helper -> named pipe -> daemon task (SYSTEM) -> winget install --scope machine
@@ -20,7 +20,7 @@ C:\ProgramData\__Softwarekatalog\
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Daemon','UpgradeAll')]
+    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy')]
     [string]$Mode = 'Install'
 )
 
@@ -39,6 +39,10 @@ $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
 $LogDir                 = Join-Path $BaseDir 'Logs'
 $LogFile                = Join-Path $LogDir 'service.log'
+$PolicyRoot             = 'HKLM:\Software\Policies\STL\Softwarekatalog'
+$PolicyCatalogRoot      = Join-Path $PolicyRoot 'Catalog'
+$PolicyRequiredRoot     = Join-Path $PolicyRoot 'Required'
+$PolicyMaxEntries       = 500
 $LegacyQueueTaskName    = 'Softwarekatalog - Winget Queue'
 $DaemonTaskName         = 'Softwarekatalog - Daemon'
 $UpgradeTaskName        = 'Softwarekatalog - Winget Upgrade'
@@ -51,44 +55,6 @@ $CommonDesktopDir       = [Environment]::GetFolderPath('CommonDesktopDirectory')
 $CommonProgramsDir      = [Environment]::GetFolderPath('CommonPrograms')
 $DesktopShortcutPath    = Join-Path $CommonDesktopDir "$CatalogDisplayName.lnk"
 $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
-
-# App catalog configuration (list-based)
-$AllowedApps = @(
-    [ordered]@{ Alias = 'vscode';            Title = 'Visual Studio Code';               Description = 'Leistungsfähiger Quellcode-Editor mit Erweiterungs-Ökosystem';           PackageId = 'Microsoft.VisualStudioCode' }
-    [ordered]@{ Alias = 'notepadpp';         Title = 'Notepad++';                        Description = 'Schneller Text- und Codeeditor mit Syntax-Highlighting';                 PackageId = 'Notepad++.Notepad++' }
-    [ordered]@{ Alias = 'sevenzip';          Title = '7-Zip';                            Description = 'Werkzeug zum Komprimieren und Entpacken von Archivdateien';              PackageId = '7zip.7zip' }
-    [ordered]@{ Alias = 'adobereader';       Title = 'Adobe Acrobat Reader';             Description = 'Betrachter zum Öffnen, Lesen und Drucken von PDF-Dokumenten';            PackageId = 'Adobe.Acrobat.Reader.64-bit' }
-    [ordered]@{ Alias = 'vlc';               Title = 'VLC media player';                 Description = 'Universeller Open-Source-Player für Audio- und Videoformate';            PackageId = 'VideoLAN.VLC' }
-    [ordered]@{ Alias = 'git';               Title = 'Git';                              Description = 'Verteiltes Versionskontrollsystem für Softwareprojekte';                  PackageId = 'Git.Git' }
-    [ordered]@{ Alias = 'python314';         Title = 'Python 3.14';                      Description = 'Interpreter und Laufzeitumgebung für die Programmiersprache Python';     PackageId = 'Python.Python.3.14' }
-    [ordered]@{ Alias = 'bitwarden';         Title = 'Bitwarden';                        Description = 'Open-Source Passwortmanager mit verschlüsseltem Tresor';                 PackageId = 'Bitwarden.Bitwarden' }
-    [ordered]@{ Alias = 'keepass';           Title = 'KeePass';                          Description = 'Lokaler Passwortmanager mit verschlüsselter Datenbank';                  PackageId = 'DominikReichl.KeePass' }
-    [ordered]@{ Alias = 'keepassxc';         Title = 'KeePassXC';                        Description = 'Moderner Open-Source Passwortmanager mit KeePass-Kompatibilität';        PackageId = 'KeePassXCTeam.KeePassXC' }
-    [ordered]@{ Alias = 'gimp';              Title = 'GIMP';                             Description = 'Open-Source Bildbearbeitungsprogramm für Retusche und Grafikdesign';     PackageId = 'GIMP.GIMP.3' }
-    [ordered]@{ Alias = 'inkscape';          Title = 'Inkscape';                         Description = 'Editor für Vektorgrafiken im SVG-Format';                                 PackageId = 'Inkscape.Inkscape' }
-    [ordered]@{ Alias = 'onlyoffice';        Title = 'ONLYOFFICE Desktop Editors';       Description = 'Desktop-Office-Suite für Dokumente, Tabellen und Präsentationen';        PackageId = 'ONLYOFFICE.DesktopEditors' }
-    [ordered]@{ Alias = 'libreoffice';       Title = 'LibreOffice';                      Description = 'Umfangreiche Open-Source-Office-Suite als Microsoft-Office-Alternative'; PackageId = 'TheDocumentFoundation.LibreOffice' }
-    [ordered]@{ Alias = 'triliumnext';       Title = 'Trilium Notes';                    Description = 'Hierarchisches Notizsystem für persönliche Wissensdatenbanken';          PackageId = 'TriliumNext.Notes' }
-    [ordered]@{ Alias = 'logseq';            Title = 'Logseq';                           Description = 'Markdown-basierte Wissens- und Notizverwaltung mit Graphstruktur';       PackageId = 'Logseq.Logseq' }
-    [ordered]@{ Alias = 'superproductivity'; Title = 'Super Productivity';               Description = 'Aufgaben- und Zeitmanagement mit Fokus auf Entwickler-Workflows';        PackageId = 'JohannesMillan.superProductivity' }
-    [ordered]@{ Alias = 'typst';             Title = 'Typst';                            Description = 'Modernes Satzsystem zum Erstellen technisch formatierter Dokumente';     PackageId = 'Typst.Typst' }
-    [ordered]@{ Alias = 'thunderbirdde';     Title = 'Mozilla Thunderbird (DE)';         Description = 'E-Mail-Client mit Kalender, Verschlüsselung und Erweiterungen';          PackageId = 'Mozilla.Thunderbird.de' }
-    [ordered]@{ Alias = 'virtualbox';        Title = 'Oracle VM VirtualBox';             Description = 'Virtualisierungssoftware zum Ausführen mehrerer Betriebssysteme';        PackageId = 'Oracle.VirtualBox' }
-    [ordered]@{ Alias = 'powershell7';      Title = 'PowerShell 7';              Description = 'Moderne plattformübergreifende PowerShell für Automatisierung und Skripting';   PackageId = 'Microsoft.PowerShell' }
-    [ordered]@{ Alias = 'windowsterminal';  Title = 'Windows Terminal';          Description = 'Moderner Terminal für PowerShell, CMD, WSL und SSH';                              PackageId = 'Microsoft.WindowsTerminal' }
-    [ordered]@{ Alias = 'nodejs';           Title = 'Node.js LTS';                Description = 'JavaScript-Laufzeitumgebung für Tools und Anwendungen';                         PackageId = 'OpenJS.NodeJS.LTS' }
-    [ordered]@{ Alias = 'everything';       Title = 'Everything';                 Description = 'Extrem schnelle Dateisuche für Windows';                                          PackageId = 'voidtools.Everything' }
-    [ordered]@{ Alias = 'rufus';            Title = 'Rufus';                      Description = 'Tool zum Erstellen bootfähiger USB-Sticks';                                        PackageId = 'Rufus.Rufus' }
-    [ordered]@{ Alias = 'filezilla';        Title = 'FileZilla Client';           Description = 'FTP-, FTPS- und SFTP-Client für Dateiübertragungen';                              PackageId = 'FileZilla.FileZilla.Client' }
-    [ordered]@{ Alias = 'obs';              Title = 'OBS Studio';                 Description = 'Open-Source Software für Bildschirmaufnahme und Streaming';                      PackageId = 'OBSProject.OBSStudio' }
-    [ordered]@{ Alias = 'powertoys';        Title = 'Microsoft PowerToys';        Description = 'Sammlung nützlicher Produktivitätswerkzeuge für Windows';                         PackageId = 'Microsoft.PowerToys' }
-    [ordered]@{ Alias = 'wireshark';        Title = 'Wireshark';                  Description = 'Netzwerkprotokoll-Analyzer zur Analyse von Netzwerkverkehr';                     PackageId = 'WiresharkFoundation.Wireshark' }
-    [ordered]@{ Alias = 'bruno';            Title = 'Bruno';                      Description = 'Leichtgewichtiger API-Client zum Testen von REST- und HTTP-APIs';                PackageId = 'usebruno.bruno' }
-    [ordered]@{ Alias = 'anki';             Title = 'Anki';                         Description = 'Karteikartenprogramm für effektives Lernen mit Spaced-Repetition';              PackageId = 'Anki.Anki' }
-    [ordered]@{ Alias = 'torbrowser';  Title = 'Tor Browser';  Description = 'Datenschutzorientierter Webbrowser für anonymes Surfen über das Tor-Netzwerk';  PackageId = 'TorProject.TorBrowser' }
-    [ordered]@{ Alias = 'citrixworkspace';  Title = 'Citrix Workspace';  Description = 'Client für den Zugriff auf virtuelle Desktops und Anwendungen über Citrix-Infrastruktur';  PackageId = 'Citrix.Workspace' }
-    [ordered]@{ Alias = 'msoffice';  Title = 'Microsoft 365 Apps for enterprise';  Description = 'Microsoft Office-Desktopanwendungen wie Word, Excel, PowerPoint und Outlook aus Microsoft 365';  PackageId = 'Microsoft.Office' }
-)
 
 # ----------------------------
 # Utility functions
@@ -180,13 +146,146 @@ function Set-FileAclAdminsOnly {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+function Get-PolicyDword {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [int]$Default = 0
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $PolicyRoot)) {
+            return $Default
+        }
+
+        $props = Get-ItemProperty -LiteralPath $PolicyRoot -ErrorAction Stop
+        $property = $props.PSObject.Properties[$Name]
+        if (-not $property) {
+            return $Default
+        }
+
+        return [int]$property.Value
+    }
+    catch {
+        Write-Log "Failed to read policy value '$Name': $($_.Exception.Message)" 'WARN'
+        return $Default
+    }
+}
+
+function Test-SoftwareCatalogPolicyEnabled {
+    (Get-PolicyDword -Name 'Enabled' -Default 0) -eq 1
+}
+
+function Test-UserInstallsAllowed {
+    (Get-PolicyDword -Name 'AllowUserInstalls' -Default 1) -eq 1
+}
+
+function Test-UserUninstallAllowed {
+    (Get-PolicyDword -Name 'AllowUserUninstall' -Default 1) -eq 1
+}
+
+function Test-RequiredEnforcementEnabled {
+    (Get-PolicyDword -Name 'EnforceRequired' -Default 1) -eq 1
+}
+
+function Get-PolicyStringValues {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    try {
+        $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $names = @($item.GetValueNames()) |
+            Where-Object { $_ -and $_ -notmatch '^\*' } |
+            Sort-Object |
+            Select-Object -First $PolicyMaxEntries
+
+        foreach ($name in $names) {
+            $value = [string]$item.GetValue($name, '')
+            if (-not [string]::IsNullOrWhiteSpace($value)) {
+                [pscustomobject]@{
+                    Name  = [string]$name
+                    Value = $value.Trim()
+                }
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed to read policy list '$Path': $($_.Exception.Message)" 'WARN'
+        return @()
+    }
+}
+
 function Get-AppCatalogObjects {
-    foreach ($app in $AllowedApps) {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) {
+        return @()
+    }
+
+    $seenAliases = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $rows = Get-PolicyStringValues -Path $PolicyCatalogRoot
+    foreach ($row in $rows) {
+        $alias = ([string]$row.Name).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($alias)) {
+            continue
+        }
+
+        if (-not $seenAliases.Add($alias)) {
+            Write-Log "Duplicate catalog alias '$alias' in policy; ignoring duplicate." 'WARN'
+            continue
+        }
+
+        $parts = ([string]$row.Value) -split '\|', 3
+        if (@($parts).Count -lt 2) {
+            Write-Log "Malformed catalog row '$alias'. Expected: PackageId|DisplayName|Description" 'WARN'
+            continue
+        }
+
+        $packageId = ([string]$parts[0]).Trim()
+        $displayName = ([string]$parts[1]).Trim()
+        $description = ''
+        if (@($parts).Count -ge 3) {
+            $description = ([string]$parts[2]).Trim()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($packageId)) {
+            Write-Log "Catalog row '$alias' has empty package ID; ignoring." 'WARN'
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($displayName)) {
+            $displayName = $alias
+        }
+
         [pscustomobject]@{
-            Alias       = [string]$app.Alias
-            DisplayName = [string]$app.Title
-            Description = [string]$app.Description
-            PackageId   = [string]$app.PackageId
+            Alias       = $alias
+            DisplayName = $displayName
+            Description = $description
+            PackageId   = $packageId
+        }
+    }
+}
+
+function Get-RequiredAliases {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) {
+        return @()
+    }
+
+    $seenAliases = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $rows = Get-PolicyStringValues -Path $PolicyRequiredRoot
+    foreach ($row in $rows) {
+        $value = ([string]$row.Value).Trim()
+        if ($value -eq '0' -or $value -eq 'false') {
+            continue
+        }
+
+        $alias = ([string]$row.Name).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($alias)) {
+            continue
+        }
+
+        if ($seenAliases.Add($alias)) {
+            $alias
         }
     }
 }
@@ -194,9 +293,21 @@ function Get-AppCatalogObjects {
 function Get-PackageIdByAlias {
     param([Parameter(Mandatory)][string]$Alias)
 
-    foreach ($app in $AllowedApps) {
+    foreach ($app in Get-AppCatalogObjects) {
         if ([string]::Equals([string]$app.Alias, $Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
             return [string]$app.PackageId
+        }
+    }
+
+    return $null
+}
+
+function Get-AppCatalogObjectByAlias {
+    param([Parameter(Mandatory)][string]$Alias)
+
+    foreach ($app in Get-AppCatalogObjects) {
+        if ([string]::Equals([string]$app.Alias, $Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $app
         }
     }
 
@@ -341,7 +452,6 @@ function Ensure-WingetAvailable {
 }
 
 function New-UserRequestTool {
-    $appsJson      = (Get-AppCatalogObjects | ConvertTo-Json -Depth 4)
     $pipeLiteral   = $PipeName.Replace("'", "''")
 
 $content = @"
@@ -357,12 +467,6 @@ param(
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = 'Stop'
 
-`$AppsJson = @'
-$appsJson
-'@
-
-`$Apps = `$AppsJson | ConvertFrom-Json
-`$AllowedAliases = @(`$Apps | ForEach-Object { `$_.Alias })
 `$PipeName = '$pipeLiteral'
 
 function Invoke-CatalogDaemon {
@@ -415,8 +519,9 @@ if (`$Uninstall) {
 }
 
 if (`$List) {
+    `$response = Invoke-CatalogDaemon -Command 'GetCatalog'
     Write-Host 'Freigegebene Anwendungen:'
-    `$Apps | Sort-Object DisplayName | ForEach-Object {
+    @(`$response.Catalog) | Sort-Object DisplayName | ForEach-Object {
         Write-Host (" - {0} [{1}] : {2}" -f `$_.DisplayName, `$_.Alias, `$_.Description)
     }
     exit 0
@@ -427,10 +532,6 @@ if (-not `$AppAlias) {
 }
 
 `$alias = `$AppAlias.Trim().ToLowerInvariant()
-if (`$AllowedAliases -notcontains `$alias) {
-    throw "App-Alias '`$AppAlias' ist nicht freigegeben. Mit -List sehen Sie gültige Aliase."
-}
-
 `$response = Invoke-CatalogDaemon -Command `$Action -Alias `$alias
 
 if (`$Action -eq 'Uninstall') {
@@ -450,7 +551,6 @@ if (`$response.Message) {
 }
 
 function New-CatalogGui {
-    $appsJson         = (Get-AppCatalogObjects | ConvertTo-Json -Depth 4)
     $pipeLiteral      = $PipeName.Replace("'", "''")
     $titleLiteral     = $CatalogDisplayName.Replace("'", "''")
     $logLiteral       = $LogFile.Replace("'", "''")
@@ -510,15 +610,12 @@ public static extern bool DestroyIcon(IntPtr hIcon);
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = 'Stop'
 
-`$AppsJson = @'
-$appsJson
-'@
-
-`$Apps = `$AppsJson | ConvertFrom-Json
 `$PipeName = '$pipeLiteral'
 `$CatalogTitle = '$titleLiteral'
 `$LogFile = '$logLiteral'
 `$InstalledPackagesPath = '$installedLiteral'
+`$AllowUserInstalls = `$true
+`$AllowUserUninstall = `$true
 
 function Set-FormIcon {
     param([Parameter(Mandatory=`$true)]`$Form)
@@ -620,6 +717,13 @@ function New-AppRequest {
     )
 
     return Invoke-CatalogDaemon -Command `$Action -Alias (`$Alias.Trim().ToLowerInvariant())
+}
+
+function Get-CatalogApps {
+    `$response = Invoke-CatalogDaemon -Command 'GetCatalog'
+    `$script:AllowUserInstalls = [bool]`$response.AllowUserInstalls
+    `$script:AllowUserUninstall = [bool]`$response.AllowUserUninstall
+    return @(`$response.Catalog)
 }
 
 function Get-InstalledPackageState {
@@ -786,8 +890,8 @@ function Update-InstallButtonState {
     `$selectedItem = `$list.SelectedItems[0]
     `$state = `$selectedItem.SubItems[2].Text
 
-    `$btnInstall.Enabled = (`$state -eq 'Installierbar')
-    `$btnUninstall.Enabled = (`$state -eq 'Installiert')
+    `$btnInstall.Enabled = (`$script:AllowUserInstalls -and `$state -eq 'Installierbar')
+    `$btnUninstall.Enabled = (`$script:AllowUserUninstall -and `$state -eq 'Installiert')
 }
 
 function Load-AppList {
@@ -800,6 +904,7 @@ function Load-AppList {
 
         `$list.Items.Clear()
 
+        `$apps = Get-CatalogApps
         `$installedState = Get-InstalledPackageState
         `$installedSet = `$installedState.PackageSet
 
@@ -809,7 +914,7 @@ function Load-AppList {
 
         `$installedNames = New-Object 'System.Collections.Generic.List[string]'
 
-        foreach (`$app in (`$Apps | Sort-Object DisplayName)) {
+        foreach (`$app in (`$apps | Sort-Object DisplayName)) {
             `$state = Get-AppStatus -App `$app -InstalledSet `$installedSet
 
             `$item = New-Object System.Windows.Forms.ListViewItem(`$app.DisplayName)
@@ -1419,6 +1524,99 @@ function Update-InstalledPackagesSnapshot {
     }
 }
 
+function Get-InstalledPackageIdSet {
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+    if (-not (Test-Path -LiteralPath $InstalledPackagesPath)) {
+        return $set
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $InstalledPackagesPath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $set
+        }
+
+        $snapshot = $raw | ConvertFrom-Json
+        foreach ($id in @($snapshot.InstalledPackageIds)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$id)) {
+                [void]$set.Add(([string]$id).Trim())
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed to read installed package snapshot: $($_.Exception.Message)" 'WARN'
+    }
+
+    return $set
+}
+
+function Invoke-RequiredSoftwarePolicy {
+    param([Parameter(Mandatory)][string]$WingetPath)
+
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) {
+        Write-Log 'Required software policy skipped because Softwarekatalog policy is disabled or not configured.' 'WARN'
+        return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0 }
+    }
+
+    if (-not (Test-RequiredEnforcementEnabled)) {
+        Write-Log 'Required software enforcement is disabled by policy.'
+        return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0 }
+    }
+
+    $requiredAliases = @(Get-RequiredAliases)
+    if ($requiredAliases.Count -lt 1) {
+        Write-Log 'No required software configured by policy.'
+        return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0 }
+    }
+
+    $installedCount = 0
+    $failedCount = 0
+    $skippedCount = 0
+
+    $result = Invoke-WithWingetLock -ScriptBlock {
+        $snapshotUpdated = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
+        if (-not $snapshotUpdated) {
+            throw 'Could not refresh installed package snapshot before required software enforcement.'
+        }
+
+        $installedSet = Get-InstalledPackageIdSet
+        foreach ($alias in $requiredAliases) {
+            $app = Get-AppCatalogObjectByAlias -Alias $alias
+            if (-not $app) {
+                Write-Log "Required alias '$alias' is not present in catalog policy; skipping." 'WARN'
+                $skippedCount++
+                continue
+            }
+
+            if ($installedSet.Contains([string]$app.PackageId)) {
+                $skippedCount++
+                continue
+            }
+
+            Write-Log "Installing required software alias '$($app.Alias)' package '$($app.PackageId)'."
+            $exitCode = Invoke-WingetInstall -WingetPath $WingetPath -PackageId ([string]$app.PackageId)
+            if ($exitCode -eq 0) {
+                $installedCount++
+                [void]$installedSet.Add([string]$app.PackageId)
+            }
+            else {
+                $failedCount++
+                Write-Log "Required install failed for alias '$($app.Alias)' package '$($app.PackageId)' with code $exitCode." 'ERROR'
+            }
+        }
+
+        $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
+        [pscustomobject]@{
+            Installed = $installedCount
+            Failed    = $failedCount
+            Skipped   = $skippedCount
+        }
+    }
+
+    return @($result)[-1]
+}
+
 function New-CatalogPipeSecurity {
     $pipeSecurity = New-Object System.IO.Pipes.PipeSecurity
 
@@ -1523,7 +1721,52 @@ function Invoke-CatalogDaemonCommand {
     $command = $command.Trim().ToLowerInvariant()
 
     switch ($command) {
+        'getcatalog' {
+            $catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
+            $requiredAliases = @(Get-RequiredAliases)
+            return [pscustomobject]@{
+                Success            = $true
+                Command            = $command
+                RequestedBy        = $ClientIdentity.Name
+                RequestedBySid     = $ClientIdentity.Sid
+                Catalog            = $catalog
+                RequiredAliases    = $requiredAliases
+                AllowUserInstalls  = (Test-UserInstallsAllowed)
+                AllowUserUninstall = (Test-UserUninstallAllowed)
+                EnforceRequired    = (Test-RequiredEnforcementEnabled)
+                Message            = 'Katalog geladen.'
+            }
+        }
+
+        'applypolicy' {
+            Write-Log "Authenticated policy apply requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
+            $wingetPath = Ensure-WingetAvailable
+            if (-not $wingetPath) {
+                throw 'winget is unavailable.'
+            }
+
+            $result = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
+            return [pscustomobject]@{
+                Success        = ($result.Failed -eq 0)
+                Command        = $command
+                RequestedBy    = $ClientIdentity.Name
+                RequestedBySid = $ClientIdentity.Sid
+                Installed      = $result.Installed
+                Failed         = $result.Failed
+                Skipped        = $result.Skipped
+                Message        = "Policy angewendet. Installiert=$($result.Installed), Fehler=$($result.Failed), Übersprungen=$($result.Skipped)."
+            }
+        }
+
         { $_ -in @('install','uninstall') } {
+            if ($command -eq 'install' -and -not (Test-UserInstallsAllowed)) {
+                throw 'Benutzerinstallationen sind per Richtlinie deaktiviert.'
+            }
+
+            if ($command -eq 'uninstall' -and -not (Test-UserUninstallAllowed)) {
+                throw 'Benutzerdeinstallationen sind per Richtlinie deaktiviert.'
+            }
+
             $appAliasProperty = $Request.PSObject.Properties['AppAlias']
             if (-not $appAliasProperty -or [string]::IsNullOrWhiteSpace([string]$appAliasProperty.Value)) {
                 throw 'Missing AppAlias.'
@@ -1619,13 +1862,11 @@ function Start-CatalogDaemon {
     try {
         $wingetPath = Ensure-WingetAvailable
         if ($wingetPath) {
-            Invoke-WithWingetLock -ScriptBlock {
-                $null = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
-            }
+            $null = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
         }
     }
     catch {
-        Write-Log "Initial installed package snapshot failed: $($_.Exception.Message)" 'WARN'
+        Write-Log "Initial required software enforcement failed: $($_.Exception.Message)" 'WARN'
     }
 
     while ($true) {
@@ -1700,6 +1941,33 @@ function Invoke-UpgradeAllMode {
     else {
         Write-Log "2-hour winget upgrade failed with code $($result.ExitCode). SnapshotUpdated=$($result.SnapshotUpdated)." 'WARN'
     }
+
+    try {
+        $requiredResult = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
+        Write-Log "Required policy after upgrade completed. Installed=$($requiredResult.Installed), Failed=$($requiredResult.Failed), Skipped=$($requiredResult.Skipped)."
+    }
+    catch {
+        Write-Log "Required policy after upgrade failed: $($_.Exception.Message)" 'ERROR'
+    }
+}
+
+function Invoke-ApplyPolicyMode {
+    Ensure-Directory -Path $BaseDir
+    Ensure-Directory -Path $LogDir
+
+    $wingetPath = Ensure-WingetAvailable
+    if (-not $wingetPath) {
+        Write-Log 'Aborting policy apply because winget is unavailable.' 'ERROR'
+        return
+    }
+
+    $result = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
+    if ($result.Failed -eq 0) {
+        Write-Log "Required policy apply completed. Installed=$($result.Installed), Failed=$($result.Failed), Skipped=$($result.Skipped)."
+    }
+    else {
+        Write-Log "Required policy apply completed with failures. Installed=$($result.Installed), Failed=$($result.Failed), Skipped=$($result.Skipped)." 'WARN'
+    }
 }
 
 function Install-Service {
@@ -1741,6 +2009,7 @@ try {
         'Install'    { Install-Service }
         'Daemon'     { Start-CatalogDaemon }
         'UpgradeAll' { Invoke-UpgradeAllMode }
+        'ApplyPolicy' { Invoke-ApplyPolicyMode }
         default      { throw "Unsupported mode '$Mode'." }
     }
 }
