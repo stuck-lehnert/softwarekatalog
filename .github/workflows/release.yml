@@ -38,53 +38,191 @@ jobs:
           (cd package && zip -r "../${archive}" LICENSE setup.ps1 PolicyDefinitions)
 
       - name: Create or update release
-        uses: actions/github-script@v7
+        shell: bash
         env:
-          SHORT_SHA: ${{ env.SHORT_SHA }}
-          ARCHIVE: ${{ env.ARCHIVE }}
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
+          ACTION_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
 
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const tag = process.env.SHORT_SHA;
-            const archive = process.env.ARCHIVE;
+          token="${RELEASE_TOKEN:-${ACTION_TOKEN:-}}"
+          : "${token:?No release token available}"
+          : "${GITHUB_API_URL:?GITHUB_API_URL is required}"
+          : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+          : "${GITHUB_SHA:?GITHUB_SHA is required}"
+          : "${SHORT_SHA:?SHORT_SHA is required}"
+          : "${ARCHIVE:?ARCHIVE is required}"
 
-            let release;
-            try {
-              const existing = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
-              release = existing.data;
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              const created = await github.rest.repos.createRelease({
-                owner,
-                repo,
-                tag_name: tag,
-                target_commitish: context.sha,
-                name: tag,
-                body: `Automated build for ${context.sha}.`,
-              });
-              release = created.data;
-            }
+          api="${GITHUB_API_URL}"
+          repo="${GITHUB_REPOSITORY}"
+          tag="${SHORT_SHA}"
+          archive="${ARCHIVE}"
+          asset_name="$(basename "${archive}")"
+          encoded_asset_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "${asset_name}")"
 
-            const assetName = path.basename(archive);
-            for (const asset of release.assets || []) {
-              if (asset.name === assetName) {
-                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
-              }
-            }
+          if [ "${GITEA_ACTIONS:-}" = "true" ]; then
+            platform="gitea"
+            auth_header="Authorization: token ${token}"
+          else
+            platform="github"
+            auth_header="Authorization: Bearer ${token}"
+          fi
 
-            const data = fs.readFileSync(archive);
-            await github.rest.repos.uploadReleaseAsset({
-              owner,
-              repo,
-              release_id: release.id,
-              name: assetName,
-              data,
-              headers: {
-                'content-type': 'application/zip',
-                'content-length': data.length,
-              },
-            });
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "${tmpdir}"' EXIT
+
+          curl_json() {
+            local method="$1"
+            local url="$2"
+            local out="$3"
+            shift 3
+
+            curl -sS -L \
+              -X "${method}" \
+              -H "Accept: application/json" \
+              -H "${auth_header}" \
+              "$@" \
+              -o "${out}" \
+              -w "%{http_code}" \
+              "${url}"
+          }
+
+          python3 - <<'PY' > "${tmpdir}/create-release.json"
+          import json
+          import os
+
+          print(json.dumps({
+              "tag_name": os.environ["SHORT_SHA"],
+              "target_commitish": os.environ["GITHUB_SHA"],
+              "name": os.environ["SHORT_SHA"],
+              "body": f"Automated build for {os.environ['GITHUB_SHA']}.",
+              "draft": False,
+              "prerelease": False,
+          }))
+          PY
+
+          release_json="${tmpdir}/release.json"
+
+          status="$(
+            curl_json GET \
+              "${api}/repos/${repo}/releases/tags/${tag}" \
+              "${release_json}"
+          )"
+
+          if [ "${status}" = "404" ]; then
+            status="$(
+              curl_json POST \
+                "${api}/repos/${repo}/releases" \
+                "${release_json}" \
+                -H "Content-Type: application/json" \
+                --data-binary "@${tmpdir}/create-release.json"
+            )"
+
+            if [ "${status}" != "201" ]; then
+              echo "Failed to create release. HTTP ${status}"
+              cat "${release_json}"
+              exit 1
+            fi
+          elif [ "${status}" != "200" ]; then
+            echo "Failed to look up release. HTTP ${status}"
+            cat "${release_json}"
+            exit 1
+          fi
+
+          release_id="$(
+            python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' \
+              "${release_json}"
+          )"
+
+          assets_json="${tmpdir}/assets.json"
+
+          status="$(
+            curl_json GET \
+              "${api}/repos/${repo}/releases/${release_id}/assets" \
+              "${assets_json}"
+          )"
+
+          if [ "${status}" != "200" ]; then
+            echo "Failed to list release assets. HTTP ${status}"
+            cat "${assets_json}"
+            exit 1
+          fi
+
+          existing_asset_id="$(
+            python3 - "${assets_json}" "${asset_name}" <<'PY'
+          import json
+          import sys
+
+          assets = json.load(open(sys.argv[1]))
+          wanted = sys.argv[2]
+
+          for asset in assets:
+              if asset.get("name") == wanted:
+                  print(asset["id"])
+                  break
+          PY
+          )"
+
+          if [ -n "${existing_asset_id}" ]; then
+            delete_json="${tmpdir}/delete-asset.json"
+
+            if [ "${platform}" = "gitea" ]; then
+              delete_url="${api}/repos/${repo}/releases/${release_id}/assets/${existing_asset_id}"
+            else
+              delete_url="${api}/repos/${repo}/releases/assets/${existing_asset_id}"
+            fi
+
+            status="$(curl_json DELETE "${delete_url}" "${delete_json}")"
+
+            case "${status}" in
+              200|204) ;;
+              *)
+                echo "Failed to delete existing asset. HTTP ${status}"
+                cat "${delete_json}"
+                exit 1
+                ;;
+            esac
+          fi
+
+          upload_json="${tmpdir}/upload-asset.json"
+
+          if [ "${platform}" = "gitea" ]; then
+            status="$(
+              curl -sS -L \
+                -X POST \
+                -H "Accept: application/json" \
+                -H "${auth_header}" \
+                -F "attachment=@${archive};type=application/zip" \
+                -o "${upload_json}" \
+                -w "%{http_code}" \
+                "${api}/repos/${repo}/releases/${release_id}/assets?name=${encoded_asset_name}"
+            )"
+          else
+            upload_url="$(
+              python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["upload_url"].split("{", 1)[0])' \
+                "${release_json}"
+            )"
+
+            status="$(
+              curl -sS -L \
+                -X POST \
+                -H "Accept: application/vnd.github+json" \
+                -H "${auth_header}" \
+                -H "Content-Type: application/zip" \
+                --data-binary "@${archive}" \
+                -o "${upload_json}" \
+                -w "%{http_code}" \
+                "${upload_url}?name=${encoded_asset_name}"
+            )"
+          fi
+
+          case "${status}" in
+            200|201)
+              echo "Uploaded ${asset_name} to ${platform} release ${tag}."
+              ;;
+            *)
+              echo "Failed to upload release asset. HTTP ${status}"
+              cat "${upload_json}"
+              exit 1
+              ;;
+          esac
