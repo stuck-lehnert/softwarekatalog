@@ -1194,6 +1194,45 @@ function Get-AppStatus {
     return 'Installierbar'
 }
 
+function Test-RequestQueuedInState {
+    param(
+        [Parameter(Mandatory=`$true)][string]`$Alias,
+        [Parameter(Mandatory=`$true)][string]`$Action
+    )
+
+    if (-not (Test-Path -LiteralPath `$QueueStatePath)) {
+        return `$false
+    }
+
+    try {
+        `$raw = Get-Content -LiteralPath `$QueueStatePath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace(`$raw)) {
+            return `$false
+        }
+
+        `$queueState = `$raw | ConvertFrom-Json
+        foreach (`$item in @(`$queueState.Queue)) {
+            if (-not `$item) { continue }
+            if (`$item.CreatedAt) {
+                try {
+                    `$createdAt = [DateTime]::Parse([string]`$item.CreatedAt)
+                    if (`$createdAt -lt (Get-Date).AddMinutes(-10)) { continue }
+                }
+                catch {
+                }
+            }
+            if (`$item.State -notin @('Queued','Running','Succeeded')) { continue }
+            if (-not [string]::Equals([string]`$item.Alias, `$Alias, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if (-not [string]::Equals([string]`$item.Action, `$Action, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            return `$true
+        }
+    }
+    catch {
+    }
+
+    return `$false
+}
+
 `$form = New-Object System.Windows.Forms.Form
 `$form.Text = `$CatalogTitle
 `$form.StartPosition = 'CenterScreen'
@@ -1660,7 +1699,11 @@ function Start-CatalogDaemonRunspaceRequest {
             }
         }
         catch {
-            `$completion.ErrorMessage = `$_.Exception.Message
+            `$exception = `$_.Exception
+            while (`$exception.InnerException) {
+                `$exception = `$exception.InnerException
+            }
+            `$completion.ErrorMessage = `$exception.Message
         }
 
         try {
@@ -1707,7 +1750,21 @@ function Start-AppRequestAsync {
             `$script:RequestWorkerBusy = `$false
             `$btnRefresh.Enabled = `$true
 
+            if (`$completion.Context.Action -eq 'Uninstall') {
+                `$verb = 'Deinstallation'
+            }
+            else {
+                `$verb = 'Installation'
+            }
+
             if (`$completion.ErrorMessage) {
+                `$requestReachedQueue = (`$completion.ErrorMessage -like '*Zeitüberschreitung beim Warten auf Antwort*' -and (Test-RequestQueuedInState -Alias `$completion.Context.Alias -Action `$completion.Context.Action))
+                if (`$requestReachedQueue) {
+                    `$status.Text = "`$verb eingereiht: {0}" -f `$completion.Context.DisplayName
+                    `$script:StateRefreshPending = `$true
+                    return
+                }
+
                 `$status.Text = 'Fehler: ' + `$completion.ErrorMessage
                 `$script:StateRefreshPending = `$true
                 [System.Windows.Forms.MessageBox]::Show(
@@ -1724,12 +1781,6 @@ function Start-AppRequestAsync {
                 Alias = `$completion.Context.Alias
                 DisplayName = `$completion.Context.DisplayName
                 Response = `$completion.Response
-            }
-            if (`$result.Action -eq 'Uninstall') {
-                `$verb = 'Deinstallation'
-            }
-            else {
-                `$verb = 'Installation'
             }
             if (`$result.Response.Message) {
                 `$status.Text = [string]`$result.Response.Message
@@ -1910,6 +1961,7 @@ function Start-RefreshStatusAsync {
 
 `$stateRefreshTimer.Add_Tick({
     if (-not `$script:StateRefreshPending) { return }
+    if (`$script:RequestWorkerBusy) { return }
     `$script:StateRefreshPending = `$false
     try { Load-AppList }
     catch { `$status.Text = "Fehler bei automatischer Aktualisierung: " + `$_.Exception.Message }
