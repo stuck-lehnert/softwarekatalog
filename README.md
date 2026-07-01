@@ -2,7 +2,7 @@
 
 Windows self-service software catalog backed by `winget`.
 
-Users install approved software through a small GUI or request helper. A SYSTEM scheduled task runs a named-pipe daemon, authenticates the connecting Windows user, validates requests against Group Policy, then queues work for a SYSTEM `winget` worker.
+Users install approved software through a small GUI or request helper. User tools write request files to a controlled drop directory. A SYSTEM scheduled task validates those requests against Group Policy, queues approved work, then runs a SYSTEM `winget` worker.
 
 ## What It Does
 
@@ -14,6 +14,7 @@ Users install approved software through a small GUI or request helper. A SYSTEM 
 - Shows current queue task and progress in the GUI.
 - Runs `winget upgrade --all` every 2 hours.
 - Tracks installed state from `winget export`, not from request history.
+- Polls user request files every minute; no long-lived user-facing daemon is required.
 
 ## Policy
 
@@ -71,8 +72,16 @@ Generated files are written to:
 C:\ProgramData\__Softwarekatalog\
 ```
 
+Runtime request files are written below:
+
+```text
+C:\ProgramData\__Softwarekatalog\Requests\
+C:\ProgramData\__Softwarekatalog\Processed\
+C:\ProgramData\__Softwarekatalog\Failed\
+```
+
 ## Notes
 
 - Requires Windows, Desktop App Installer, and `winget`.
-- The daemon runs as `LocalSystem`; keep catalog policy restricted to trusted admins.
+- SYSTEM scheduled tasks validate and execute requests; keep catalog policy restricted to trusted admins.
 - Package IDs and silent machine-scope support depend on upstream `winget` packages.

@@ -3,10 +3,10 @@ SelfServiceWinget.ps1
 
 Use as:
 - Computer Startup GPO script (default mode = Install)
-- Scheduled task target (Mode = Daemon / UpgradeAll / ApplyPolicy / ProcessQueue / ProcessRequest)
+- Scheduled task target (Mode = ProcessRequests / UpgradeAll / ApplyPolicy / ProcessQueue / ProcessRequest)
 
 Behavior:
-User -> GUI / request helper -> named pipe -> daemon task (SYSTEM) -> winget install --scope machine
+User -> GUI / request helper -> request drop dir -> SYSTEM request worker -> winget install --scope machine
 
 Created paths:
 C:\ProgramData\__Softwarekatalog\
@@ -15,12 +15,15 @@ C:\ProgramData\__Softwarekatalog\
   Software-Catalog.ps1
   Launch-Software-Catalog.vbs
   Installed-Packages.json
+  Requests\
+  Processed\
+  Failed\
   Logs\service.log
 #>
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Install','Daemon','UpgradeAll','ApplyPolicy','ProcessQueue','ProcessRequest')]
+    [ValidateSet('Install','UpgradeAll','ApplyPolicy','ProcessQueue','ProcessRequest','ProcessRequests')]
     [string]$Mode = 'Install',
     [ValidateSet('Install','Uninstall')]
     [string]$RequestAction = 'Install',
@@ -43,6 +46,9 @@ $CatalogGuiPath         = Join-Path $BaseDir 'Software-Catalog.ps1'
 $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
 $QueueStatePath         = Join-Path $BaseDir 'Queue-State.json'
+$RequestsDir            = Join-Path $BaseDir 'Requests'
+$ProcessedRequestsDir   = Join-Path $BaseDir 'Processed'
+$FailedRequestsDir      = Join-Path $BaseDir 'Failed'
 $LogDir                 = Join-Path $BaseDir 'Logs'
 $LogFile                = Join-Path $LogDir 'service.log'
 $PolicyRoot             = 'HKLM:\Software\Policies\STL\Softwarekatalog'
@@ -51,8 +57,8 @@ $PolicyRequiredRoot     = Join-Path $PolicyRoot 'Required'
 $PolicyMaxEntries       = 500
 $LegacyQueueTaskName    = 'Softwarekatalog - Winget Queue'
 $DaemonTaskName         = 'Softwarekatalog - Daemon'
+$RequestTaskName        = 'Softwarekatalog - Requests'
 $UpgradeTaskName        = 'Softwarekatalog - Winget Upgrade'
-$PipeName               = 'Softwarekatalog'
 $WingetMutexName        = 'Global\Softwarekatalog-Winget'
 $QueueStateMutexName    = 'Global\Softwarekatalog-QueueState'
 $PowerShellExe          = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -62,7 +68,6 @@ $CommonDesktopDir       = [Environment]::GetFolderPath('CommonDesktopDirectory')
 $CommonProgramsDir      = [Environment]::GetFolderPath('CommonPrograms')
 $DesktopShortcutPath    = Join-Path $CommonDesktopDir "$CatalogDisplayName.lnk"
 $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
-$script:DaemonPostResponseWorkers = @()
 
 # ----------------------------
 # Utility functions
@@ -123,6 +128,43 @@ function Set-DirectoryAcl {
     $null = $acl.AddAccessRule($ruleSystem)
     $null = $acl.AddAccessRule($ruleAdmins)
     $null = $acl.AddAccessRule($ruleUsers)
+
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+function Set-RequestDirectoryAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $inheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+    $noInheritance = [System.Security.AccessControl.InheritanceFlags]::None
+    $noPropagation = [System.Security.AccessControl.PropagationFlags]::None
+
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $sidCreatorOwner = New-Object System.Security.Principal.SecurityIdentifier('S-1-3-0')
+
+    $ruleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sidSystem, 'FullControl', $inheritance, $noPropagation, 'Allow'
+    )
+    $ruleAdmins = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sidAdmins, 'FullControl', $inheritance, $noPropagation, 'Allow'
+    )
+    $ruleUsers = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sidUsers, 'ReadAndExecute, Write, Synchronize', $noInheritance, $noPropagation, 'Allow'
+    )
+    $ruleCreatorOwner = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $sidCreatorOwner, 'Modify', $inheritance, $inheritOnly, 'Allow'
+    )
+
+    $null = $acl.AddAccessRule($ruleSystem)
+    $null = $acl.AddAccessRule($ruleAdmins)
+    $null = $acl.AddAccessRule($ruleUsers)
+    $null = $acl.AddAccessRule($ruleCreatorOwner)
 
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
@@ -676,7 +718,7 @@ function Get-WorkerScriptPath {
 
 function Start-SoftwarekatalogWorker {
     param(
-        [Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessRequest','ProcessQueue')][string]$WorkerMode,
+        [Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessRequest','ProcessRequests','ProcessQueue')][string]$WorkerMode,
         [ValidateSet('Install','Uninstall')][string]$WorkerAction = 'Install',
         [string]$WorkerAlias,
         [string]$WorkerRequestedBy,
@@ -709,28 +751,6 @@ function Start-SoftwarekatalogWorker {
 
 function Start-QueueWorker {
     Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
-}
-
-function Add-DaemonPostResponseWorker {
-    param([Parameter(Mandatory)][ValidateSet('ApplyPolicy','ProcessQueue')][string]$WorkerMode)
-
-    if (-not $script:DaemonPostResponseWorkers) {
-        $script:DaemonPostResponseWorkers = @()
-    }
-    $script:DaemonPostResponseWorkers = @($script:DaemonPostResponseWorkers + $WorkerMode)
-}
-
-function Invoke-DaemonPostResponseWorkers {
-    foreach ($workerMode in @($script:DaemonPostResponseWorkers | Select-Object -Unique)) {
-        try {
-            Start-SoftwarekatalogWorker -WorkerMode $workerMode
-        }
-        catch {
-            Write-Log "Could not start post-response worker '$workerMode': $($_.Exception.Message)" 'WARN'
-        }
-    }
-
-    $script:DaemonPostResponseWorkers = @()
 }
 
 function Get-WingetPath {
@@ -825,7 +845,10 @@ function Ensure-WingetAvailable {
 }
 
 function New-UserRequestTool {
-    $pipeLiteral   = $PipeName.Replace("'", "''")
+    $requestsLiteral = $RequestsDir.Replace("'", "''")
+    $policyRootLiteral = $PolicyRoot.Replace("'", "''")
+    $policyCatalogLiteral = $PolicyCatalogRoot.Replace("'", "''")
+    $policyMaxEntriesLiteral = $PolicyMaxEntries
 
 $content = @"
 [CmdletBinding()]
@@ -840,58 +863,102 @@ param(
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = 'Stop'
 
-`$PipeName = '$pipeLiteral'
+`$RequestsDir = '$requestsLiteral'
+`$PolicyRoot = '$policyRootLiteral'
+`$PolicyCatalogRoot = '$policyCatalogLiteral'
+`$PolicyMaxEntries = $policyMaxEntriesLiteral
 
-function Invoke-CatalogDaemon {
+function Get-PolicyDword {
+    param([Parameter(Mandatory=`$true)][string]`$Name, [int]`$Default = 0)
+
+    try {
+        if (-not (Test-Path -LiteralPath `$PolicyRoot)) { return `$Default }
+        `$props = Get-ItemProperty -LiteralPath `$PolicyRoot -ErrorAction Stop
+        `$property = `$props.PSObject.Properties[`$Name]
+        if (-not `$property) { return `$Default }
+        return [int]`$property.Value
+    }
+    catch {
+        return `$Default
+    }
+}
+
+function Test-SoftwareCatalogPolicyEnabled {
+    (Get-PolicyDword -Name 'Enabled' -Default 0) -eq 1
+}
+
+function Get-PolicyStringValues {
+    param([Parameter(Mandatory=`$true)][string]`$Path)
+
+    if (-not (Test-Path -LiteralPath `$Path)) { return @() }
+
+    try {
+        `$item = Get-Item -LiteralPath `$Path -ErrorAction Stop
+        `$names = @(`$item.GetValueNames()) |
+            Where-Object { `$_ -and `$_ -notmatch '^\*' } |
+            Sort-Object |
+            Select-Object -First `$PolicyMaxEntries
+
+        foreach (`$name in `$names) {
+            `$value = [string]`$item.GetValue(`$name, '')
+            if (-not [string]::IsNullOrWhiteSpace(`$value)) {
+                [pscustomobject]@{ Name = [string]`$name; Value = `$value.Trim() }
+            }
+        }
+    }
+    catch {
+        return @()
+    }
+}
+
+function Get-AppCatalogObjects {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
+
+    foreach (`$row in Get-PolicyStringValues -Path `$PolicyCatalogRoot) {
+        `$alias = ([string]`$row.Name).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace(`$alias)) { continue }
+
+        `$parts = ([string]`$row.Value) -split '\|', 3
+        if (@(`$parts).Count -lt 2) { continue }
+
+        `$packageId = ([string]`$parts[0]).Trim()
+        `$displayName = ([string]`$parts[1]).Trim()
+        `$description = ''
+        if (@(`$parts).Count -ge 3) { `$description = ([string]`$parts[2]).Trim() }
+        if ([string]::IsNullOrWhiteSpace(`$packageId)) { continue }
+        if ([string]::IsNullOrWhiteSpace(`$displayName)) { `$displayName = `$alias }
+
+        [pscustomobject]@{
+            Alias = `$alias
+            DisplayName = `$displayName
+            Description = `$description
+            PackageId = `$packageId
+        }
+    }
+}
+
+function New-CatalogRequestFile {
     param(
-        [Parameter(Mandatory=`$true)][string]`$Command,
+        [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall','RefreshStatus')][string]`$Command,
         [string]`$Alias
     )
 
+    if (-not (Test-Path -LiteralPath `$RequestsDir)) {
+        throw "Request directory '`$RequestsDir' does not exist. Run setup first."
+    }
+
+    `$id = [Guid]::NewGuid().ToString('N')
     `$payload = [ordered]@{
-        Command  = `$Command
+        Id = `$id
+        Command = `$Command
         AppAlias = `$Alias
+        CreatedAt = (Get-Date).ToString('o')
     }
-    `$json = `$payload | ConvertTo-Json -Compress
 
-    `$encoding = New-Object System.Text.UTF8Encoding(`$false)
-    `$client = New-Object System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
-        '.',
-        `$PipeName,
-        [System.IO.Pipes.PipeDirection]::InOut,
-        [System.IO.Pipes.PipeOptions]::None,
-        [System.Security.Principal.TokenImpersonationLevel]::Impersonation
-    )
-
-    try {
-        `$client.Connect(10000)
-        `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
-        `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
-        `$writer.AutoFlush = `$true
-        `$writer.WriteLine(`$json)
-
-        `$readTask = `$reader.ReadLineAsync()
-        if (-not `$readTask.Wait(15000)) {
-            throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
-        }
-        `$line = `$readTask.Result
-        if ([string]::IsNullOrWhiteSpace(`$line)) {
-            throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
-        }
-
-        `$response = `$line | ConvertFrom-Json
-        if (-not `$response.Success) {
-            throw ([string]`$response.Message)
-        }
-
-        return `$response
-    }
-    catch [System.TimeoutException] {
-        throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
-    }
-    finally {
-        `$client.Dispose()
-    }
+    `$tempPath = Join-Path `$RequestsDir ("`$id.tmp")
+    `$finalPath = Join-Path `$RequestsDir ("`$id.json")
+    `$payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `$tempPath -Encoding UTF8
+    Move-Item -LiteralPath `$tempPath -Destination `$finalPath -Force
 }
 
 if (`$Uninstall) {
@@ -899,9 +966,8 @@ if (`$Uninstall) {
 }
 
 if (`$List) {
-    `$response = Invoke-CatalogDaemon -Command 'GetCatalog'
     Write-Host 'Freigegebene Anwendungen:'
-    @(`$response.Catalog) | Sort-Object DisplayName | ForEach-Object {
+    @(Get-AppCatalogObjects) | Sort-Object DisplayName | ForEach-Object {
         Write-Host (" - {0} [{1}] : {2}" -f `$_.DisplayName, `$_.Alias, `$_.Description)
     }
     exit 0
@@ -912,17 +978,18 @@ if (-not `$AppAlias) {
 }
 
 `$alias = `$AppAlias.Trim().ToLowerInvariant()
-`$response = Invoke-CatalogDaemon -Command `$Action -Alias `$alias
+`$app = @(Get-AppCatalogObjects) | Where-Object { [string]::Equals([string]`$_.Alias, `$alias, [System.StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+if (-not `$app) {
+    throw "Alias '`$alias' ist nicht freigegeben."
+}
+
+New-CatalogRequestFile -Command `$Action -Alias `$alias
 
 if (`$Action -eq 'Uninstall') {
-    Write-Host "Deinstallation für '`$alias' eingereiht."
+    Write-Host "Deinstallation für '`$alias' angefordert."
 }
 else {
-    Write-Host "Installation für '`$alias' eingereiht."
-}
-
-if (`$response.Message) {
-    Write-Host `$response.Message
+    Write-Host "Installation für '`$alias' angefordert."
 }
 "@
 
@@ -931,11 +998,15 @@ if (`$response.Message) {
 }
 
 function New-CatalogGui {
-    $pipeLiteral      = $PipeName.Replace("'", "''")
     $titleLiteral     = $CatalogDisplayName.Replace("'", "''")
     $logLiteral       = $LogFile.Replace("'", "''")
     $installedLiteral = $InstalledPackagesPath.Replace("'", "''")
     $queueStateLiteral = $QueueStatePath.Replace("'", "''")
+    $requestsLiteral = $RequestsDir.Replace("'", "''")
+    $policyRootLiteral = $PolicyRoot.Replace("'", "''")
+    $policyCatalogLiteral = $PolicyCatalogRoot.Replace("'", "''")
+    $policyRequiredLiteral = $PolicyRequiredRoot.Replace("'", "''")
+    $policyMaxEntriesLiteral = $PolicyMaxEntries
 
 $content = @"
 Add-Type -AssemblyName System.Windows.Forms
@@ -991,11 +1062,15 @@ public static extern bool DestroyIcon(IntPtr hIcon);
 Set-StrictMode -Version Latest
 `$ErrorActionPreference = 'Stop'
 
-`$PipeName = '$pipeLiteral'
 `$CatalogTitle = '$titleLiteral'
 `$LogFile = '$logLiteral'
 `$InstalledPackagesPath = '$installedLiteral'
 `$QueueStatePath = '$queueStateLiteral'
+`$RequestsDir = '$requestsLiteral'
+`$PolicyRoot = '$policyRootLiteral'
+`$PolicyCatalogRoot = '$policyCatalogLiteral'
+`$PolicyRequiredRoot = '$policyRequiredLiteral'
+`$PolicyMaxEntries = $policyMaxEntriesLiteral
 `$AllowUserInstalls = `$true
 `$AllowUserUninstall = `$true
 `$RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1003,6 +1078,7 @@ Set-StrictMode -Version Latest
 `$LastQueue = @()
 `$LastCurrent = `$null
 `$LastInstalledIds = @()
+`$PendingRequests = @{}
 
 function Set-FormIcon {
     param([Parameter(Mandatory=`$true)]`$Form)
@@ -1052,56 +1128,189 @@ function Set-FormIcon {
     }
 }
 
-function Invoke-CatalogDaemon {
+function Invoke-CatalogLocal {
     param(
         [Parameter(Mandatory=`$true)][string]`$Command,
         [string]`$Alias
     )
 
-    `$payload = [ordered]@{
-        Command  = `$Command
-        AppAlias = `$Alias
-    }
-    `$json = `$payload | ConvertTo-Json -Compress
+    `$commandName = `$Command.Trim().ToLowerInvariant()
+    switch (`$commandName) {
+        { `$_ -in @('getcatalog','getstate') } {
+            `$queueState = Get-QueueStateSnapshot
+            return [pscustomobject]@{
+                Success = `$true
+                Command = `$commandName
+                Catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
+                RequiredAliases = @(Get-RequiredAliases)
+                Queue = @(`$queueState.Queue)
+                Current = `$queueState.Current
+                Version = `$queueState.Version
+                InstalledPackageIds = @(Get-InstalledPackageIds)
+                AllowUserInstalls = (Test-UserInstallsAllowed)
+                AllowUserUninstall = (Test-UserUninstallAllowed)
+                EnforceRequired = (Test-RequiredEnforcementEnabled)
+                Message = 'Katalog geladen.'
+            }
+        }
 
-    `$encoding = New-Object System.Text.UTF8Encoding(`$false)
-    `$client = New-Object System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
-        '.',
-        `$PipeName,
-        [System.IO.Pipes.PipeDirection]::InOut,
-        [System.IO.Pipes.PipeOptions]::None,
-        [System.Security.Principal.TokenImpersonationLevel]::Impersonation
-    )
+        { `$_ -in @('install','uninstall','refreshstatus') } {
+            if (`$commandName -eq 'install') { `$requestCommand = 'Install' }
+            elseif (`$commandName -eq 'uninstall') { `$requestCommand = 'Uninstall' }
+            else { `$requestCommand = 'RefreshStatus' }
+
+            New-CatalogRequestFile -Command `$requestCommand -Alias `$Alias
+            return [pscustomobject]@{
+                Success = `$true
+                Command = `$commandName
+                AppAlias = `$Alias
+                Queued = `$true
+                Message = 'Anfrage gespeichert.'
+            }
+        }
+
+        default {
+            throw "Unsupported command '`$Command'."
+        }
+    }
+}
+
+function Get-PolicyDword {
+    param([Parameter(Mandatory=`$true)][string]`$Name, [int]`$Default = 0)
 
     try {
-        `$client.Connect(10000)
-        `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
-        `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
-        `$writer.AutoFlush = `$true
-        `$writer.WriteLine(`$json)
-
-        `$readTask = `$reader.ReadLineAsync()
-        if (-not `$readTask.Wait(15000)) {
-            throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
-        }
-        `$line = `$readTask.Result
-        if ([string]::IsNullOrWhiteSpace(`$line)) {
-            throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
-        }
-
-        `$response = `$line | ConvertFrom-Json
-        if (-not `$response.Success) {
-            throw ([string]`$response.Message)
-        }
-
-        return `$response
+        if (-not (Test-Path -LiteralPath `$PolicyRoot)) { return `$Default }
+        `$props = Get-ItemProperty -LiteralPath `$PolicyRoot -ErrorAction Stop
+        `$property = `$props.PSObject.Properties[`$Name]
+        if (-not `$property) { return `$Default }
+        return [int]`$property.Value
     }
-    catch [System.TimeoutException] {
-        throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
+    catch {
+        return `$Default
     }
-    finally {
-        `$client.Dispose()
+}
+
+function Test-SoftwareCatalogPolicyEnabled { (Get-PolicyDword -Name 'Enabled' -Default 0) -eq 1 }
+function Test-UserInstallsAllowed { (Get-PolicyDword -Name 'AllowUserInstalls' -Default 1) -eq 1 }
+function Test-UserUninstallAllowed { (Get-PolicyDword -Name 'AllowUserUninstall' -Default 1) -eq 1 }
+function Test-RequiredEnforcementEnabled { (Get-PolicyDword -Name 'EnforceRequired' -Default 1) -eq 1 }
+
+function Get-PolicyStringValues {
+    param([Parameter(Mandatory=`$true)][string]`$Path)
+
+    if (-not (Test-Path -LiteralPath `$Path)) { return @() }
+
+    try {
+        `$item = Get-Item -LiteralPath `$Path -ErrorAction Stop
+        `$names = @(`$item.GetValueNames()) |
+            Where-Object { `$_ -and `$_ -notmatch '^\*' } |
+            Sort-Object |
+            Select-Object -First `$PolicyMaxEntries
+
+        foreach (`$name in `$names) {
+            `$value = [string]`$item.GetValue(`$name, '')
+            if (-not [string]::IsNullOrWhiteSpace(`$value)) {
+                [pscustomobject]@{ Name = [string]`$name; Value = `$value.Trim() }
+            }
+        }
     }
+    catch {
+        return @()
+    }
+}
+
+function Get-AppCatalogObjects {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
+
+    foreach (`$row in Get-PolicyStringValues -Path `$PolicyCatalogRoot) {
+        `$alias = ([string]`$row.Name).Trim().ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace(`$alias)) { continue }
+
+        `$parts = ([string]`$row.Value) -split '\|', 3
+        if (@(`$parts).Count -lt 2) { continue }
+
+        `$packageId = ([string]`$parts[0]).Trim()
+        `$displayName = ([string]`$parts[1]).Trim()
+        `$description = ''
+        if (@(`$parts).Count -ge 3) { `$description = ([string]`$parts[2]).Trim() }
+        if ([string]::IsNullOrWhiteSpace(`$packageId)) { continue }
+        if ([string]::IsNullOrWhiteSpace(`$displayName)) { `$displayName = `$alias }
+
+        [pscustomobject]@{
+            Alias = `$alias
+            DisplayName = `$displayName
+            Description = `$description
+            PackageId = `$packageId
+        }
+    }
+}
+
+function Get-RequiredAliases {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
+
+    foreach (`$row in Get-PolicyStringValues -Path `$PolicyRequiredRoot) {
+        `$value = ([string]`$row.Value).Trim()
+        if (`$value -eq '0' -or `$value -eq 'false') { continue }
+        `$alias = ([string]`$row.Name).Trim().ToLowerInvariant()
+        if (-not [string]::IsNullOrWhiteSpace(`$alias)) { `$alias }
+    }
+}
+
+function Get-QueueStateSnapshot {
+    `$state = [pscustomobject][ordered]@{ Version = 0; UpdatedAt = `$null; Current = `$null; Queue = @() }
+    if (-not (Test-Path -LiteralPath `$QueueStatePath)) { return `$state }
+
+    try {
+        `$raw = Get-Content -LiteralPath `$QueueStatePath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace(`$raw)) { return `$state }
+        `$loaded = `$raw | ConvertFrom-Json
+        if (`$loaded.PSObject.Properties['Version']) { `$state.Version = [int64]`$loaded.Version }
+        if (`$loaded.PSObject.Properties['UpdatedAt']) { `$state.UpdatedAt = `$loaded.UpdatedAt }
+        if (`$loaded.PSObject.Properties['Current']) { `$state.Current = `$loaded.Current }
+        if (`$loaded.PSObject.Properties['Queue'] -and `$loaded.Queue) { `$state.Queue = @(`$loaded.Queue) }
+    }
+    catch {
+    }
+
+    return `$state
+}
+
+function Get-InstalledPackageIds {
+    if (-not (Test-Path -LiteralPath `$InstalledPackagesPath)) { return @() }
+
+    try {
+        `$raw = Get-Content -LiteralPath `$InstalledPackagesPath -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace(`$raw)) { return @() }
+        `$snapshot = `$raw | ConvertFrom-Json
+        return @(`$snapshot.InstalledPackageIds)
+    }
+    catch {
+        return @()
+    }
+}
+
+function New-CatalogRequestFile {
+    param(
+        [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall','RefreshStatus')][string]`$Command,
+        [string]`$Alias
+    )
+
+    if (-not (Test-Path -LiteralPath `$RequestsDir)) {
+        throw "Anfrageverzeichnis '`$RequestsDir' fehlt. Bitte Setup erneut ausführen."
+    }
+
+    `$id = [Guid]::NewGuid().ToString('N')
+    `$payload = [ordered]@{
+        Id = `$id
+        Command = `$Command
+        AppAlias = `$Alias
+        CreatedAt = (Get-Date).ToString('o')
+    }
+
+    `$tempPath = Join-Path `$RequestsDir ("`$id.tmp")
+    `$finalPath = Join-Path `$RequestsDir ("`$id.json")
+    `$payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `$tempPath -Encoding UTF8
+    Move-Item -LiteralPath `$tempPath -Destination `$finalPath -Force
 }
 
 function New-AppRequest {
@@ -1110,11 +1319,11 @@ function New-AppRequest {
         [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall')][string]`$Action
     )
 
-    return Invoke-CatalogDaemon -Command `$Action -Alias (`$Alias.Trim().ToLowerInvariant())
+    return Invoke-CatalogLocal -Command `$Action -Alias (`$Alias.Trim().ToLowerInvariant())
 }
 
 function Get-CatalogApps {
-    `$response = Invoke-CatalogDaemon -Command 'GetState'
+    `$response = Invoke-CatalogLocal -Command 'GetState'
     `$script:AllowUserInstalls = [bool]`$response.AllowUserInstalls
     `$script:AllowUserUninstall = [bool]`$response.AllowUserUninstall
     `$script:RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1173,12 +1382,26 @@ function Get-AppStatus {
     foreach (`$queued in @(`$QueueItems)) {
         if (-not `$queued) { continue }
         if (`$queued.State -in @('Queued','Running') -and [string]::Equals([string]`$queued.Alias, [string]`$App.Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]`$script:PendingRequests.Remove([string]`$App.Alias)
             if (`$queued.State -eq 'Running') {
                 if (`$queued.Action -eq 'Uninstall') { return 'Wird deinstalliert' }
                 return 'Wird installiert'
             }
 
             if (`$queued.Action -eq 'Uninstall') { return 'Deinstallation in Warteschlange' }
+            return 'In Warteschlange'
+        }
+    }
+
+    `$pending = `$script:PendingRequests[[string]`$App.Alias]
+    if (`$pending) {
+        if (`$pending.CreatedAt -lt (Get-Date).AddMinutes(-5)) {
+            [void]`$script:PendingRequests.Remove([string]`$App.Alias)
+        }
+        elseif (`$pending.Action -eq 'Uninstall') {
+            return 'Deinstallation in Warteschlange'
+        }
+        else {
             return 'In Warteschlange'
         }
     }
@@ -1533,193 +1756,6 @@ function Load-AppList {
 `$stateRefreshTimer.Interval = 500
 `$script:StateRefreshPending = `$false
 `$script:RequestWorkerBusy = `$false
-`$script:RunspaceJobs = @()
-`$script:CatalogClosing = `$false
-
-function Remove-CatalogRunspaceJob {
-    param(
-        [Parameter(Mandatory=`$true)]`$Job,
-        [switch]`$Stop
-    )
-
-    try {
-        if (`$null -ne `$Job.Timer) {
-            `$Job.Timer.Stop()
-            `$Job.Timer.Dispose()
-        }
-    }
-    catch {
-    }
-
-    try {
-        if (`$Stop -and `$null -ne `$Job.PowerShell -and `$null -ne `$Job.AsyncResult -and -not `$Job.AsyncResult.IsCompleted) {
-            `$null = `$Job.PowerShell.BeginStop(`$null, `$null)
-        }
-    }
-    catch {
-        try { `$Job.PowerShell.Stop() } catch { }
-    }
-
-    try {
-        if (`$null -ne `$Job.PowerShell) { `$Job.PowerShell.Dispose() }
-    }
-    catch {
-    }
-
-    try {
-        if (`$null -ne `$Job.Runspace) { `$Job.Runspace.Dispose() }
-    }
-    catch {
-    }
-
-    `$remainingJobs = @()
-    foreach (`$existingJob in @(`$script:RunspaceJobs)) {
-        if (-not [object]::ReferenceEquals(`$existingJob, `$Job)) {
-            `$remainingJobs += `$existingJob
-        }
-    }
-    `$script:RunspaceJobs = `$remainingJobs
-}
-
-function Start-CatalogDaemonRunspaceRequest {
-    param(
-        [Parameter(Mandatory=`$true)][string]`$Command,
-        [string]`$Alias,
-        `$Context,
-        [Parameter(Mandatory=`$true)][scriptblock]`$OnCompleted
-    )
-
-    `$runspace = [runspacefactory]::CreateRunspace()
-    `$powershell = [powershell]::Create()
-    `$timer = New-Object System.Windows.Forms.Timer
-    `$timer.Interval = 100
-
-    `$job = [pscustomobject]@{
-        PowerShell  = `$powershell
-        Runspace    = `$runspace
-        AsyncResult = `$null
-        Timer       = `$timer
-        Context     = `$Context
-        OnCompleted = `$OnCompleted
-    }
-
-    try {
-        `$runspace.ApartmentState = 'MTA'
-        `$runspace.ThreadOptions = 'ReuseThread'
-        `$runspace.Open()
-        `$runspace.SessionStateProxy.SetVariable('PipeName', `$PipeName)
-        `$runspace.SessionStateProxy.SetVariable('Command', `$Command)
-        `$runspace.SessionStateProxy.SetVariable('Alias', `$Alias)
-
-        `$powershell.Runspace = `$runspace
-        [void]`$powershell.AddScript({
-            Set-StrictMode -Version Latest
-            `$ErrorActionPreference = 'Stop'
-
-            `$payload = [ordered]@{
-                Command  = `$Command
-                AppAlias = `$Alias
-            }
-            `$json = `$payload | ConvertTo-Json -Compress
-
-            `$encoding = New-Object System.Text.UTF8Encoding(`$false)
-            `$client = New-Object System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
-                '.',
-                `$PipeName,
-                [System.IO.Pipes.PipeDirection]::InOut,
-                [System.IO.Pipes.PipeOptions]::None,
-                [System.Security.Principal.TokenImpersonationLevel]::Impersonation
-            )
-
-            try {
-                `$client.Connect(10000)
-                `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
-                `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
-                `$writer.AutoFlush = `$true
-                `$writer.WriteLine(`$json)
-
-                `$readTask = `$reader.ReadLineAsync()
-                if (-not `$readTask.Wait(15000)) {
-                    throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
-                }
-                `$line = `$readTask.Result
-                if ([string]::IsNullOrWhiteSpace(`$line)) {
-                    throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
-                }
-
-                `$response = `$line | ConvertFrom-Json
-                if (-not `$response.Success) {
-                    throw ([string]`$response.Message)
-                }
-
-                return `$response
-            }
-            catch [System.TimeoutException] {
-                throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
-            }
-            finally {
-                `$client.Dispose()
-            }
-        }.ToString())
-
-        `$job.AsyncResult = `$powershell.BeginInvoke()
-    }
-    catch {
-        `$timer.Dispose()
-        `$powershell.Dispose()
-        `$runspace.Dispose()
-        throw
-    }
-
-    `$script:RunspaceJobs = @(`$script:RunspaceJobs + `$job)
-    `$jobRef = `$job
-    `$timer.Add_Tick({
-        if (`$null -eq `$jobRef.AsyncResult -or -not `$jobRef.AsyncResult.IsCompleted) { return }
-
-        `$jobRef.Timer.Stop()
-        `$completion = [pscustomobject]@{
-            Context      = `$jobRef.Context
-            Response     = `$null
-            ErrorMessage = `$null
-        }
-
-        try {
-            `$result = @(`$jobRef.PowerShell.EndInvoke(`$jobRef.AsyncResult))
-            if (`$jobRef.PowerShell.Streams.Error.Count -gt 0) {
-                `$firstError = `$jobRef.PowerShell.Streams.Error[0]
-                if (`$null -ne `$firstError.Exception) {
-                    `$completion.ErrorMessage = `$firstError.Exception.Message
-                }
-                else {
-                    `$completion.ErrorMessage = [string]`$firstError
-                }
-            }
-            elseif (`$result.Count -gt 0) {
-                `$completion.Response = `$result[-1]
-            }
-        }
-        catch {
-            `$exception = `$_.Exception
-            while (`$exception.InnerException) {
-                `$exception = `$exception.InnerException
-            }
-            `$completion.ErrorMessage = `$exception.Message
-        }
-
-        try {
-            if (-not `$script:CatalogClosing) {
-                & `$jobRef.OnCompleted `$completion
-            }
-        }
-        catch {
-            try { `$status.Text = 'Fehler: ' + `$_.Exception.Message } catch { }
-        }
-        finally {
-            Remove-CatalogRunspaceJob -Job `$jobRef
-        }
-    }.GetNewClosure())
-    `$timer.Start()
-}
 
 function Start-AppRequestAsync {
     param(
@@ -1737,77 +1773,26 @@ function Start-AppRequestAsync {
     `$btnUninstall.Enabled = `$false
     `$btnRefresh.Enabled = `$false
 
-    `$context = [pscustomobject]@{
-        Action = `$Action
-        Alias = [string]`$Selected.Alias
-        DisplayName = [string]`$Selected.DisplayName
-    }
-
     try {
-        Start-CatalogDaemonRunspaceRequest -Command `$Action -Alias `$context.Alias -Context `$context -OnCompleted ({
-            param(`$completion)
-        try {
-            `$script:RequestWorkerBusy = `$false
-            `$btnRefresh.Enabled = `$true
-
-            if (`$completion.Context.Action -eq 'Uninstall') {
-                `$verb = 'Deinstallation'
-            }
-            else {
-                `$verb = 'Installation'
-            }
-
-            if (`$completion.ErrorMessage) {
-                `$requestReachedQueue = (`$completion.ErrorMessage -like '*Zeitüberschreitung beim Warten auf Antwort*' -and (Test-RequestQueuedInState -Alias `$completion.Context.Alias -Action `$completion.Context.Action))
-                if (`$requestReachedQueue) {
-                    `$status.Text = "`$verb eingereiht: {0}" -f `$completion.Context.DisplayName
-                    `$script:StateRefreshPending = `$true
-                    return
-                }
-
-                `$status.Text = 'Fehler: ' + `$completion.ErrorMessage
-                `$script:StateRefreshPending = `$true
-                [System.Windows.Forms.MessageBox]::Show(
-                    `$completion.ErrorMessage,
-                    `$CatalogTitle,
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Error
-                ) | Out-Null
-                return
-            }
-
-            `$result = [pscustomobject]@{
-                Action = `$completion.Context.Action
-                Alias = `$completion.Context.Alias
-                DisplayName = `$completion.Context.DisplayName
-                Response = `$completion.Response
-            }
-            if (`$result.Response.Message) {
-                `$status.Text = [string]`$result.Response.Message
-            }
-            else {
-                `$status.Text = "`$verb eingereiht: {0}" -f `$result.DisplayName
-            }
-
-            [System.Windows.Forms.MessageBox]::Show(
-                ("`$verb eingereiht:`r`n`r`n{0}`r`nAlias: {1}" -f `$result.DisplayName, `$result.Alias),
-                `$CatalogTitle,
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Information
-            ) | Out-Null
-
-            `$script:StateRefreshPending = `$true
-        }
-        finally {
-            Update-InstallButtonState
-        }
-        }.GetNewClosure())
+        `$response = New-AppRequest -Alias ([string]`$Selected.Alias) -Action `$Action
+        `$script:PendingRequests[[string]`$Selected.Alias] = [pscustomobject]@{ Action = `$Action; CreatedAt = (Get-Date) }
+        if (`$Action -eq 'Uninstall') { `$verb = 'Deinstallation' } else { `$verb = 'Installation' }
+        if (`$response.Message) { `$status.Text = [string]`$response.Message } else { `$status.Text = "`$verb angefordert: {0}" -f `$Selected.DisplayName }
+        [System.Windows.Forms.MessageBox]::Show(
+            ("`$verb angefordert:`r`n`r`n{0}`r`nAlias: {1}" -f `$Selected.DisplayName, `$Selected.Alias),
+            `$CatalogTitle,
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information
+        ) | Out-Null
+        `$script:StateRefreshPending = `$true
     }
     catch {
+        throw
+    }
+    finally {
         `$script:RequestWorkerBusy = `$false
         `$btnRefresh.Enabled = `$true
         Update-InstallButtonState
-        throw
     }
 }
 
@@ -1824,37 +1809,17 @@ function Start-RefreshStatusAsync {
     `$status.Text = 'Installationsdaten-Aktualisierung wird angefordert...'
 
     try {
-        Start-CatalogDaemonRunspaceRequest -Command 'RefreshStatus' -OnCompleted ({
-            param(`$completion)
-        try {
-            `$script:RequestWorkerBusy = `$false
-            `$btnRefresh.Enabled = `$true
-
-            if (`$completion.ErrorMessage) {
-                `$status.Text = 'Fehler: ' + `$completion.ErrorMessage
-                [System.Windows.Forms.MessageBox]::Show(
-                    `$completion.ErrorMessage,
-                    `$CatalogTitle,
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Error
-                ) | Out-Null
-                return
-            }
-
-            `$response = `$completion.Response
-            if (`$response.Message) { `$status.Text = [string]`$response.Message }
-            `$script:StateRefreshPending = `$true
-        }
-        finally {
-            Update-InstallButtonState
-        }
-        }.GetNewClosure())
+        `$response = Invoke-CatalogLocal -Command 'RefreshStatus'
+        if (`$response.Message) { `$status.Text = [string]`$response.Message } else { `$status.Text = 'Installationsdaten-Aktualisierung angefordert.' }
+        `$script:StateRefreshPending = `$true
     }
     catch {
+        throw
+    }
+    finally {
         `$script:RequestWorkerBusy = `$false
         `$btnRefresh.Enabled = `$true
         Update-InstallButtonState
-        throw
     }
 }
 
@@ -2032,15 +1997,10 @@ function Start-RefreshStatusAsync {
     `$stateRefreshTimer.Start()
 })
 `$form.Add_FormClosing({
-    `$script:CatalogClosing = `$true
     `$stateRefreshTimer.Stop()
     `$stateRefreshTimer.Dispose()
     if (`$null -ne `$script:StateWatcher) { `$script:StateWatcher.Dispose() }
     if (`$null -ne `$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
-    foreach (`$job in @(`$script:RunspaceJobs)) {
-        Remove-CatalogRunspaceJob -Job `$job -Stop
-    }
-    `$script:RunspaceJobs = @()
 })
 
 `$list.Add_SelectedIndexChanged({ Update-InstallButtonState })
@@ -2143,13 +2103,13 @@ function Register-OrUpdateTasks {
     try {
         $existingDaemon = Get-ScheduledTask -TaskName $DaemonTaskName -ErrorAction SilentlyContinue
         if ($existingDaemon) {
-            Write-Log "Stopping scheduled task '$DaemonTaskName' before update."
+            Write-Log "Removing obsolete scheduled task '$DaemonTaskName'."
             Stop-ScheduledTask -TaskName $DaemonTaskName -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $DaemonTaskName -Confirm:$false
         }
     }
     catch {
-        Write-Log "Could not stop daemon task '$DaemonTaskName': $($_.Exception.Message)" 'WARN'
+        Write-Log "Could not remove daemon task '$DaemonTaskName': $($_.Exception.Message)" 'WARN'
     }
 
     $principal = New-ScheduledTaskPrincipal `
@@ -2157,26 +2117,29 @@ function Register-OrUpdateTasks {
         -LogonType ServiceAccount `
         -RunLevel Highest
 
-    Write-Log "Registering/updating scheduled task '$DaemonTaskName'."
-    $daemonArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode Daemon"
-    $daemonAction = New-ScheduledTaskAction -Execute $PowerShellExe -Argument $daemonArgs
-    $daemonTrigger = New-ScheduledTaskTrigger -AtStartup
-    $daemonSettings = New-ScheduledTaskSettingsSet `
+    Write-Log "Registering/updating scheduled task '$RequestTaskName'."
+    $requestArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode ProcessRequests"
+    $requestAction = New-ScheduledTaskAction -Execute $PowerShellExe -Argument $requestArgs
+    $requestStartupTrigger = New-ScheduledTaskTrigger -AtStartup
+    $requestPollTrigger = New-ScheduledTaskTrigger `
+        -Once `
+        -At ((Get-Date).AddMinutes(1)) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $requestSettings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries `
         -StartWhenAvailable `
         -MultipleInstances IgnoreNew `
-        -ExecutionTimeLimit (New-TimeSpan -Seconds 0) `
-        -RestartCount 3 `
-        -RestartInterval (New-TimeSpan -Minutes 1)
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
 
-    $daemonTask = New-ScheduledTask `
-        -Action $daemonAction `
-        -Trigger $daemonTrigger `
+    $requestTask = New-ScheduledTask `
+        -Action $requestAction `
+        -Trigger @($requestStartupTrigger, $requestPollTrigger) `
         -Principal $principal `
-        -Settings $daemonSettings
+        -Settings $requestSettings
 
-    Register-ScheduledTask -TaskName $DaemonTaskName -InputObject $daemonTask -Force | Out-Null
+    Register-ScheduledTask -TaskName $RequestTaskName -InputObject $requestTask -Force | Out-Null
 
     Write-Log "Registering/updating scheduled task '$UpgradeTaskName'."
     $upgradeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode UpgradeAll"
@@ -2202,10 +2165,10 @@ function Register-OrUpdateTasks {
     Register-ScheduledTask -TaskName $UpgradeTaskName -InputObject $upgradeTask -Force | Out-Null
 
     try {
-        Start-ScheduledTask -TaskName $DaemonTaskName
+        Start-ScheduledTask -TaskName $RequestTaskName
     }
     catch {
-        Write-Log "Could not start daemon task '$DaemonTaskName': $($_.Exception.Message)" 'WARN'
+        Write-Log "Could not start request task '$RequestTaskName': $($_.Exception.Message)" 'WARN'
     }
 }
 
@@ -2489,301 +2452,6 @@ function Invoke-RequiredSoftwarePolicy {
     return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0; Queued = $queued }
 }
 
-function New-CatalogPipeSecurity {
-    $pipeSecurity = New-Object System.IO.Pipes.PipeSecurity
-
-    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
-    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-    $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
-
-    $ruleSystem = New-Object System.IO.Pipes.PipeAccessRule(
-        $sidSystem,
-        [System.IO.Pipes.PipeAccessRights]::FullControl,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $ruleAdmins = New-Object System.IO.Pipes.PipeAccessRule(
-        $sidAdmins,
-        [System.IO.Pipes.PipeAccessRights]::FullControl,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-    $ruleUsers = New-Object System.IO.Pipes.PipeAccessRule(
-        $sidUsers,
-        [System.IO.Pipes.PipeAccessRights]::ReadWrite,
-        [System.Security.AccessControl.AccessControlType]::Allow
-    )
-
-    $null = $pipeSecurity.AddAccessRule($ruleSystem)
-    $null = $pipeSecurity.AddAccessRule($ruleAdmins)
-    $null = $pipeSecurity.AddAccessRule($ruleUsers)
-
-    return $pipeSecurity
-}
-
-function New-CatalogPipeServer {
-    $pipeSecurity = New-CatalogPipeSecurity
-    return New-Object System.IO.Pipes.NamedPipeServerStream -ArgumentList @(
-        $PipeName,
-        [System.IO.Pipes.PipeDirection]::InOut,
-        1,
-        [System.IO.Pipes.PipeTransmissionMode]::Byte,
-        [System.IO.Pipes.PipeOptions]::None,
-        4096,
-        4096,
-        $pipeSecurity
-    )
-}
-
-function Get-PipeClientIdentity {
-    param([Parameter(Mandatory)][System.IO.Pipes.NamedPipeServerStream]$Pipe)
-
-    $script:PipeClientIdentityName = $null
-    $script:PipeClientIdentitySid = $null
-
-    try {
-        $Pipe.RunAsClient([System.IO.Pipes.PipeStreamImpersonationWorker]{
-            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-            $script:PipeClientIdentityName = $identity.Name
-            if ($identity.User) {
-                $script:PipeClientIdentitySid = $identity.User.Value
-            }
-        })
-    }
-    catch {
-        try {
-            $script:PipeClientIdentityName = $Pipe.GetImpersonationUserName()
-        }
-        catch {
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($script:PipeClientIdentityName)) {
-        $script:PipeClientIdentityName = 'Unknown'
-    }
-
-    return [pscustomobject]@{
-        Name = $script:PipeClientIdentityName
-        Sid  = $script:PipeClientIdentitySid
-    }
-}
-
-function Invoke-CatalogDaemonCommand {
-    param(
-        [Parameter(Mandatory)]$Request,
-        [Parameter(Mandatory)]$ClientIdentity
-    )
-
-    if (-not $ClientIdentity -or [string]::IsNullOrWhiteSpace($ClientIdentity.Name) -or $ClientIdentity.Name -eq 'Unknown') {
-        throw 'Named pipe client could not be authenticated.'
-    }
-
-    $command = $null
-    $commandProperty = $Request.PSObject.Properties['Command']
-    $actionProperty = $Request.PSObject.Properties['Action']
-    if ($commandProperty -and $commandProperty.Value) {
-        $command = [string]$commandProperty.Value
-    }
-    elseif ($actionProperty -and $actionProperty.Value) {
-        $command = [string]$actionProperty.Value
-    }
-
-    if ([string]::IsNullOrWhiteSpace($command)) {
-        throw 'Missing command.'
-    }
-
-    $command = $command.Trim().ToLowerInvariant()
-
-    switch ($command) {
-        { $_ -in @('getcatalog','getstate') } {
-            $requiredQueued = Ensure-RequiredSoftwareQueued
-            if ($requiredQueued -gt 0) {
-                Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
-            }
-            $catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
-            $requiredAliases = @(Get-RequiredAliases)
-            $requiredSet = Get-RequiredAliasSet
-            $installedIds = @((Get-InstalledPackageIdSet) | ForEach-Object { [string]$_ })
-            $queueState = Get-QueueStateSnapshot
-            return [pscustomobject]@{
-                Success            = $true
-                Command            = $command
-                RequestedBy        = $ClientIdentity.Name
-                RequestedBySid     = $ClientIdentity.Sid
-                Catalog            = $catalog
-                RequiredAliases    = $requiredAliases
-                Queue              = @($queueState.Queue)
-                Current            = $queueState.Current
-                Version            = $queueState.Version
-                InstalledPackageIds = $installedIds
-                AllowUserInstalls  = (Test-UserInstallsAllowed)
-                AllowUserUninstall = (Test-UserUninstallAllowed)
-                EnforceRequired    = (Test-RequiredEnforcementEnabled)
-                Message            = 'Katalog geladen.'
-            }
-        }
-
-        'applypolicy' {
-            Write-Log "Authenticated policy apply requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-            Add-DaemonPostResponseWorker -WorkerMode ApplyPolicy
-            return [pscustomobject]@{
-                Success        = $true
-                Command        = $command
-                RequestedBy    = $ClientIdentity.Name
-                RequestedBySid = $ClientIdentity.Sid
-                Message        = 'Policyanwendung gestartet.'
-            }
-        }
-
-        { $_ -in @('install','uninstall') } {
-            if ($command -eq 'install' -and -not (Test-UserInstallsAllowed)) {
-                throw 'Benutzerinstallationen sind per Richtlinie deaktiviert.'
-            }
-
-            if ($command -eq 'uninstall' -and -not (Test-UserUninstallAllowed)) {
-                throw 'Benutzerdeinstallationen sind per Richtlinie deaktiviert.'
-            }
-
-            $appAliasProperty = $Request.PSObject.Properties['AppAlias']
-            if (-not $appAliasProperty -or [string]::IsNullOrWhiteSpace([string]$appAliasProperty.Value)) {
-                throw 'Missing AppAlias.'
-            }
-
-            $alias = ([string]$appAliasProperty.Value).Trim().ToLowerInvariant()
-            $packageId = Get-PackageIdByAlias -Alias $alias
-            if (-not $packageId) {
-                throw "Alias '$alias' is not in the allowlist."
-            }
-
-            $requiredSet = Get-RequiredAliasSet
-            if ($command -eq 'uninstall' -and $requiredSet.Contains($alias)) {
-                throw 'Pflichtsoftware kann nicht deinstalliert werden.'
-            }
-
-            $actionText = if ($command -eq 'uninstall') { 'uninstall' } else { 'install' }
-            Write-Log "Authenticated request: action=$actionText alias='$alias' package='$packageId' user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-
-            $queueResult = Add-SoftwareRequestToQueue -Action $command -Alias $alias -RequestedBy $ClientIdentity.Name -RequestedBySid $ClientIdentity.Sid -Source User
-            Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
-
-            if ($command -eq 'uninstall') {
-                $verb = 'Deinstallation'
-            }
-            else {
-                $verb = 'Installation'
-            }
-            if ($queueResult.Added) {
-                $message = "$verb eingereiht: $alias"
-            }
-            else {
-                $message = "$verb ist bereits in der Warteschlange: $alias"
-            }
-            return [pscustomobject]@{
-                Success         = $true
-                Command         = $command
-                AppAlias        = $alias
-                PackageId       = $packageId
-                RequestedBy     = $ClientIdentity.Name
-                RequestedBySid  = $ClientIdentity.Sid
-                QueueId         = $queueResult.Item.Id
-                Queued          = $true
-                Message         = $message
-            }
-        }
-
-        { $_ -in @('refreshstatus','getstatus') } {
-            Write-Log "Authenticated status refresh requested by user='$($ClientIdentity.Name)' sid='$($ClientIdentity.Sid)'"
-            $started = $false
-            if (Test-WingetLockAvailable) {
-                Add-DaemonPostResponseWorker -WorkerMode ProcessQueue
-                $started = $true
-            }
-            if ($started) {
-                $message = 'Installationsdaten-Aktualisierung gestartet.'
-            }
-            else {
-                $message = 'Installationsdaten-Aktualisierung läuft bereits.'
-            }
-
-            return [pscustomobject]@{
-                Success         = $true
-                Command         = $command
-                RequestedBy     = $ClientIdentity.Name
-                RequestedBySid  = $ClientIdentity.Sid
-                SnapshotQueued  = $started
-                Message         = $message
-            }
-        }
-
-        default {
-            throw "Unsupported command '$command'."
-        }
-    }
-}
-
-function Start-CatalogDaemon {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
-
-    Write-Log "Named pipe daemon starting on '\\.\pipe\$PipeName'."
-
-    try {
-        Start-SoftwarekatalogWorker -WorkerMode ApplyPolicy
-    }
-    catch {
-        Write-Log "Could not start initial required software enforcement worker: $($_.Exception.Message)" 'WARN'
-    }
-
-    while ($true) {
-        $pipe = $null
-        try {
-            $script:DaemonPostResponseWorkers = @()
-            $pipe = New-CatalogPipeServer
-            $pipe.WaitForConnection()
-
-            $clientIdentity = Get-PipeClientIdentity -Pipe $pipe
-            $encoding = New-Object System.Text.UTF8Encoding($false)
-            $reader = New-Object System.IO.StreamReader($pipe, $encoding)
-            $writer = New-Object System.IO.StreamWriter($pipe, $encoding)
-            $writer.AutoFlush = $true
-
-            $response = $null
-            try {
-                $readTask = $reader.ReadLineAsync()
-                if (-not $readTask.Wait(30000)) {
-                    throw 'Timed out waiting for named pipe request.'
-                }
-                $line = $readTask.Result
-                if ([string]::IsNullOrWhiteSpace($line)) {
-                    throw 'Empty request.'
-                }
-
-                $request = $line | ConvertFrom-Json
-                $response = Invoke-CatalogDaemonCommand -Request $request -ClientIdentity $clientIdentity
-            }
-            catch {
-                Write-Log "Named pipe request failed: $($_.Exception.Message)" 'ERROR'
-                $response = [pscustomobject]@{
-                    Success        = $false
-                    RequestedBy    = $clientIdentity.Name
-                    RequestedBySid = $clientIdentity.Sid
-                    Message        = $_.Exception.Message
-                }
-            }
-
-            $writer.WriteLine(($response | ConvertTo-Json -Compress -Depth 6))
-            Invoke-DaemonPostResponseWorkers
-        }
-        catch {
-            Write-Log "Named pipe daemon error: $($_.Exception.Message)" 'ERROR'
-            Start-Sleep -Seconds 3
-        }
-        finally {
-            if ($pipe) {
-                $pipe.Dispose()
-            }
-        }
-    }
-}
-
 function Reset-RunningQueueItems {
     $null = Update-QueueState -ScriptBlock {
         param($state)
@@ -3003,19 +2671,186 @@ function Invoke-ProcessRequestMode {
     Start-QueueWorker
 }
 
+function Get-RequestFileOwnerInfo {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $ownerName = 'Unknown'
+    $ownerSid = $null
+
+    try {
+        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if ($acl.Owner) {
+            $ownerName = [string]$acl.Owner
+            try {
+                $account = New-Object System.Security.Principal.NTAccount($ownerName)
+                $ownerSid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+            }
+            catch {
+            }
+        }
+    }
+    catch {
+        Write-Log "Could not read request file owner '$Path': $($_.Exception.Message)" 'WARN'
+    }
+
+    [pscustomobject]@{
+        Name = $ownerName
+        Sid  = $ownerSid
+    }
+}
+
+function Move-RequestFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$DestinationDir,
+        [string]$ErrorMessage
+    )
+
+    Ensure-Directory -Path $DestinationDir
+    $leaf = Split-Path -Path $Path -Leaf
+    $destination = Join-Path $DestinationDir $leaf
+    if (Test-Path -LiteralPath $destination) {
+        $destination = Join-Path $DestinationDir ("{0}-{1}.json" -f [IO.Path]::GetFileNameWithoutExtension($leaf), [Guid]::NewGuid().ToString('N'))
+    }
+
+    Move-Item -LiteralPath $Path -Destination $destination -Force
+    Set-FileAclAdminsOnly -Path $destination
+
+    if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
+        Set-Content -LiteralPath ($destination + '.error.txt') -Value $ErrorMessage -Encoding UTF8
+        Set-FileAclAdminsOnly -Path ($destination + '.error.txt')
+    }
+}
+
+function Invoke-ProcessRequestsMode {
+    Ensure-Directory -Path $BaseDir
+    Ensure-Directory -Path $LogDir
+    Ensure-Directory -Path $RequestsDir
+    Ensure-Directory -Path $ProcessedRequestsDir
+    Ensure-Directory -Path $FailedRequestsDir
+
+    $shouldStartQueue = $false
+    $files = @(Get-ChildItem -LiteralPath $RequestsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc | Select-Object -First 200)
+
+    foreach ($file in $files) {
+        try {
+            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'Request file is a reparse point.'
+            }
+
+            if ($file.Length -gt 32768) {
+                throw "Request file is too large ($($file.Length) bytes)."
+            }
+
+            $raw = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+            if ([string]::IsNullOrWhiteSpace($raw)) {
+                throw 'Request file is empty.'
+            }
+
+            $request = $raw | ConvertFrom-Json
+            $commandValue = $null
+            if ($request.PSObject.Properties['Command'] -and $request.Command) {
+                $commandValue = [string]$request.Command
+            }
+            elseif ($request.PSObject.Properties['Action'] -and $request.Action) {
+                $commandValue = [string]$request.Action
+            }
+
+            if ([string]::IsNullOrWhiteSpace($commandValue)) {
+                throw 'Request is missing Command.'
+            }
+
+            $command = $commandValue.Trim().ToLowerInvariant()
+            if ($command -in @('refreshstatus','getstatus')) {
+                $owner = Get-RequestFileOwnerInfo -Path $file.FullName
+                Write-Log "Accepted status refresh request file '$($file.Name)' owner='$($owner.Name)' sid='$($owner.Sid)'."
+                Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
+                $shouldStartQueue = $true
+                continue
+            }
+
+            if ($command -eq 'install') {
+                $action = 'Install'
+                if (-not (Test-UserInstallsAllowed)) {
+                    throw 'Benutzerinstallationen sind per Richtlinie deaktiviert.'
+                }
+            }
+            elseif ($command -eq 'uninstall') {
+                $action = 'Uninstall'
+                if (-not (Test-UserUninstallAllowed)) {
+                    throw 'Benutzerdeinstallationen sind per Richtlinie deaktiviert.'
+                }
+            }
+            else {
+                throw "Unsupported request command '$commandValue'."
+            }
+
+            $aliasValue = $null
+            if ($request.PSObject.Properties['AppAlias'] -and $request.AppAlias) {
+                $aliasValue = [string]$request.AppAlias
+            }
+            elseif ($request.PSObject.Properties['Alias'] -and $request.Alias) {
+                $aliasValue = [string]$request.Alias
+            }
+
+            if ([string]::IsNullOrWhiteSpace($aliasValue)) {
+                throw 'Request is missing AppAlias.'
+            }
+
+            $alias = $aliasValue.Trim().ToLowerInvariant()
+            $owner = Get-RequestFileOwnerInfo -Path $file.FullName
+            $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User
+            Write-Log "Accepted request file '$($file.Name)' action=$action alias='$alias' added=$($result.Added) owner='$($owner.Name)' sid='$($owner.Sid)'."
+            Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
+            $shouldStartQueue = $true
+        }
+        catch {
+            $message = $_.Exception.Message
+            Write-Log "Rejected request file '$($file.Name)': $message" 'WARN'
+            try {
+                Move-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -ErrorMessage $message
+            }
+            catch {
+                Write-Log "Could not move failed request file '$($file.FullName)': $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    $requiredQueued = Ensure-RequiredSoftwareQueued
+    if ($requiredQueued -gt 0) {
+        Write-Log "Queued required software from request worker count=$requiredQueued."
+        $shouldStartQueue = $true
+    }
+
+    foreach ($queuedItem in @((Get-QueueStateSnapshot).Queue)) {
+        if ($queuedItem -and $queuedItem.State -eq 'Queued') {
+            $shouldStartQueue = $true
+            break
+        }
+    }
+
+    if ($shouldStartQueue) {
+        if (Test-WingetLockAvailable) {
+            Start-QueueWorker
+        }
+        else {
+            Write-Log 'Queue worker not started because winget lock is already held.'
+        }
+    }
+}
+
 function Install-Service {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
+    Ensure-Directory -Path $RequestsDir
+    Ensure-Directory -Path $ProcessedRequestsDir
+    Ensure-Directory -Path $FailedRequestsDir
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
-
-    foreach ($legacyDirName in @('Requests','Processed','Failed')) {
-        $legacyDirPath = Join-Path $BaseDir $legacyDirName
-        if (Test-Path -LiteralPath $legacyDirPath) {
-            Set-DirectoryAcl -Path $legacyDirPath -UsersCanModify:$false
-        }
-    }
+    Set-RequestDirectoryAcl -Path $RequestsDir
+    Set-DirectoryAcl -Path $ProcessedRequestsDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $FailedRequestsDir -UsersCanModify:$false
 
     if (-not $PSCommandPath) {
         throw 'PSCommandPath is empty; cannot determine the source script path.'
@@ -3040,11 +2875,11 @@ function Install-Service {
 try {
     switch ($Mode) {
         'Install'    { Install-Service }
-        'Daemon'     { Start-CatalogDaemon }
         'UpgradeAll' { Invoke-UpgradeAllMode }
         'ApplyPolicy' { Invoke-ApplyPolicyMode }
         'ProcessQueue' { Invoke-ProcessQueueMode }
         'ProcessRequest' { Invoke-ProcessRequestMode }
+        'ProcessRequests' { Invoke-ProcessRequestsMode }
         default      { throw "Unsupported mode '$Mode'." }
     }
 }
