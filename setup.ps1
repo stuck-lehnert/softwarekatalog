@@ -1494,7 +1494,53 @@ function Load-AppList {
 `$stateRefreshTimer.Interval = 500
 `$script:StateRefreshPending = `$false
 `$script:RequestWorkerBusy = `$false
-`$script:RunspaceJobs = New-Object 'System.Collections.Generic.List[object]'
+`$script:RunspaceJobs = @()
+`$script:CatalogClosing = `$false
+
+function Remove-CatalogRunspaceJob {
+    param(
+        [Parameter(Mandatory=`$true)]`$Job,
+        [switch]`$Stop
+    )
+
+    try {
+        if (`$null -ne `$Job.Timer) {
+            `$Job.Timer.Stop()
+            `$Job.Timer.Dispose()
+        }
+    }
+    catch {
+    }
+
+    try {
+        if (`$Stop -and `$null -ne `$Job.PowerShell -and `$null -ne `$Job.AsyncResult -and -not `$Job.AsyncResult.IsCompleted) {
+            `$null = `$Job.PowerShell.BeginStop(`$null, `$null)
+        }
+    }
+    catch {
+        try { `$Job.PowerShell.Stop() } catch { }
+    }
+
+    try {
+        if (`$null -ne `$Job.PowerShell) { `$Job.PowerShell.Dispose() }
+    }
+    catch {
+    }
+
+    try {
+        if (`$null -ne `$Job.Runspace) { `$Job.Runspace.Dispose() }
+    }
+    catch {
+    }
+
+    `$remainingJobs = @()
+    foreach (`$existingJob in @(`$script:RunspaceJobs)) {
+        if (-not [object]::ReferenceEquals(`$existingJob, `$Job)) {
+            `$remainingJobs += `$existingJob
+        }
+    }
+    `$script:RunspaceJobs = `$remainingJobs
+}
 
 function Start-CatalogDaemonRunspaceRequest {
     param(
@@ -1586,22 +1632,23 @@ function Start-CatalogDaemonRunspaceRequest {
         throw
     }
 
-    [void]`$script:RunspaceJobs.Add(`$job)
+    `$script:RunspaceJobs = @(`$script:RunspaceJobs + `$job)
+    `$jobRef = `$job
     `$timer.Add_Tick({
-        if (-not `$job.AsyncResult.IsCompleted) { return }
+        if (`$null -eq `$jobRef.AsyncResult -or -not `$jobRef.AsyncResult.IsCompleted) { return }
 
-        `$job.Timer.Stop()
+        `$jobRef.Timer.Stop()
         `$completion = [pscustomobject]@{
-            Context      = `$job.Context
+            Context      = `$jobRef.Context
             Response     = `$null
             ErrorMessage = `$null
         }
 
         try {
-            `$result = @(`$job.PowerShell.EndInvoke(`$job.AsyncResult))
-            if (`$job.PowerShell.Streams.Error.Count -gt 0) {
-                `$firstError = `$job.PowerShell.Streams.Error[0]
-                if (`$firstError.Exception) {
+            `$result = @(`$jobRef.PowerShell.EndInvoke(`$jobRef.AsyncResult))
+            if (`$jobRef.PowerShell.Streams.Error.Count -gt 0) {
+                `$firstError = `$jobRef.PowerShell.Streams.Error[0]
+                if (`$null -ne `$firstError.Exception) {
                     `$completion.ErrorMessage = `$firstError.Exception.Message
                 }
                 else {
@@ -1617,15 +1664,17 @@ function Start-CatalogDaemonRunspaceRequest {
         }
 
         try {
-            & `$job.OnCompleted `$completion
+            if (-not `$script:CatalogClosing) {
+                & `$jobRef.OnCompleted `$completion
+            }
+        }
+        catch {
+            try { `$status.Text = 'Fehler: ' + `$_.Exception.Message } catch { }
         }
         finally {
-            [void]`$script:RunspaceJobs.Remove(`$job)
-            `$job.Timer.Dispose()
-            `$job.PowerShell.Dispose()
-            `$job.Runspace.Dispose()
+            Remove-CatalogRunspaceJob -Job `$jobRef
         }
-    })
+    }.GetNewClosure())
     `$timer.Start()
 }
 
@@ -1652,7 +1701,7 @@ function Start-AppRequestAsync {
     }
 
     try {
-        Start-CatalogDaemonRunspaceRequest -Command `$Action -Alias `$context.Alias -Context `$context -OnCompleted {
+        Start-CatalogDaemonRunspaceRequest -Command `$Action -Alias `$context.Alias -Context `$context -OnCompleted ({
             param(`$completion)
         try {
             `$script:RequestWorkerBusy = `$false
@@ -1701,7 +1750,7 @@ function Start-AppRequestAsync {
         finally {
             Update-InstallButtonState
         }
-        }
+        }.GetNewClosure())
     }
     catch {
         `$script:RequestWorkerBusy = `$false
@@ -1724,7 +1773,7 @@ function Start-RefreshStatusAsync {
     `$status.Text = 'Installationsdaten-Aktualisierung wird angefordert...'
 
     try {
-        Start-CatalogDaemonRunspaceRequest -Command 'RefreshStatus' -OnCompleted {
+        Start-CatalogDaemonRunspaceRequest -Command 'RefreshStatus' -OnCompleted ({
             param(`$completion)
         try {
             `$script:RequestWorkerBusy = `$false
@@ -1748,7 +1797,7 @@ function Start-RefreshStatusAsync {
         finally {
             Update-InstallButtonState
         }
-        }
+        }.GetNewClosure())
     }
     catch {
         `$script:RequestWorkerBusy = `$false
@@ -1931,36 +1980,15 @@ function Start-RefreshStatusAsync {
     `$stateRefreshTimer.Start()
 })
 `$form.Add_FormClosing({
+    `$script:CatalogClosing = `$true
     `$stateRefreshTimer.Stop()
     `$stateRefreshTimer.Dispose()
-    if (`$script:StateWatcher) { `$script:StateWatcher.Dispose() }
-    if (`$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
+    if (`$null -ne `$script:StateWatcher) { `$script:StateWatcher.Dispose() }
+    if (`$null -ne `$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
     foreach (`$job in @(`$script:RunspaceJobs)) {
-        try {
-            if (`$job.Timer) {
-                `$job.Timer.Stop()
-                `$job.Timer.Dispose()
-            }
-        }
-        catch {
-        }
-
-        try {
-            if (`$job.PowerShell -and `$job.AsyncResult -and -not `$job.AsyncResult.IsCompleted) {
-                `$job.PowerShell.Stop()
-            }
-        }
-        catch {
-        }
-
-        try {
-            if (`$job.PowerShell) { `$job.PowerShell.Dispose() }
-            if (`$job.Runspace) { `$job.Runspace.Dispose() }
-        }
-        catch {
-        }
+        Remove-CatalogRunspaceJob -Job `$job -Stop
     }
-    `$script:RunspaceJobs.Clear()
+    `$script:RunspaceJobs = @()
 })
 
 `$list.Add_SelectedIndexChanged({ Update-InstallButtonState })
