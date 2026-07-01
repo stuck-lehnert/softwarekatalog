@@ -1494,6 +1494,140 @@ function Load-AppList {
 `$stateRefreshTimer.Interval = 500
 `$script:StateRefreshPending = `$false
 `$script:RequestWorkerBusy = `$false
+`$script:RunspaceJobs = New-Object 'System.Collections.Generic.List[object]'
+
+function Start-CatalogDaemonRunspaceRequest {
+    param(
+        [Parameter(Mandatory=`$true)][string]`$Command,
+        [string]`$Alias,
+        `$Context,
+        [Parameter(Mandatory=`$true)][scriptblock]`$OnCompleted
+    )
+
+    `$runspace = [runspacefactory]::CreateRunspace()
+    `$powershell = [powershell]::Create()
+    `$timer = New-Object System.Windows.Forms.Timer
+    `$timer.Interval = 100
+
+    `$job = [pscustomobject]@{
+        PowerShell  = `$powershell
+        Runspace    = `$runspace
+        AsyncResult = `$null
+        Timer       = `$timer
+        Context     = `$Context
+        OnCompleted = `$OnCompleted
+    }
+
+    try {
+        `$runspace.ApartmentState = 'MTA'
+        `$runspace.ThreadOptions = 'ReuseThread'
+        `$runspace.Open()
+        `$runspace.SessionStateProxy.SetVariable('PipeName', `$PipeName)
+        `$runspace.SessionStateProxy.SetVariable('Command', `$Command)
+        `$runspace.SessionStateProxy.SetVariable('Alias', `$Alias)
+
+        `$powershell.Runspace = `$runspace
+        [void]`$powershell.AddScript({
+            Set-StrictMode -Version Latest
+            `$ErrorActionPreference = 'Stop'
+
+            `$payload = [ordered]@{
+                Command  = `$Command
+                AppAlias = `$Alias
+            }
+            `$json = `$payload | ConvertTo-Json -Compress
+
+            `$encoding = New-Object System.Text.UTF8Encoding(`$false)
+            `$client = New-Object System.IO.Pipes.NamedPipeClientStream -ArgumentList @(
+                '.',
+                `$PipeName,
+                [System.IO.Pipes.PipeDirection]::InOut,
+                [System.IO.Pipes.PipeOptions]::None,
+                [System.Security.Principal.TokenImpersonationLevel]::Impersonation
+            )
+
+            try {
+                `$client.Connect(10000)
+                `$reader = New-Object System.IO.StreamReader(`$client, `$encoding)
+                `$writer = New-Object System.IO.StreamWriter(`$client, `$encoding)
+                `$writer.AutoFlush = `$true
+                `$writer.WriteLine(`$json)
+
+                `$readTask = `$reader.ReadLineAsync()
+                if (-not `$readTask.Wait(15000)) {
+                    throw 'Zeitüberschreitung beim Warten auf Antwort des Softwarekatalog-Dienstes.'
+                }
+                `$line = `$readTask.Result
+                if ([string]::IsNullOrWhiteSpace(`$line)) {
+                    throw 'Der Softwarekatalog-Dienst hat keine Antwort gesendet.'
+                }
+
+                `$response = `$line | ConvertFrom-Json
+                if (-not `$response.Success) {
+                    throw ([string]`$response.Message)
+                }
+
+                return `$response
+            }
+            catch [System.TimeoutException] {
+                throw 'Der Softwarekatalog-Dienst ist nicht erreichbar oder startet noch. Bitte versuchen Sie es erneut.'
+            }
+            finally {
+                `$client.Dispose()
+            }
+        }.ToString())
+
+        `$job.AsyncResult = `$powershell.BeginInvoke()
+    }
+    catch {
+        `$timer.Dispose()
+        `$powershell.Dispose()
+        `$runspace.Dispose()
+        throw
+    }
+
+    [void]`$script:RunspaceJobs.Add(`$job)
+    `$timer.Add_Tick({
+        if (-not `$job.AsyncResult.IsCompleted) { return }
+
+        `$job.Timer.Stop()
+        `$completion = [pscustomobject]@{
+            Context      = `$job.Context
+            Response     = `$null
+            ErrorMessage = `$null
+        }
+
+        try {
+            `$result = @(`$job.PowerShell.EndInvoke(`$job.AsyncResult))
+            if (`$job.PowerShell.Streams.Error.Count -gt 0) {
+                `$firstError = `$job.PowerShell.Streams.Error[0]
+                if (`$firstError.Exception) {
+                    `$completion.ErrorMessage = `$firstError.Exception.Message
+                }
+                else {
+                    `$completion.ErrorMessage = [string]`$firstError
+                }
+            }
+            elseif (`$result.Count -gt 0) {
+                `$completion.Response = `$result[-1]
+            }
+        }
+        catch {
+            `$completion.ErrorMessage = `$_.Exception.Message
+        }
+
+        try {
+            & `$job.OnCompleted `$completion
+        }
+        finally {
+            [void]`$script:RunspaceJobs.Remove(`$job)
+            `$job.Timer.Dispose()
+            `$job.PowerShell.Dispose()
+            `$job.Runspace.Dispose()
+        }
+    })
+    `$timer.Start()
+}
 
 function Start-AppRequestAsync {
     param(
@@ -1511,29 +1645,24 @@ function Start-AppRequestAsync {
     `$btnUninstall.Enabled = `$false
     `$btnRefresh.Enabled = `$false
 
-    `$worker = New-Object System.ComponentModel.BackgroundWorker
-    `$worker.Add_DoWork({
-        param(`$sender, `$eventArgs)
-        `$arg = `$eventArgs.Argument
-        `$response = New-AppRequest -Alias `$arg.Alias -Action `$arg.Action
-        `$eventArgs.Result = [pscustomobject]@{
-            Action = `$arg.Action
-            Alias = `$arg.Alias
-            DisplayName = `$arg.DisplayName
-            Response = `$response
-        }
-    })
-    `$worker.Add_RunWorkerCompleted({
-        param(`$sender, `$eventArgs)
+    `$context = [pscustomobject]@{
+        Action = `$Action
+        Alias = [string]`$Selected.Alias
+        DisplayName = [string]`$Selected.DisplayName
+    }
+
+    try {
+        Start-CatalogDaemonRunspaceRequest -Command `$Action -Alias `$context.Alias -Context `$context -OnCompleted {
+            param(`$completion)
         try {
             `$script:RequestWorkerBusy = `$false
             `$btnRefresh.Enabled = `$true
 
-            if (`$eventArgs.Error) {
-                `$status.Text = 'Fehler: ' + `$eventArgs.Error.Message
+            if (`$completion.ErrorMessage) {
+                `$status.Text = 'Fehler: ' + `$completion.ErrorMessage
                 `$script:StateRefreshPending = `$true
                 [System.Windows.Forms.MessageBox]::Show(
-                    `$eventArgs.Error.Message,
+                    `$completion.ErrorMessage,
                     `$CatalogTitle,
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Error
@@ -1541,7 +1670,12 @@ function Start-AppRequestAsync {
                 return
             }
 
-            `$result = `$eventArgs.Result
+            `$result = [pscustomobject]@{
+                Action = `$completion.Context.Action
+                Alias = `$completion.Context.Alias
+                DisplayName = `$completion.Context.DisplayName
+                Response = `$completion.Response
+            }
             if (`$result.Action -eq 'Uninstall') {
                 `$verb = 'Deinstallation'
             }
@@ -1566,14 +1700,15 @@ function Start-AppRequestAsync {
         }
         finally {
             Update-InstallButtonState
-            `$sender.Dispose()
         }
-    })
-    `$worker.RunWorkerAsync([pscustomobject]@{
-        Action = `$Action
-        Alias = [string]`$Selected.Alias
-        DisplayName = [string]`$Selected.DisplayName
-    })
+        }
+    }
+    catch {
+        `$script:RequestWorkerBusy = `$false
+        `$btnRefresh.Enabled = `$true
+        Update-InstallButtonState
+        throw
+    }
 }
 
 function Start-RefreshStatusAsync {
@@ -1588,21 +1723,17 @@ function Start-RefreshStatusAsync {
     `$btnRefresh.Enabled = `$false
     `$status.Text = 'Installationsdaten-Aktualisierung wird angefordert...'
 
-    `$worker = New-Object System.ComponentModel.BackgroundWorker
-    `$worker.Add_DoWork({
-        param(`$sender, `$eventArgs)
-        `$eventArgs.Result = Invoke-CatalogDaemon -Command 'RefreshStatus'
-    })
-    `$worker.Add_RunWorkerCompleted({
-        param(`$sender, `$eventArgs)
+    try {
+        Start-CatalogDaemonRunspaceRequest -Command 'RefreshStatus' -OnCompleted {
+            param(`$completion)
         try {
             `$script:RequestWorkerBusy = `$false
             `$btnRefresh.Enabled = `$true
 
-            if (`$eventArgs.Error) {
-                `$status.Text = 'Fehler: ' + `$eventArgs.Error.Message
+            if (`$completion.ErrorMessage) {
+                `$status.Text = 'Fehler: ' + `$completion.ErrorMessage
                 [System.Windows.Forms.MessageBox]::Show(
-                    `$eventArgs.Error.Message,
+                    `$completion.ErrorMessage,
                     `$CatalogTitle,
                     [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Error
@@ -1610,16 +1741,21 @@ function Start-RefreshStatusAsync {
                 return
             }
 
-            `$response = `$eventArgs.Result
+            `$response = `$completion.Response
             if (`$response.Message) { `$status.Text = [string]`$response.Message }
             `$script:StateRefreshPending = `$true
         }
         finally {
             Update-InstallButtonState
-            `$sender.Dispose()
         }
-    })
-    `$worker.RunWorkerAsync()
+        }
+    }
+    catch {
+        `$script:RequestWorkerBusy = `$false
+        `$btnRefresh.Enabled = `$true
+        Update-InstallButtonState
+        throw
+    }
 }
 
 `$btnInstall.Add_Click({
@@ -1799,6 +1935,32 @@ function Start-RefreshStatusAsync {
     `$stateRefreshTimer.Dispose()
     if (`$script:StateWatcher) { `$script:StateWatcher.Dispose() }
     if (`$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
+    foreach (`$job in @(`$script:RunspaceJobs)) {
+        try {
+            if (`$job.Timer) {
+                `$job.Timer.Stop()
+                `$job.Timer.Dispose()
+            }
+        }
+        catch {
+        }
+
+        try {
+            if (`$job.PowerShell -and `$job.AsyncResult -and -not `$job.AsyncResult.IsCompleted) {
+                `$job.PowerShell.Stop()
+            }
+        }
+        catch {
+        }
+
+        try {
+            if (`$job.PowerShell) { `$job.PowerShell.Dispose() }
+            if (`$job.Runspace) { `$job.Runspace.Dispose() }
+        }
+        catch {
+        }
+    }
+    `$script:RunspaceJobs.Clear()
 })
 
 `$list.Add_SelectedIndexChanged({ Update-InstallButtonState })
