@@ -490,6 +490,34 @@ function Get-QueueStateSnapshot {
     Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState } -TimeoutSeconds $TimeoutSeconds
 }
 
+function Test-IsQueueStateLockTimeout {
+    param([Parameter(Mandatory)]$ErrorObject)
+
+    if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) {
+        $exception = $ErrorObject.Exception
+    }
+    elseif ($ErrorObject -is [System.Exception]) {
+        $exception = $ErrorObject
+    }
+    else {
+        return $false
+    }
+
+    while ($exception) {
+        if ($exception -is [System.TimeoutException] -and $exception.Message -like "*$QueueStateMutexName*") {
+            return $true
+        }
+
+        if ($exception.Message -like "*Timed out waiting for queue state lock '$QueueStateMutexName'*") {
+            return $true
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    return $false
+}
+
 function New-QueueItem {
     param(
         [Parameter(Mandatory)][ValidateSet('Install','Uninstall','UpgradeAll')][string]$Action,
@@ -616,7 +644,8 @@ function Add-SoftwareRequestToQueue {
         [Parameter(Mandatory)][string]$Alias,
         [string]$RequestedBy,
         [string]$RequestedBySid,
-        [ValidateSet('User','Required')][string]$Source = 'User'
+        [ValidateSet('User','Required')][string]$Source = 'User',
+        [int]$TimeoutSeconds = 30
     )
 
     $normalizedAlias = $Alias.Trim().ToLowerInvariant()
@@ -641,10 +670,12 @@ function Add-SoftwareRequestToQueue {
         -RequestedBy $RequestedBy `
         -RequestedBySid $RequestedBySid
 
-    return Add-QueueItem -Item $item
+    return Add-QueueItem -Item $item -TimeoutSeconds $TimeoutSeconds
 }
 
 function Ensure-RequiredSoftwareQueued {
+    param([int]$TimeoutSeconds = 30)
+
     $addedCount = 0
     if (-not (Test-SoftwareCatalogPolicyEnabled)) { return 0 }
     if (-not (Test-RequiredEnforcementEnabled)) { return 0 }
@@ -661,7 +692,7 @@ function Ensure-RequiredSoftwareQueued {
             continue
         }
 
-        $result = Add-SoftwareRequestToQueue -Action Install -Alias $alias -RequestedBy 'Policy' -RequestedBySid 'Policy' -Source Required
+        $result = Add-SoftwareRequestToQueue -Action Install -Alias $alias -RequestedBy 'Policy' -RequestedBySid 'Policy' -Source Required -TimeoutSeconds $TimeoutSeconds
         if ($result -and $result.Added) {
             $addedCount++
             Write-Log "Queued required software alias '$alias' package '$($app.PackageId)'."
@@ -702,6 +733,29 @@ function Test-WingetLockAvailable {
 
     try {
         $hasLock = $mutex.WaitOne(0)
+        return $hasLock
+    }
+    finally {
+        if ($hasLock) {
+            $mutex.ReleaseMutex()
+        }
+        $mutex.Dispose()
+    }
+}
+
+function Test-QueueStateLockAvailable {
+    $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
+    $hasLock = $false
+
+    try {
+        try {
+            $hasLock = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+            Write-Log "Recovered abandoned queue state lock '$QueueStateMutexName' during availability check." 'WARN'
+        }
+
         return $hasLock
     }
     finally {
@@ -769,6 +823,21 @@ function Start-SoftwarekatalogWorker {
 
 function Start-QueueWorker {
     Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
+}
+
+function Start-QueueWorkerIfAvailable {
+    if (-not (Test-WingetLockAvailable)) {
+        Write-Log 'Queue worker not started because winget lock is already held.'
+        return $false
+    }
+
+    if (-not (Test-QueueStateLockAvailable)) {
+        Write-Log 'Queue worker not started because queue state lock is already held.' 'WARN'
+        return $false
+    }
+
+    Start-QueueWorker
+    return $true
 }
 
 function Get-WingetPath {
@@ -2129,7 +2198,25 @@ function Unregister-ObsoleteDaemonTask {
     }
 }
 
+function Test-CommandLineHasWorkerMode {
+    param(
+        [Parameter(Mandatory)][string]$CommandLine,
+        [Parameter(Mandatory)][string]$Mode
+    )
+
+    $pattern = ('(?i)(^|\s)-Mode\s+["'']?{0}["'']?(\s|$)' -f [regex]::Escape($Mode))
+    return [bool]($CommandLine -match $pattern)
+}
+
 function Stop-ObsoleteDaemonProcesses {
+    $currentWorkerModes = @(
+        'Install',
+        'ProcessRequests',
+        'ProcessQueue',
+        'UpgradeAll',
+        'ApplyPolicy',
+        'ProcessRequest'
+    )
     $daemonMarkers = @(
         '-Mode Daemon',
         '-Mode "Daemon"',
@@ -2160,6 +2247,14 @@ function Stop-ObsoleteDaemonProcesses {
         $matchesScriptName = ($commandLine.IndexOf('SelfServiceWinget.ps1', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $commandLine.IndexOf($BaseDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
         if (-not ($matchesScriptPath -or $matchesScriptName)) { continue }
 
+        $hasCurrentWorkerMode = $false
+        foreach ($mode in $currentWorkerModes) {
+            if (Test-CommandLineHasWorkerMode -CommandLine $commandLine -Mode $mode) {
+                $hasCurrentWorkerMode = $true
+                break
+            }
+        }
+
         $hasDaemonMarker = $false
         foreach ($marker in $daemonMarkers) {
             if ($commandLine.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
@@ -2167,10 +2262,11 @@ function Stop-ObsoleteDaemonProcesses {
                 break
             }
         }
-        if (-not $hasDaemonMarker) { continue }
+
+        if ($hasCurrentWorkerMode -and -not $hasDaemonMarker) { continue }
 
         try {
-            Write-Log "Stopping obsolete daemon process pid=$($process.ProcessId)."
+            Write-Log "Stopping obsolete Softwarekatalog process pid=$($process.ProcessId)."
             Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
         }
         catch {
@@ -2512,9 +2608,19 @@ function Invoke-RequiredSoftwarePolicy {
         }
     }
 
-    $queued = Ensure-RequiredSoftwareQueued
+    try {
+        $queued = Ensure-RequiredSoftwareQueued -TimeoutSeconds 5
+    }
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Required software queueing skipped because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+            return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0; Queued = 0 }
+        }
+        throw
+    }
+
     if ($queued -gt 0) {
-        Start-QueueWorker
+        [void](Start-QueueWorkerIfAvailable)
     }
 
     return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0; Queued = $queued }
@@ -2693,9 +2799,12 @@ function Invoke-UpgradeAllMode {
     try {
         $result = Add-QueueItem -Item $item -TimeoutSeconds 5
     }
-    catch [System.TimeoutException] {
-        Write-Log "Skipped 2-hour winget upgrade queueing because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-        return
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Skipped 2-hour winget upgrade queueing because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+            return
+        }
+        throw
     }
 
     if ($result.Added) {
@@ -2705,12 +2814,7 @@ function Invoke-UpgradeAllMode {
         Write-Log '2-hour winget upgrade is already queued or running.'
     }
 
-    if (Test-WingetLockAvailable) {
-        Start-QueueWorker
-    }
-    else {
-        Write-Log 'Queue worker not started because winget lock is already held; queued upgrade will be processed by the active worker.'
-    }
+    [void](Start-QueueWorkerIfAvailable)
 }
 
 function Invoke-ApplyPolicyMode {
@@ -2747,9 +2851,19 @@ function Invoke-ProcessRequestMode {
         return
     }
 
-    $result = Add-SoftwareRequestToQueue -Action $RequestAction -Alias $alias -RequestedBy $RequestedBy -RequestedBySid $RequestedBySid -Source User
+    try {
+        $result = Add-SoftwareRequestToQueue -Action $RequestAction -Alias $alias -RequestedBy $RequestedBy -RequestedBySid $RequestedBySid -Source User -TimeoutSeconds 5
+    }
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Worker request action=$RequestAction alias='$alias' could not be queued because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+            return
+        }
+        throw
+    }
+
     Write-Log "Queued worker request action=$RequestAction alias='$alias' added=$($result.Added) RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
-    Start-QueueWorker
+    [void](Start-QueueWorkerIfAvailable)
 }
 
 function Get-RequestFileOwnerInfo {
@@ -2961,13 +3075,18 @@ function Invoke-ProcessRequestsMode {
             $aliasValue = Get-RequestScalarValue -Request $request -Names @('AppAlias','Alias') -DisplayName 'AppAlias' -MaxLength 128
             $alias = $aliasValue.Trim().ToLowerInvariant()
             $owner = Get-RequestFileOwnerInfo -Path $file.FullName
-            $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User
+            $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User -TimeoutSeconds 5
             Write-Log "Accepted request file '$($file.Name)' action=$action alias='$alias' added=$($result.Added) owner='$($owner.Name)' sid='$($owner.Sid)'."
             Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
             $shouldStartQueue = $true
         }
         catch {
             $message = $_.Exception.Message
+            if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+                Write-Log "Request file '$($file.Name)' will be retried because the queue state lock is busy: $message" 'WARN'
+                break
+            }
+
             Write-Log "Rejected request file '$($file.Name)': $message" 'WARN'
             try {
                 Move-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -ErrorMessage $message
@@ -2978,26 +3097,42 @@ function Invoke-ProcessRequestsMode {
         }
     }
 
-    $requiredQueued = Ensure-RequiredSoftwareQueued
-    if ($requiredQueued -gt 0) {
-        Write-Log "Queued required software from request worker count=$requiredQueued."
-        $shouldStartQueue = $true
+    try {
+        $requiredQueued = Ensure-RequiredSoftwareQueued -TimeoutSeconds 5
+        if ($requiredQueued -gt 0) {
+            Write-Log "Queued required software from request worker count=$requiredQueued."
+            $shouldStartQueue = $true
+        }
+    }
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Required software queueing deferred because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+        }
+        else {
+            throw
+        }
     }
 
-    foreach ($queuedItem in @((Get-QueueStateSnapshot).Queue)) {
-        if ($queuedItem -and $queuedItem.State -eq 'Queued') {
-            $shouldStartQueue = $true
-            break
+    try {
+        $queueState = Get-QueueStateSnapshot -TimeoutSeconds 5
+        foreach ($queuedItem in @($queueState.Queue)) {
+            if ($queuedItem -and $queuedItem.State -eq 'Queued') {
+                $shouldStartQueue = $true
+                break
+            }
+        }
+    }
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Queued work inspection skipped because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+        }
+        else {
+            throw
         }
     }
 
     if ($shouldStartQueue) {
-        if (Test-WingetLockAvailable) {
-            Start-QueueWorker
-        }
-        else {
-            Write-Log 'Queue worker not started because winget lock is already held.'
-        }
+        [void](Start-QueueWorkerIfAvailable)
     }
 }
 
