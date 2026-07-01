@@ -440,14 +440,24 @@ function Write-QueueState {
 }
 
 function Invoke-WithQueueStateLock {
-    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int]$TimeoutSeconds = 30
+    )
 
     $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
     $hasLock = $false
     try {
-        $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+        try {
+            $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+            Write-Log "Recovered abandoned queue state lock '$QueueStateMutexName'." 'WARN'
+        }
+
         if (-not $hasLock) {
-            throw "Timed out waiting for queue state lock '$QueueStateMutexName'."
+            throw (New-Object System.TimeoutException -ArgumentList "Timed out waiting for queue state lock '$QueueStateMutexName'.")
         }
 
         & $ScriptBlock
@@ -459,7 +469,10 @@ function Invoke-WithQueueStateLock {
 }
 
 function Update-QueueState {
-    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int]$TimeoutSeconds = 30
+    )
 
     Invoke-WithQueueStateLock -ScriptBlock {
         $state = Read-QueueState
@@ -468,11 +481,13 @@ function Update-QueueState {
         $state.UpdatedAt = (Get-Date).ToString('o')
         Write-QueueState -State $state
         return $state
-    }
+    } -TimeoutSeconds $TimeoutSeconds
 }
 
 function Get-QueueStateSnapshot {
-    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState }
+    param([int]$TimeoutSeconds = 30)
+
+    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState } -TimeoutSeconds $TimeoutSeconds
 }
 
 function New-QueueItem {
@@ -568,7 +583,10 @@ function Get-RequiredAliasSet {
 }
 
 function Add-QueueItem {
-    param([Parameter(Mandatory)]$Item)
+    param(
+        [Parameter(Mandatory)]$Item,
+        [int]$TimeoutSeconds = 30
+    )
 
     $result = $null
     $null = Update-QueueState -ScriptBlock {
@@ -585,7 +603,7 @@ function Add-QueueItem {
 
         $state.Queue = @($queue + $Item)
         $script:QueueAddResult = [pscustomobject]@{ Added = $true; Item = $Item }
-    }
+    } -TimeoutSeconds $TimeoutSeconds
 
     $result = $script:QueueAddResult
     $script:QueueAddResult = $null
@@ -2097,9 +2115,7 @@ function Unregister-LegacyQueueTask {
     }
 }
 
-function Register-OrUpdateTasks {
-    Unregister-LegacyQueueTask
-
+function Unregister-ObsoleteDaemonTask {
     try {
         $existingDaemon = Get-ScheduledTask -TaskName $DaemonTaskName -ErrorAction SilentlyContinue
         if ($existingDaemon) {
@@ -2111,7 +2127,59 @@ function Register-OrUpdateTasks {
     catch {
         Write-Log "Could not remove daemon task '$DaemonTaskName': $($_.Exception.Message)" 'WARN'
     }
+}
 
+function Stop-ObsoleteDaemonProcesses {
+    $daemonMarkers = @(
+        '-Mode Daemon',
+        '-Mode "Daemon"',
+        "-Mode 'Daemon'",
+        'Mode=Daemon',
+        'NamedPipe',
+        'Named pipe',
+        '\\.\pipe\Softwarekatalog'
+    )
+
+    try {
+        $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    }
+    catch {
+        Write-Log "Could not enumerate processes for obsolete daemon cleanup: $($_.Exception.Message)" 'WARN'
+        return
+    }
+
+    foreach ($process in $processes) {
+        if (-not $process) { continue }
+        if ([int]$process.ProcessId -eq $PID) { continue }
+        if ([string]$process.Name -notin @('powershell.exe','pwsh.exe')) { continue }
+
+        $commandLine = [string]$process.CommandLine
+        if ([string]::IsNullOrWhiteSpace($commandLine)) { continue }
+
+        $matchesScriptPath = $commandLine.IndexOf($LocalScriptPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+        $matchesScriptName = ($commandLine.IndexOf('SelfServiceWinget.ps1', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $commandLine.IndexOf($BaseDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+        if (-not ($matchesScriptPath -or $matchesScriptName)) { continue }
+
+        $hasDaemonMarker = $false
+        foreach ($marker in $daemonMarkers) {
+            if ($commandLine.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $hasDaemonMarker = $true
+                break
+            }
+        }
+        if (-not $hasDaemonMarker) { continue }
+
+        try {
+            Write-Log "Stopping obsolete daemon process pid=$($process.ProcessId)."
+            Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+        }
+        catch {
+            Write-Log "Could not stop obsolete daemon process pid=$($process.ProcessId): $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
+function Register-OrUpdateTasks {
     $principal = New-ScheduledTaskPrincipal `
         -UserId 'SYSTEM' `
         -LogonType ServiceAccount `
@@ -2622,14 +2690,27 @@ function Invoke-UpgradeAllMode {
     Ensure-Directory -Path $LogDir
 
     $item = New-QueueItem -Action UpgradeAll -DisplayName 'winget upgrade --all' -Source System -RequestedBy 'System' -RequestedBySid 'System'
-    $result = Add-QueueItem -Item $item
+    try {
+        $result = Add-QueueItem -Item $item -TimeoutSeconds 5
+    }
+    catch [System.TimeoutException] {
+        Write-Log "Skipped 2-hour winget upgrade queueing because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+        return
+    }
+
     if ($result.Added) {
         Write-Log 'Queued 2-hour winget upgrade.'
     }
     else {
         Write-Log '2-hour winget upgrade is already queued or running.'
     }
-    Start-QueueWorker
+
+    if (Test-WingetLockAvailable) {
+        Start-QueueWorker
+    }
+    else {
+        Write-Log 'Queue worker not started because winget lock is already held; queued upgrade will be processed by the active worker.'
+    }
 }
 
 function Invoke-ApplyPolicyMode {
@@ -2699,6 +2780,98 @@ function Get-RequestFileOwnerInfo {
     }
 }
 
+function Assert-RequestJsonDepth {
+    param(
+        [Parameter(Mandatory)][string]$Raw,
+        [int]$MaxDepth = 8
+    )
+
+    $depth = 0
+    $inString = $false
+    $escaped = $false
+
+    for ($i = 0; $i -lt $Raw.Length; $i++) {
+        $code = [int][char]$Raw[$i]
+
+        if ($inString) {
+            if ($escaped) {
+                $escaped = $false
+                continue
+            }
+
+            if ($code -eq 92) {
+                $escaped = $true
+                continue
+            }
+
+            if ($code -eq 34) {
+                $inString = $false
+            }
+            continue
+        }
+
+        if ($code -eq 34) {
+            $inString = $true
+            continue
+        }
+
+        if ($code -eq 123 -or $code -eq 91) {
+            $depth++
+            if ($depth -gt $MaxDepth) {
+                throw "Request JSON nesting exceeds maximum depth $MaxDepth."
+            }
+            continue
+        }
+
+        if ($code -eq 125 -or $code -eq 93) {
+            if ($depth -lt 1) {
+                throw 'Request JSON has an unexpected closing bracket.'
+            }
+            $depth--
+        }
+    }
+
+    if ($inString) {
+        throw 'Request JSON string is unterminated.'
+    }
+
+    if ($depth -ne 0) {
+        throw 'Request JSON is incomplete.'
+    }
+}
+
+function Get-RequestScalarValue {
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][string[]]$Names,
+        [Parameter(Mandatory)][string]$DisplayName,
+        [int]$MaxLength = 256
+    )
+
+    foreach ($name in $Names) {
+        $property = $Request.PSObject.Properties[$name]
+        if (-not $property) { continue }
+
+        $value = $property.Value
+        if ($null -eq $value) { continue }
+
+        if ($value -is [System.Array] -or $value -is [System.Collections.IDictionary] -or $value -is [pscustomobject]) {
+            throw "Request property '$name' must be a scalar value."
+        }
+
+        $text = ([string]$value).Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { continue }
+
+        if ($text.Length -gt $MaxLength) {
+            throw "Request property '$name' is too long ($($text.Length) characters; max=$MaxLength)."
+        }
+
+        return $text
+    }
+
+    throw "Request is missing $DisplayName."
+}
+
 function Move-RequestFile {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -2713,12 +2886,18 @@ function Move-RequestFile {
         $destination = Join-Path $DestinationDir ("{0}-{1}.json" -f [IO.Path]::GetFileNameWithoutExtension($leaf), [Guid]::NewGuid().ToString('N'))
     }
 
-    Move-Item -LiteralPath $Path -Destination $destination -Force
+    Microsoft.PowerShell.Management\Move-Item -LiteralPath $Path -Destination $destination -Force -ErrorAction Stop
     Set-FileAclAdminsOnly -Path $destination
 
     if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
-        Set-Content -LiteralPath ($destination + '.error.txt') -Value $ErrorMessage -Encoding UTF8
-        Set-FileAclAdminsOnly -Path ($destination + '.error.txt')
+        $errorPath = $destination + '.error.txt'
+        try {
+            Microsoft.PowerShell.Management\Set-Content -LiteralPath $errorPath -Value $ErrorMessage -Encoding UTF8 -ErrorAction Stop
+            Set-FileAclAdminsOnly -Path $errorPath
+        }
+        catch {
+            Write-Log "Could not write request error file '$errorPath': $($_.Exception.Message)" 'WARN'
+        }
     }
 }
 
@@ -2747,19 +2926,13 @@ function Invoke-ProcessRequestsMode {
                 throw 'Request file is empty.'
             }
 
+            Assert-RequestJsonDepth -Raw $raw -MaxDepth 8
             $request = $raw | ConvertFrom-Json
-            $commandValue = $null
-            if ($request.PSObject.Properties['Command'] -and $request.Command) {
-                $commandValue = [string]$request.Command
-            }
-            elseif ($request.PSObject.Properties['Action'] -and $request.Action) {
-                $commandValue = [string]$request.Action
+            if ($request -is [System.Array] -or $request -isnot [pscustomobject]) {
+                throw 'Request JSON must be an object.'
             }
 
-            if ([string]::IsNullOrWhiteSpace($commandValue)) {
-                throw 'Request is missing Command.'
-            }
-
+            $commandValue = Get-RequestScalarValue -Request $request -Names @('Command','Action') -DisplayName 'Command' -MaxLength 32
             $command = $commandValue.Trim().ToLowerInvariant()
             if ($command -in @('refreshstatus','getstatus')) {
                 $owner = Get-RequestFileOwnerInfo -Path $file.FullName
@@ -2785,18 +2958,7 @@ function Invoke-ProcessRequestsMode {
                 throw "Unsupported request command '$commandValue'."
             }
 
-            $aliasValue = $null
-            if ($request.PSObject.Properties['AppAlias'] -and $request.AppAlias) {
-                $aliasValue = [string]$request.AppAlias
-            }
-            elseif ($request.PSObject.Properties['Alias'] -and $request.Alias) {
-                $aliasValue = [string]$request.Alias
-            }
-
-            if ([string]::IsNullOrWhiteSpace($aliasValue)) {
-                throw 'Request is missing AppAlias.'
-            }
-
+            $aliasValue = Get-RequestScalarValue -Request $request -Names @('AppAlias','Alias') -DisplayName 'AppAlias' -MaxLength 128
             $alias = $aliasValue.Trim().ToLowerInvariant()
             $owner = Get-RequestFileOwnerInfo -Path $file.FullName
             $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User
@@ -2845,6 +3007,10 @@ function Install-Service {
     Ensure-Directory -Path $RequestsDir
     Ensure-Directory -Path $ProcessedRequestsDir
     Ensure-Directory -Path $FailedRequestsDir
+
+    Unregister-LegacyQueueTask
+    Unregister-ObsoleteDaemonTask
+    Stop-ObsoleteDaemonProcesses
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
