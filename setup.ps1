@@ -46,6 +46,7 @@ $CatalogGuiPath         = Join-Path $BaseDir 'Software-Catalog.ps1'
 $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
 $QueueStatePath         = Join-Path $BaseDir 'Queue-State.json'
+$QueueLockInfoPath      = Join-Path $BaseDir 'Queue-Lock.json'
 $RequestsDir            = Join-Path $BaseDir 'Requests'
 $ProcessedRequestsDir   = Join-Path $BaseDir 'Processed'
 $FailedRequestsDir      = Join-Path $BaseDir 'Failed'
@@ -58,6 +59,7 @@ $PolicyMaxEntries       = 500
 $LegacyQueueTaskName    = 'Softwarekatalog - Winget Queue'
 $DaemonTaskName         = 'Softwarekatalog - Daemon'
 $RequestTaskName        = 'Softwarekatalog - Requests'
+$QueueTaskName          = 'Softwarekatalog - Queue'
 $UpgradeTaskName        = 'Softwarekatalog - Winget Upgrade'
 $WingetMutexName        = 'Global\Softwarekatalog-Winget'
 $QueueStateMutexName    = 'Global\Softwarekatalog-QueueState'
@@ -68,6 +70,8 @@ $CommonDesktopDir       = [Environment]::GetFolderPath('CommonDesktopDirectory')
 $CommonProgramsDir      = [Environment]::GetFolderPath('CommonPrograms')
 $DesktopShortcutPath    = Join-Path $CommonDesktopDir "$CatalogDisplayName.lnk"
 $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
+$script:QueueProgressThrottle = @{}
+$script:SoftwarekatalogBuildCommit = $null
 
 # ----------------------------
 # Utility functions
@@ -89,6 +93,88 @@ function Write-Log {
     Ensure-Directory -Path $LogDir
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
     Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+}
+
+function Get-SoftwarekatalogBuildCommit {
+    if (-not [string]::IsNullOrWhiteSpace($script:SoftwarekatalogBuildCommit)) {
+        return $script:SoftwarekatalogBuildCommit
+    }
+
+    $paths = @()
+    if ($PSCommandPath) {
+        $paths += $PSCommandPath
+    }
+    elseif ($MyInvocation.MyCommand.Path) {
+        $paths += $MyInvocation.MyCommand.Path
+    }
+    elseif ($LocalScriptPath) {
+        $paths += $LocalScriptPath
+    }
+
+    foreach ($path in @($paths | Select-Object -Unique)) {
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+
+        try {
+            foreach ($line in @(Get-Content -LiteralPath $path -TotalCount 5 -Encoding UTF8 -ErrorAction Stop)) {
+                $match = [regex]::Match([string]$line, '^#\s*Softwarekatalog build commit:\s*(.+?)\s*$')
+                if ($match.Success) {
+                    $script:SoftwarekatalogBuildCommit = $match.Groups[1].Value
+                    return $script:SoftwarekatalogBuildCommit
+                }
+            }
+        }
+        catch {
+        }
+    }
+
+    $script:SoftwarekatalogBuildCommit = 'unknown'
+    return $script:SoftwarekatalogBuildCommit
+}
+
+function Write-QueueLockOwnerInfo {
+    param([Parameter(Mandatory)][string]$Operation)
+
+    try {
+        Ensure-Directory -Path $BaseDir
+        $owner = [ordered]@{
+            Pid         = $PID
+            Mode        = $Mode
+            Operation   = $Operation
+            StartedAt   = (Get-Date).ToString('o')
+            ScriptPath  = $PSCommandPath
+            BuildCommit = Get-SoftwarekatalogBuildCommit
+        }
+        $owner | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $QueueLockInfoPath -Encoding UTF8 -ErrorAction Stop
+    }
+    catch {
+    }
+}
+
+function Clear-QueueLockOwnerInfo {
+    try {
+        if (Test-Path -LiteralPath $QueueLockInfoPath) {
+            Remove-Item -LiteralPath $QueueLockInfoPath -Force -ErrorAction Stop
+        }
+    }
+    catch {
+    }
+}
+
+function Get-QueueLockOwnerSummary {
+    if (-not (Test-Path -LiteralPath $QueueLockInfoPath)) {
+        return 'owner=unknown'
+    }
+
+    try {
+        $raw = Get-Content -LiteralPath $QueueLockInfoPath -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { return 'owner=unknown' }
+        $owner = $raw | ConvertFrom-Json
+        return "ownerPid=$($owner.Pid) ownerMode='$($owner.Mode)' operation='$($owner.Operation)' startedAt='$($owner.StartedAt)' build='$($owner.BuildCommit)' script='$($owner.ScriptPath)'"
+    }
+    catch {
+        return "owner=unreadable ($($_.Exception.Message))"
+    }
 }
 
 function Set-DirectoryAcl {
@@ -394,6 +480,75 @@ function New-QueueStateObject {
     }
 }
 
+function Backup-CorruptQueueState {
+    param([string]$Reason)
+
+    if (-not (Test-Path -LiteralPath $QueueStatePath)) { return }
+
+    try {
+        $backupPath = Join-Path $BaseDir ("Queue-State.corrupt-{0}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'))
+        Copy-Item -LiteralPath $QueueStatePath -Destination $backupPath -Force -ErrorAction Stop
+        Write-Log "Backed up corrupt queue state to '$backupPath': $Reason" 'WARN'
+    }
+    catch {
+        Write-Log "Could not back up corrupt queue state: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Normalize-QueueState {
+    param($State)
+
+    if (-not $State -or $State -is [System.Array] -or $State -isnot [pscustomobject]) {
+        return New-QueueStateObject
+    }
+
+    if (-not $State.PSObject.Properties['Version']) { $State | Add-Member -NotePropertyName Version -NotePropertyValue 0 }
+    if (-not $State.PSObject.Properties['UpdatedAt']) { $State | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue (Get-Date).ToString('o') }
+    if (-not $State.PSObject.Properties['Current']) { $State | Add-Member -NotePropertyName Current -NotePropertyValue $null }
+    if (-not $State.PSObject.Properties['Queue']) {
+        $State | Add-Member -NotePropertyName Queue -NotePropertyValue @()
+    }
+    elseif (-not $State.Queue) {
+        $State.Queue = @()
+    }
+    else {
+        $State.Queue = @(@($State.Queue) | Where-Object { $null -ne $_ })
+    }
+
+    return $State
+}
+
+function Get-QueueItemSortTimestamp {
+    param($Item)
+
+    foreach ($propertyName in @('FinishedAt','StartedAt','CreatedAt')) {
+        if ($Item -and $Item.PSObject.Properties[$propertyName] -and $Item.$propertyName) {
+            try { return [DateTime]::Parse([string]$Item.$propertyName) }
+            catch { }
+        }
+    }
+
+    return [DateTime]::MinValue
+}
+
+function Compact-QueueState {
+    param($State)
+
+    $State = Normalize-QueueState -State $State
+    $active = New-Object 'System.Collections.Generic.List[object]'
+    $finished = New-Object 'System.Collections.Generic.List[object]'
+
+    foreach ($item in @($State.Queue)) {
+        if (-not $item) { continue }
+        if ($item.State -in @('Queued','Running')) { [void]$active.Add($item) }
+        else { [void]$finished.Add($item) }
+    }
+
+    $keptFinished = @($finished | Sort-Object { Get-QueueItemSortTimestamp -Item $_ } -Descending | Select-Object -First 100)
+    $State.Queue = @(@($active | Sort-Object CreatedAt) + @($keptFinished | Sort-Object { Get-QueueItemSortTimestamp -Item $_ }))
+    return $State
+}
+
 function Read-QueueState {
     if (-not (Test-Path -LiteralPath $QueueStatePath)) {
         return New-QueueStateObject
@@ -406,19 +561,16 @@ function Read-QueueState {
         }
 
         $state = $raw | ConvertFrom-Json
-        if (-not $state.PSObject.Properties['Version']) { $state | Add-Member -NotePropertyName Version -NotePropertyValue 0 }
-        if (-not $state.PSObject.Properties['UpdatedAt']) { $state | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue (Get-Date).ToString('o') }
-        if (-not $state.PSObject.Properties['Current']) { $state | Add-Member -NotePropertyName Current -NotePropertyValue $null }
-        if (-not $state.PSObject.Properties['Queue']) {
-            $state | Add-Member -NotePropertyName Queue -NotePropertyValue @()
+        if ($state -is [System.Array] -or $state -isnot [pscustomobject]) {
+            Backup-CorruptQueueState -Reason "Queue state root is not a JSON object."
+            return New-QueueStateObject
         }
-        elseif (-not $state.Queue) {
-            $state.Queue = @()
-        }
-        return $state
+
+        return Normalize-QueueState -State $state
     }
     catch {
         Write-Log "Failed to read queue state: $($_.Exception.Message)" 'WARN'
+        Backup-CorruptQueueState -Reason $_.Exception.Message
         return New-QueueStateObject
     }
 }
@@ -427,6 +579,7 @@ function Write-QueueState {
     param([Parameter(Mandatory)]$State)
 
     Ensure-Directory -Path $BaseDir
+    $State = Compact-QueueState -State $State
     $tempPath = Join-Path $BaseDir ("Queue-State-{0}.json.tmp" -f [Guid]::NewGuid().ToString('N'))
     try {
         $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
@@ -442,7 +595,8 @@ function Write-QueueState {
 function Invoke-WithQueueStateLock {
     param(
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [string]$Operation = 'QueueState'
     )
 
     $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
@@ -457,13 +611,18 @@ function Invoke-WithQueueStateLock {
         }
 
         if (-not $hasLock) {
-            throw (New-Object System.TimeoutException -ArgumentList "Timed out waiting for queue state lock '$QueueStateMutexName'.")
+            $owner = Get-QueueLockOwnerSummary
+            throw (New-Object System.TimeoutException -ArgumentList "Timed out waiting for queue state lock '$QueueStateMutexName' ($owner).")
         }
 
+        Write-QueueLockOwnerInfo -Operation $Operation
         & $ScriptBlock
     }
     finally {
-        if ($hasLock) { $mutex.ReleaseMutex() }
+        if ($hasLock) {
+            Clear-QueueLockOwnerInfo
+            $mutex.ReleaseMutex()
+        }
         $mutex.Dispose()
     }
 }
@@ -471,7 +630,8 @@ function Invoke-WithQueueStateLock {
 function Update-QueueState {
     param(
         [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-        [int]$TimeoutSeconds = 30
+        [int]$TimeoutSeconds = 30,
+        [string]$Operation = 'UpdateQueueState'
     )
 
     Invoke-WithQueueStateLock -ScriptBlock {
@@ -481,13 +641,13 @@ function Update-QueueState {
         $state.UpdatedAt = (Get-Date).ToString('o')
         Write-QueueState -State $state
         return $state
-    } -TimeoutSeconds $TimeoutSeconds
+    } -TimeoutSeconds $TimeoutSeconds -Operation $Operation
 }
 
 function Get-QueueStateSnapshot {
     param([int]$TimeoutSeconds = 30)
 
-    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState } -TimeoutSeconds $TimeoutSeconds
+    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState } -TimeoutSeconds $TimeoutSeconds -Operation 'GetQueueStateSnapshot'
 }
 
 function Test-IsQueueStateLockTimeout {
@@ -575,7 +735,28 @@ function Update-QueueItemProgress {
         [bool]$IsIndeterminate = $true
     )
 
-    $null = Update-QueueState -ScriptBlock {
+    if (-not $script:QueueProgressThrottle) { $script:QueueProgressThrottle = @{} }
+    $now = Get-Date
+    $last = $script:QueueProgressThrottle[$Id]
+    if ($last) {
+        $sameStage = [string]::Equals([string]$last.Stage, [string]$Stage, [System.StringComparison]::Ordinal)
+        $sameText = [string]::Equals([string]$last.StageText, [string]$StageText, [System.StringComparison]::Ordinal)
+        $samePercent = ([string]$last.ProgressPercent) -eq ([string]$ProgressPercent)
+        $sameIndeterminate = ([bool]$last.IsIndeterminate) -eq ([bool]$IsIndeterminate)
+        if ($sameStage -and $sameText -and $samePercent -and $sameIndeterminate -and (($now - $last.UpdatedAt).TotalSeconds -lt 5)) {
+            return
+        }
+    }
+
+    $script:QueueProgressThrottle[$Id] = [pscustomobject]@{
+        Stage = $Stage
+        StageText = $StageText
+        ProgressPercent = $ProgressPercent
+        IsIndeterminate = $IsIndeterminate
+        UpdatedAt = $now
+    }
+
+    $null = Update-QueueState -Operation "Progress:$Id" -ScriptBlock {
         param($state)
         foreach ($item in @($state.Queue)) {
             if (-not $item) { continue }
@@ -631,7 +812,7 @@ function Add-QueueItem {
 
         $state.Queue = @($queue + $Item)
         $script:QueueAddResult = [pscustomobject]@{ Added = $true; Item = $Item }
-    } -TimeoutSeconds $TimeoutSeconds
+    } -TimeoutSeconds $TimeoutSeconds -Operation "AddQueueItem:$($Item.Action):$($Item.Alias)"
 
     $result = $script:QueueAddResult
     $script:QueueAddResult = $null
@@ -822,7 +1003,27 @@ function Start-SoftwarekatalogWorker {
 }
 
 function Start-QueueWorker {
-    Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
+    try {
+        $task = Get-ScheduledTask -TaskName $QueueTaskName -ErrorAction SilentlyContinue
+        if ($task) {
+            Start-ScheduledTask -TaskName $QueueTaskName -ErrorAction Stop
+            Write-Log "Started scheduled queue task '$QueueTaskName'."
+            return $true
+        }
+    }
+    catch {
+        Write-Log "Could not start scheduled queue task '$QueueTaskName': $($_.Exception.Message)" 'WARN'
+    }
+
+    try {
+        Start-SoftwarekatalogWorker -WorkerMode ProcessQueue
+        Write-Log 'Started queue worker process fallback.' 'WARN'
+        return $true
+    }
+    catch {
+        Write-Log "Could not start queue worker process fallback: $($_.Exception.Message)" 'ERROR'
+        return $false
+    }
 }
 
 function Start-QueueWorkerIfAvailable {
@@ -836,8 +1037,7 @@ function Start-QueueWorkerIfAvailable {
         return $false
     }
 
-    Start-QueueWorker
-    return $true
+    return (Start-QueueWorker)
 }
 
 function Get-WingetPath {
@@ -2198,40 +2398,34 @@ function Unregister-ObsoleteDaemonTask {
     }
 }
 
-function Test-CommandLineHasWorkerMode {
-    param(
-        [Parameter(Mandatory)][string]$CommandLine,
-        [Parameter(Mandatory)][string]$Mode
-    )
+function Stop-SoftwarekatalogScheduledTasksForUpdate {
+    foreach ($taskName in @($RequestTaskName, $QueueTaskName, $UpgradeTaskName, $LegacyQueueTaskName, $DaemonTaskName)) {
+        if ([string]::IsNullOrWhiteSpace($taskName)) { continue }
 
-    $pattern = ('(?i)(^|\s)-Mode\s+["'']?{0}["'']?(\s|$)' -f [regex]::Escape($Mode))
-    return [bool]($CommandLine -match $pattern)
+        try {
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($task) {
+                Write-Log "Stopping scheduled task '$taskName' before update."
+                Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                for ($attempt = 0; $attempt -lt 10; $attempt++) {
+                    $currentTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                    if (-not $currentTask -or [string]$currentTask.State -ne "Running") { break }
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+        }
+        catch {
+            Write-Log "Could not stop scheduled task '$taskName': $($_.Exception.Message)" 'WARN'
+        }
+    }
 }
 
 function Stop-ObsoleteDaemonProcesses {
-    $currentWorkerModes = @(
-        'Install',
-        'ProcessRequests',
-        'ProcessQueue',
-        'UpgradeAll',
-        'ApplyPolicy',
-        'ProcessRequest'
-    )
-    $daemonMarkers = @(
-        '-Mode Daemon',
-        '-Mode "Daemon"',
-        "-Mode 'Daemon'",
-        'Mode=Daemon',
-        'NamedPipe',
-        'Named pipe',
-        '\\.\pipe\Softwarekatalog'
-    )
-
     try {
         $processes = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
     }
     catch {
-        Write-Log "Could not enumerate processes for obsolete daemon cleanup: $($_.Exception.Message)" 'WARN'
+        Write-Log "Could not enumerate processes for Softwarekatalog worker cleanup: $($_.Exception.Message)" 'WARN'
         return
     }
 
@@ -2247,30 +2441,12 @@ function Stop-ObsoleteDaemonProcesses {
         $matchesScriptName = ($commandLine.IndexOf('SelfServiceWinget.ps1', [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and $commandLine.IndexOf($BaseDir, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
         if (-not ($matchesScriptPath -or $matchesScriptName)) { continue }
 
-        $hasCurrentWorkerMode = $false
-        foreach ($mode in $currentWorkerModes) {
-            if (Test-CommandLineHasWorkerMode -CommandLine $commandLine -Mode $mode) {
-                $hasCurrentWorkerMode = $true
-                break
-            }
-        }
-
-        $hasDaemonMarker = $false
-        foreach ($marker in $daemonMarkers) {
-            if ($commandLine.IndexOf($marker, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                $hasDaemonMarker = $true
-                break
-            }
-        }
-
-        if ($hasCurrentWorkerMode -and -not $hasDaemonMarker) { continue }
-
         try {
-            Write-Log "Stopping obsolete Softwarekatalog process pid=$($process.ProcessId)."
+            Write-Log "Stopping existing Softwarekatalog process pid=$($process.ProcessId)."
             Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
         }
         catch {
-            Write-Log "Could not stop obsolete daemon process pid=$($process.ProcessId): $($_.Exception.Message)" 'WARN'
+            Write-Log "Could not stop Softwarekatalog process pid=$($process.ProcessId): $($_.Exception.Message)" 'WARN'
         }
     }
 }
@@ -2304,6 +2480,23 @@ function Register-OrUpdateTasks {
         -Settings $requestSettings
 
     Register-ScheduledTask -TaskName $RequestTaskName -InputObject $requestTask -Force | Out-Null
+
+    Write-Log "Registering/updating scheduled task '$QueueTaskName'."
+    $queueArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode ProcessQueue"
+    $queueAction = New-ScheduledTaskAction -Execute $PowerShellExe -Argument $queueArgs
+    $queueSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+
+    $queueTask = New-ScheduledTask `
+        -Action $queueAction `
+        -Principal $principal `
+        -Settings $queueSettings
+
+    Register-ScheduledTask -TaskName $QueueTaskName -InputObject $queueTask -Force | Out-Null
 
     Write-Log "Registering/updating scheduled task '$UpgradeTaskName'."
     $upgradeArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalScriptPath`" -Mode UpgradeAll"
@@ -2627,7 +2820,7 @@ function Invoke-RequiredSoftwarePolicy {
 }
 
 function Reset-RunningQueueItems {
-    $null = Update-QueueState -ScriptBlock {
+    $null = Update-QueueState -Operation 'ResetRunningQueueItems' -ScriptBlock {
         param($state)
         foreach ($item in @($state.Queue)) {
             if (-not $item) { continue }
@@ -2646,7 +2839,7 @@ function Reset-RunningQueueItems {
 
 function Get-NextQueuedItem {
     $script:NextQueueItem = $null
-    $null = Update-QueueState -ScriptBlock {
+    $null = Update-QueueState -Operation 'GetNextQueuedItem' -ScriptBlock {
         param($state)
         foreach ($item in (@($state.Queue) | Sort-Object CreatedAt)) {
             if (-not $item) { continue }
@@ -2686,7 +2879,7 @@ function Complete-QueueItem {
         [string]$Message
     )
 
-    $null = Update-QueueState -ScriptBlock {
+    $null = Update-QueueState -Operation "CompleteQueueItem:${Id}:${State}" -ScriptBlock {
         param($queueState)
         foreach ($item in @($queueState.Queue)) {
             if (-not $item) { continue }
@@ -2787,7 +2980,7 @@ function Invoke-ProcessQueueMode {
             }
         }
 
-        $null = Update-QueueState -ScriptBlock { param($state) $state.Current = $null }
+        $null = Update-QueueState -Operation 'ClearCurrentQueueItem' -ScriptBlock { param($state) $state.Current = $null }
     }
 }
 
@@ -3015,6 +3208,49 @@ function Move-RequestFile {
     }
 }
 
+function Test-IsTransientRequestFailureMessage {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+
+    return (
+        $Message -like "*$QueueStateMutexName*" -or
+        $Message -like "*queue state lock*" -or
+        $Message -like "*Aufruftiefe*" -or
+        $Message -like "*call depth*" -or
+        $Message -like "*recursion*"
+    )
+}
+
+function Restore-QueueLockFailedRequests {
+    Ensure-Directory -Path $RequestsDir
+    Ensure-Directory -Path $FailedRequestsDir
+
+    $errorFiles = @(Get-ChildItem -LiteralPath $FailedRequestsDir -Filter '*.json.error.txt' -File -ErrorAction SilentlyContinue)
+    foreach ($errorFile in $errorFiles) {
+        try {
+            $message = Get-Content -LiteralPath $errorFile.FullName -Raw -Encoding UTF8 -ErrorAction Stop
+            if (-not (Test-IsTransientRequestFailureMessage -Message $message)) { continue }
+
+            $requestName = $errorFile.Name.Substring(0, $errorFile.Name.Length - '.error.txt'.Length)
+            $requestPath = Join-Path $FailedRequestsDir $requestName
+            if (-not (Test-Path -LiteralPath $requestPath)) { continue }
+
+            $destination = Join-Path $RequestsDir $requestName
+            if (Test-Path -LiteralPath $destination) {
+                $destination = Join-Path $RequestsDir ("{0}-{1}.json" -f [IO.Path]::GetFileNameWithoutExtension($requestName), [Guid]::NewGuid().ToString('N'))
+            }
+
+            Move-Item -LiteralPath $requestPath -Destination $destination -Force -ErrorAction Stop
+            Remove-Item -LiteralPath $errorFile.FullName -Force -ErrorAction SilentlyContinue
+            Write-Log "Restored failed request '$requestName' for retry after queue lock timeout."
+        }
+        catch {
+            Write-Log "Could not restore failed request '$($errorFile.Name)': $($_.Exception.Message)" 'WARN'
+        }
+    }
+}
+
 function Invoke-ProcessRequestsMode {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
@@ -3113,24 +3349,6 @@ function Invoke-ProcessRequestsMode {
         }
     }
 
-    try {
-        $queueState = Get-QueueStateSnapshot -TimeoutSeconds 5
-        foreach ($queuedItem in @($queueState.Queue)) {
-            if ($queuedItem -and $queuedItem.State -eq 'Queued') {
-                $shouldStartQueue = $true
-                break
-            }
-        }
-    }
-    catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Queued work inspection skipped because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-        }
-        else {
-            throw
-        }
-    }
-
     if ($shouldStartQueue) {
         [void](Start-QueueWorkerIfAvailable)
     }
@@ -3143,9 +3361,14 @@ function Install-Service {
     Ensure-Directory -Path $ProcessedRequestsDir
     Ensure-Directory -Path $FailedRequestsDir
 
+    Write-Log "Softwarekatalog build commit: $(Get-SoftwarekatalogBuildCommit)."
+    Stop-SoftwarekatalogScheduledTasksForUpdate
+    Stop-ObsoleteDaemonProcesses
     Unregister-LegacyQueueTask
     Unregister-ObsoleteDaemonTask
-    Stop-ObsoleteDaemonProcesses
+    Restore-QueueLockFailedRequests
+    try { Reset-RunningQueueItems }
+    catch { Write-Log "Could not reset running queue items during install/update: $($_.Exception.Message)" 'WARN' }
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
@@ -3167,6 +3390,24 @@ function Install-Service {
     New-Shortcut -ShortcutPath $StartMenuShortcutPath
     Register-OrUpdateTasks
 
+    try {
+        $queueState = Get-QueueStateSnapshot -TimeoutSeconds 5
+        foreach ($queuedItem in @($queueState.Queue)) {
+            if ($queuedItem -and $queuedItem.State -eq 'Queued') {
+                [void](Start-QueueWorkerIfAvailable)
+                break
+            }
+        }
+    }
+    catch {
+        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
+            Write-Log "Could not inspect queued work during install/update because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+        }
+        else {
+            Write-Log "Could not inspect queued work during install/update: $($_.Exception.Message)" 'WARN'
+        }
+    }
+
     Write-Log 'Install/update completed successfully.'
 }
 
@@ -3186,6 +3427,11 @@ try {
 }
 catch {
     try {
+        if ($Mode -in @('ProcessRequests','UpgradeAll') -and (Test-IsQueueStateLockTimeout -ErrorObject $_)) {
+            Write-Log "Mode '$Mode' deferred because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
+            return
+        }
+
         Write-Log "Fatal error in mode '$Mode': $($_.Exception.Message)" 'ERROR'
     }
     catch {

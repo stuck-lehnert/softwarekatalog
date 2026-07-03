@@ -4,16 +4,31 @@ set -euo pipefail
 src="${1:-setup.ps1}"
 out="${2:-dist/setup.ps1}"
 out_dir="$(dirname "$out")"
+build_commit="${SOFTKAT_BUILD_COMMIT:-${GITHUB_SHA:-}}"
+
+if [ -z "$build_commit" ] && git rev-parse --verify HEAD >/dev/null 2>&1; then
+  build_commit="$(git rev-parse HEAD)"
+fi
+
+if [ -z "$build_commit" ]; then
+  build_commit="unknown"
+fi
 
 mkdir -p "$out_dir"
 
+payload_src="$(mktemp)"
+trap 'rm -f "$payload_src"' EXIT
+printf '# Softwarekatalog build commit: %s\n' "$build_commit" > "$payload_src"
+cat "$src" >> "$payload_src"
+
 if base64 --help 2>&1 | grep -q -- '-w'; then
-  payload="$(base64 -w 0 "$src")"
+  payload="$(base64 -w 0 "$payload_src")"
 else
-  payload="$(base64 "$src" | tr -d '\n')"
+  payload="$(base64 "$payload_src" | tr -d '\n')"
 fi
 
 cat > "$out" <<EOF
+# Softwarekatalog build commit: $build_commit
 # ASCII-only bootstrap generated from setup.ps1. Do not edit.
 [CmdletBinding()]
 param(

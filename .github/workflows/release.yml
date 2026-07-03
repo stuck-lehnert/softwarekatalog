@@ -20,6 +20,8 @@ jobs:
 
       - name: Build dist
         run: make dist
+        env:
+          SOFTKAT_BUILD_COMMIT: ${{ github.sha }}
 
       - name: Package release zip
         run: |
