@@ -47,6 +47,12 @@ $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
 $QueueStatePath         = Join-Path $BaseDir 'Queue-State.json'
 $QueueLockInfoPath      = Join-Path $BaseDir 'Queue-Lock.json'
+$QueueRootDir           = Join-Path $BaseDir 'Queue'
+$QueuePendingDir        = Join-Path $QueueRootDir 'Pending'
+$QueueRunningDir        = Join-Path $QueueRootDir 'Running'
+$QueueSucceededDir      = Join-Path $QueueRootDir 'Succeeded'
+$QueueFailedDir         = Join-Path $QueueRootDir 'Failed'
+$QueueCompletedRetention = 100
 $RequestsDir            = Join-Path $BaseDir 'Requests'
 $ProcessedRequestsDir   = Join-Path $BaseDir 'Processed'
 $FailedRequestsDir      = Join-Path $BaseDir 'Failed'
@@ -132,25 +138,6 @@ function Get-SoftwarekatalogBuildCommit {
     return $script:SoftwarekatalogBuildCommit
 }
 
-function Write-QueueLockOwnerInfo {
-    param([Parameter(Mandatory)][string]$Operation)
-
-    try {
-        Ensure-Directory -Path $BaseDir
-        $owner = [ordered]@{
-            Pid         = $PID
-            Mode        = $Mode
-            Operation   = $Operation
-            StartedAt   = (Get-Date).ToString('o')
-            ScriptPath  = $PSCommandPath
-            BuildCommit = Get-SoftwarekatalogBuildCommit
-        }
-        $owner | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $QueueLockInfoPath -Encoding UTF8 -ErrorAction Stop
-    }
-    catch {
-    }
-}
-
 function Clear-QueueLockOwnerInfo {
     try {
         if (Test-Path -LiteralPath $QueueLockInfoPath) {
@@ -158,22 +145,6 @@ function Clear-QueueLockOwnerInfo {
         }
     }
     catch {
-    }
-}
-
-function Get-QueueLockOwnerSummary {
-    if (-not (Test-Path -LiteralPath $QueueLockInfoPath)) {
-        return 'owner=unknown'
-    }
-
-    try {
-        $raw = Get-Content -LiteralPath $QueueLockInfoPath -Raw -Encoding UTF8 -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return 'owner=unknown' }
-        $owner = $raw | ConvertFrom-Json
-        return "ownerPid=$($owner.Pid) ownerMode='$($owner.Mode)' operation='$($owner.Operation)' startedAt='$($owner.StartedAt)' build='$($owner.BuildCommit)' script='$($owner.ScriptPath)'"
-    }
-    catch {
-        return "owner=unreadable ($($_.Exception.Message))"
     }
 }
 
@@ -471,9 +442,15 @@ function Write-TextFile {
     [System.IO.File]::WriteAllText($Path, $Content, $textEncoding)
 }
 
+function Ensure-QueueDirectories {
+    foreach ($path in @($QueueRootDir, $QueuePendingDir, $QueueRunningDir, $QueueSucceededDir, $QueueFailedDir)) {
+        Ensure-Directory -Path $path
+    }
+}
+
 function New-QueueStateObject {
     [pscustomobject][ordered]@{
-        Version = 0
+        Version = [int64](Get-Date).ToUniversalTime().Ticks
         UpdatedAt = (Get-Date).ToString('o')
         Current = $null
         Queue = @()
@@ -495,95 +472,157 @@ function Backup-CorruptQueueState {
     }
 }
 
-function Normalize-QueueState {
-    param($State)
+function Get-QueueObjectValue {
+    param(
+        $Object,
+        [Parameter(Mandatory)][string]$Name,
+        $Default = $null
+    )
 
-    if (-not $State -or $State -is [System.Array] -or $State -isnot [pscustomobject]) {
-        return New-QueueStateObject
-    }
-
-    if (-not $State.PSObject.Properties['Version']) { $State | Add-Member -NotePropertyName Version -NotePropertyValue 0 }
-    if (-not $State.PSObject.Properties['UpdatedAt']) { $State | Add-Member -NotePropertyName UpdatedAt -NotePropertyValue (Get-Date).ToString('o') }
-    if (-not $State.PSObject.Properties['Current']) { $State | Add-Member -NotePropertyName Current -NotePropertyValue $null }
-    if (-not $State.PSObject.Properties['Queue']) {
-        $State | Add-Member -NotePropertyName Queue -NotePropertyValue @()
-    }
-    elseif (-not $State.Queue) {
-        $State.Queue = @()
-    }
-    else {
-        $State.Queue = @(@($State.Queue) | Where-Object { $null -ne $_ })
-    }
-
-    return $State
-}
-
-function Get-QueueItemSortTimestamp {
-    param($Item)
-
-    foreach ($propertyName in @('FinishedAt','StartedAt','CreatedAt')) {
-        if ($Item -and $Item.PSObject.Properties[$propertyName] -and $Item.$propertyName) {
-            try { return [DateTime]::Parse([string]$Item.$propertyName) }
-            catch { }
-        }
-    }
-
-    return [DateTime]::MinValue
-}
-
-function Compact-QueueState {
-    param($State)
-
-    $State = Normalize-QueueState -State $State
-    $active = New-Object 'System.Collections.Generic.List[object]'
-    $finished = New-Object 'System.Collections.Generic.List[object]'
-
-    foreach ($item in @($State.Queue)) {
-        if (-not $item) { continue }
-        if ($item.State -in @('Queued','Running')) { [void]$active.Add($item) }
-        else { [void]$finished.Add($item) }
-    }
-
-    $keptFinished = @($finished | Sort-Object { Get-QueueItemSortTimestamp -Item $_ } -Descending | Select-Object -First 100)
-    $State.Queue = @(@($active | Sort-Object CreatedAt) + @($keptFinished | Sort-Object { Get-QueueItemSortTimestamp -Item $_ }))
-    return $State
-}
-
-function Read-QueueState {
-    if (-not (Test-Path -LiteralPath $QueueStatePath)) {
-        return New-QueueStateObject
-    }
+    if ($null -eq $Object) { return $Default }
 
     try {
-        $raw = Get-Content -LiteralPath $QueueStatePath -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) {
-            return New-QueueStateObject
-        }
-
-        $state = $raw | ConvertFrom-Json
-        if ($state -is [System.Array] -or $state -isnot [pscustomobject]) {
-            Backup-CorruptQueueState -Reason "Queue state root is not a JSON object."
-            return New-QueueStateObject
-        }
-
-        return Normalize-QueueState -State $state
+        $property = $Object.PSObject.Properties[$Name]
+        if (-not $property) { return $Default }
+        if ($null -eq $property.Value) { return $Default }
+        return $property.Value
     }
     catch {
-        Write-Log "Failed to read queue state: $($_.Exception.Message)" 'WARN'
-        Backup-CorruptQueueState -Reason $_.Exception.Message
-        return New-QueueStateObject
+        return $Default
     }
 }
 
-function Write-QueueState {
-    param([Parameter(Mandatory)]$State)
+function ConvertTo-QueueBool {
+    param(
+        $Value,
+        [bool]$Default = $false
+    )
 
-    Ensure-Directory -Path $BaseDir
-    $State = Compact-QueueState -State $State
-    $tempPath = Join-Path $BaseDir ("Queue-State-{0}.json.tmp" -f [Guid]::NewGuid().ToString('N'))
+    if ($null -eq $Value) { return $Default }
+    if ($Value -is [bool]) { return [bool]$Value }
+
+    $text = ([string]$Value).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+    if ($text -in @('0','false','no','nein')) { return $false }
+    if ($text -in @('1','true','yes','ja')) { return $true }
+    return [bool]$Value
+}
+
+function ConvertTo-QueueNullableInt {
+    param($Value)
+
+    if ($null -eq $Value) { return $null }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
     try {
-        $State | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
-        Move-Item -LiteralPath $tempPath -Destination $QueueStatePath -Force
+        $number = [int]$text
+        if ($number -lt 0) { return 0 }
+        if ($number -gt 100) { return 100 }
+        return $number
+    }
+    catch {
+        return $null
+    }
+}
+
+function ConvertTo-QueueTimestampString {
+    param(
+        $Value,
+        [string]$Default
+    )
+
+    if ($null -eq $Value) { return $Default }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $Default }
+
+    try {
+        return ([DateTime]::Parse($text)).ToString('o')
+    }
+    catch {
+        return $Default
+    }
+}
+
+function ConvertTo-QueueItemRecord {
+    param(
+        [Parameter(Mandatory)]$Item,
+        [ValidateSet('Queued','Running','Succeeded','Failed')][string]$DefaultState = 'Queued'
+    )
+
+    $now = (Get-Date).ToString('o')
+    $id = [string](Get-QueueObjectValue -Object $Item -Name 'Id' -Default '')
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = [Guid]::NewGuid().ToString('N') }
+
+    $action = [string](Get-QueueObjectValue -Object $Item -Name 'Action' -Default '')
+    $state = [string](Get-QueueObjectValue -Object $Item -Name 'State' -Default $DefaultState)
+    if ($state -notin @('Queued','Running','Succeeded','Failed')) { $state = $DefaultState }
+
+    $createdAt = ConvertTo-QueueTimestampString -Value (Get-QueueObjectValue -Object $Item -Name 'CreatedAt' -Default $null) -Default $now
+    $startedAt = ConvertTo-QueueTimestampString -Value (Get-QueueObjectValue -Object $Item -Name 'StartedAt' -Default $null) -Default $null
+    $finishedAt = ConvertTo-QueueTimestampString -Value (Get-QueueObjectValue -Object $Item -Name 'FinishedAt' -Default $null) -Default $null
+
+    [pscustomobject][ordered]@{
+        Id = $id
+        Action = $action
+        Alias = [string](Get-QueueObjectValue -Object $Item -Name 'Alias' -Default '')
+        PackageId = [string](Get-QueueObjectValue -Object $Item -Name 'PackageId' -Default '')
+        DisplayName = [string](Get-QueueObjectValue -Object $Item -Name 'DisplayName' -Default '')
+        Source = [string](Get-QueueObjectValue -Object $Item -Name 'Source' -Default 'User')
+        Required = ConvertTo-QueueBool -Value (Get-QueueObjectValue -Object $Item -Name 'Required' -Default $false)
+        RequestedBy = [string](Get-QueueObjectValue -Object $Item -Name 'RequestedBy' -Default '')
+        RequestedBySid = [string](Get-QueueObjectValue -Object $Item -Name 'RequestedBySid' -Default '')
+        State = $state
+        Stage = [string](Get-QueueObjectValue -Object $Item -Name 'Stage' -Default $state)
+        StageText = [string](Get-QueueObjectValue -Object $Item -Name 'StageText' -Default '')
+        ProgressPercent = ConvertTo-QueueNullableInt -Value (Get-QueueObjectValue -Object $Item -Name 'ProgressPercent' -Default $null)
+        IsIndeterminate = ConvertTo-QueueBool -Value (Get-QueueObjectValue -Object $Item -Name 'IsIndeterminate' -Default $false)
+        CreatedAt = $createdAt
+        StartedAt = $startedAt
+        FinishedAt = $finishedAt
+        ExitCode = Get-QueueObjectValue -Object $Item -Name 'ExitCode' -Default $null
+        Message = [string](Get-QueueObjectValue -Object $Item -Name 'Message' -Default '')
+    }
+}
+
+function ConvertTo-SafeQueueFileName {
+    param([string]$Id)
+
+    if ([string]::IsNullOrWhiteSpace($Id)) {
+        $Id = [Guid]::NewGuid().ToString('N')
+    }
+
+    $safe = [regex]::Replace($Id, '[^A-Za-z0-9._-]', '_')
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        $safe = [Guid]::NewGuid().ToString('N')
+    }
+
+    return $safe
+}
+
+function Get-QueueItemPath {
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][string]$Id
+    )
+
+    Join-Path $Directory ("{0}.json" -f (ConvertTo-SafeQueueFileName -Id $Id))
+}
+
+function Write-JsonFileAtomic {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)]$Value,
+        [int]$Depth = 8
+    )
+
+    $directory = Split-Path -Path $Path -Parent
+    if ($directory) { Ensure-Directory -Path $directory }
+
+    $tempPath = Join-Path $directory ("{0}.{1}.tmp" -f (Split-Path -Path $Path -Leaf), [Guid]::NewGuid().ToString('N'))
+    try {
+        $Value | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $Path -Force
     }
     finally {
         if (Test-Path -LiteralPath $tempPath) {
@@ -592,90 +631,260 @@ function Write-QueueState {
     }
 }
 
-function Invoke-WithQueueStateLock {
+function Write-QueueItemFile {
     param(
-        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-        [int]$TimeoutSeconds = 30,
-        [string]$Operation = 'QueueState'
+        [Parameter(Mandatory)]$Item,
+        [string]$Directory,
+        [string]$Path,
+        [ValidateSet('Queued','Running','Succeeded','Failed')][string]$DefaultState = 'Queued'
     )
 
-    $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
-    $hasLock = $false
-    try {
-        try {
-            $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
-        }
-        catch [System.Threading.AbandonedMutexException] {
-            $hasLock = $true
-            Write-Log "Recovered abandoned queue state lock '$QueueStateMutexName'." 'WARN'
-        }
-
-        if (-not $hasLock) {
-            $owner = Get-QueueLockOwnerSummary
-            throw (New-Object System.TimeoutException -ArgumentList "Timed out waiting for queue state lock '$QueueStateMutexName' ($owner).")
-        }
-
-        Write-QueueLockOwnerInfo -Operation $Operation
-        & $ScriptBlock
+    $record = ConvertTo-QueueItemRecord -Item $Item -DefaultState $DefaultState
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        if ([string]::IsNullOrWhiteSpace($Directory)) { throw 'Directory or Path is required when writing a queue item.' }
+        $Path = Get-QueueItemPath -Directory $Directory -Id $record.Id
     }
-    finally {
-        if ($hasLock) {
-            Clear-QueueLockOwnerInfo
-            $mutex.ReleaseMutex()
-        }
-        $mutex.Dispose()
+
+    Write-JsonFileAtomic -Path $Path -Value $record -Depth 8
+    return $record
+}
+
+function Get-QueueDefaultStateForDirectory {
+    param([Parameter(Mandatory)][string]$Directory)
+
+    if ([string]::Equals($Directory, $QueueRunningDir, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Running' }
+    if ([string]::Equals($Directory, $QueueSucceededDir, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Succeeded' }
+    if ([string]::Equals($Directory, $QueueFailedDir, [System.StringComparison]::OrdinalIgnoreCase)) { return 'Failed' }
+    return 'Queued'
+}
+
+function Read-QueueItemFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [ValidateSet('Queued','Running','Succeeded','Failed')][string]$DefaultState = 'Queued'
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $null }
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw 'Queue item file is empty.' }
+        $item = $raw | ConvertFrom-Json
+        if ($item -is [System.Array] -or $item -isnot [pscustomobject]) { throw 'Queue item JSON root is not an object.' }
+        return (ConvertTo-QueueItemRecord -Item $item -DefaultState $DefaultState)
+    }
+    catch {
+        Write-Log "Could not read queue item file '$Path': $($_.Exception.Message)" 'WARN'
+        return $null
     }
 }
 
-function Update-QueueState {
+function Get-QueueItemFiles {
+    param([Parameter(Mandatory)][string]$Directory)
+
+    if (-not (Test-Path -LiteralPath $Directory)) { return @() }
+    return @(Get-ChildItem -LiteralPath $Directory -Filter '*.json' -File -ErrorAction SilentlyContinue)
+}
+
+function Get-QueueItemsInDirectory {
     param(
-        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
-        [int]$TimeoutSeconds = 30,
-        [string]$Operation = 'UpdateQueueState'
+        [Parameter(Mandatory)][string]$Directory,
+        [ValidateSet('Queued','Running','Succeeded','Failed')][string]$DefaultState = 'Queued'
     )
 
-    Invoke-WithQueueStateLock -ScriptBlock {
-        $state = Read-QueueState
-        & $ScriptBlock $state
-        $state.Version = [int64]$state.Version + 1
-        $state.UpdatedAt = (Get-Date).ToString('o')
-        Write-QueueState -State $state
-        return $state
-    } -TimeoutSeconds $TimeoutSeconds -Operation $Operation
+    $items = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($file in @(Get-QueueItemFiles -Directory $Directory)) {
+        $item = Read-QueueItemFile -Path $file.FullName -DefaultState $DefaultState
+        if ($item) { [void]$items.Add($item) }
+    }
+    return @($items.ToArray())
+}
+
+function Find-QueueItemFile {
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)][string[]]$Directories
+    )
+
+    foreach ($directory in $Directories) {
+        $path = Get-QueueItemPath -Directory $directory -Id $Id
+        if (Test-Path -LiteralPath $path) {
+            $item = Read-QueueItemFile -Path $path -DefaultState (Get-QueueDefaultStateForDirectory -Directory $directory)
+            return [pscustomobject]@{ Path = $path; Directory = $directory; Item = $item }
+        }
+    }
+
+    foreach ($directory in $Directories) {
+        foreach ($file in Get-QueueItemFiles -Directory $directory) {
+            $item = Read-QueueItemFile -Path $file.FullName -DefaultState (Get-QueueDefaultStateForDirectory -Directory $directory)
+            if ($item -and [string]::Equals([string]$item.Id, $Id, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return [pscustomobject]@{ Path = $file.FullName; Directory = $directory; Item = $item }
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-QueueItemSortTimestamp {
+    param($Item)
+
+    foreach ($propertyName in @('FinishedAt','StartedAt','CreatedAt')) {
+        $value = Get-QueueObjectValue -Object $Item -Name $propertyName -Default $null
+        if ($value) {
+            try { return [DateTime]::Parse([string]$value) }
+            catch { }
+        }
+    }
+
+    return [DateTime]::MinValue
+}
+
+function ConvertTo-QueueCurrentRecord {
+    param($Item)
+
+    if (-not $Item) { return $null }
+    [pscustomobject][ordered]@{
+        Id = $Item.Id
+        Action = $Item.Action
+        Alias = $Item.Alias
+        DisplayName = $Item.DisplayName
+        Stage = $Item.Stage
+        StageText = $Item.StageText
+        ProgressPercent = $Item.ProgressPercent
+        IsIndeterminate = $Item.IsIndeterminate
+    }
+}
+
+function New-QueueStateSnapshot {
+    Ensure-QueueDirectories
+
+    $running = @(Get-QueueItemsInDirectory -Directory $QueueRunningDir -DefaultState Running | Sort-Object { Get-QueueItemSortTimestamp -Item $_ })
+    $pending = @(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued | Sort-Object { Get-QueueItemSortTimestamp -Item $_ })
+    $completed = @(
+        @(Get-QueueItemsInDirectory -Directory $QueueSucceededDir -DefaultState Succeeded) +
+        @(Get-QueueItemsInDirectory -Directory $QueueFailedDir -DefaultState Failed)
+    ) | Sort-Object { Get-QueueItemSortTimestamp -Item $_ } -Descending | Select-Object -First $QueueCompletedRetention
+
+    $snapshot = New-QueueStateObject
+    if ($running.Count -gt 0) {
+        $snapshot.Current = ConvertTo-QueueCurrentRecord -Item $running[0]
+    }
+
+    $snapshot.Queue = @(
+        @($running) +
+        @($pending) +
+        @($completed | Sort-Object { Get-QueueItemSortTimestamp -Item $_ })
+    )
+    return $snapshot
+}
+
+function Write-QueueState {
+    param([Parameter(Mandatory)]$State)
+
+    Write-JsonFileAtomic -Path $QueueStatePath -Value $State -Depth 8
+}
+
+function Publish-QueueStateSnapshot {
+    try {
+        Write-QueueState -State (New-QueueStateSnapshot)
+    }
+    catch {
+        Write-Log "Could not publish queue state snapshot: $($_.Exception.Message)" 'WARN'
+    }
 }
 
 function Get-QueueStateSnapshot {
     param([int]$TimeoutSeconds = 30)
 
-    Invoke-WithQueueStateLock -ScriptBlock { Read-QueueState } -TimeoutSeconds $TimeoutSeconds -Operation 'GetQueueStateSnapshot'
+    return New-QueueStateSnapshot
 }
 
-function Test-IsQueueStateLockTimeout {
-    param([Parameter(Mandatory)]$ErrorObject)
+function Test-QueueHasPendingWork {
+    Ensure-QueueDirectories
+    return (@(Get-QueueItemFiles -Directory $QueuePendingDir).Count -gt 0)
+}
 
-    if ($ErrorObject -is [System.Management.Automation.ErrorRecord]) {
-        $exception = $ErrorObject.Exception
+function Limit-QueueHistory {
+    foreach ($directory in @($QueueSucceededDir, $QueueFailedDir)) {
+        if (-not (Test-Path -LiteralPath $directory)) { continue }
+        $files = @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)
+        foreach ($file in @($files | Select-Object -Skip $QueueCompletedRetention)) {
+            try { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop }
+            catch { Write-Log "Could not remove old queue history file '$($file.FullName)': $($_.Exception.Message)" 'WARN' }
+        }
     }
-    elseif ($ErrorObject -is [System.Exception]) {
-        $exception = $ErrorObject
-    }
-    else {
-        return $false
-    }
+}
 
-    while ($exception) {
-        if ($exception -is [System.TimeoutException] -and $exception.Message -like "*$QueueStateMutexName*") {
-            return $true
+function Move-CorruptQueueFileToFailed {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Message = 'Queue item could not be read.'
+    )
+
+    try {
+        Ensure-QueueDirectories
+        $destination = Join-Path $QueueFailedDir ("corrupt-{0}.json" -f [Guid]::NewGuid().ToString('N'))
+        Move-Item -LiteralPath $Path -Destination $destination -Force -ErrorAction Stop
+        Set-Content -LiteralPath ($destination + '.error.txt') -Value $Message -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Could not move corrupt queue item '$Path' to failed queue: $($_.Exception.Message)" 'WARN'
+    }
+}
+
+function Migrate-LegacyQueueState {
+    if (Test-Path -LiteralPath $QueueRootDir) { return }
+    if (-not (Test-Path -LiteralPath $QueueStatePath)) { return }
+
+    $legacyPath = Join-Path $BaseDir ("Queue-State.legacy-{0}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    try {
+        $raw = Get-Content -LiteralPath $QueueStatePath -Raw -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $QueueStatePath -Destination $legacyPath -Force -ErrorAction Stop
+        Write-Log "Moved legacy queue state to '$legacyPath'."
+
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            Ensure-QueueDirectories
+            Publish-QueueStateSnapshot
+            return
         }
 
-        if ($exception.Message -like "*Timed out waiting for queue state lock '$QueueStateMutexName'*") {
-            return $true
+        $legacy = $raw | ConvertFrom-Json
+        if ($legacy -is [System.Array] -or $legacy -isnot [pscustomobject]) {
+            Write-Log "Legacy queue state '$legacyPath' was not a JSON object; starting with an empty queue." 'WARN'
+            Ensure-QueueDirectories
+            Publish-QueueStateSnapshot
+            return
         }
 
-        $exception = $exception.InnerException
-    }
+        Ensure-QueueDirectories
+        $migrated = 0
+        foreach ($item in @($legacy.Queue)) {
+            if (-not $item) { continue }
+            $state = [string](Get-QueueObjectValue -Object $item -Name 'State' -Default '')
+            if ($state -notin @('Queued','Running')) { continue }
 
-    return $false
+            $record = ConvertTo-QueueItemRecord -Item $item -DefaultState Queued
+            $record.State = 'Queued'
+            $record.Stage = 'Queued'
+            $record.StageText = 'Nach Queue-Migration erneut eingereiht'
+            $record.ProgressPercent = $null
+            $record.IsIndeterminate = $false
+            $record.StartedAt = $null
+            $record.FinishedAt = $null
+            $record.ExitCode = $null
+            $record.Message = ''
+            $result = Add-QueueItem -Item $record
+            if ($result -and $result.Added) { $migrated++ }
+        }
+
+        Write-Log "Migrated active legacy queue items count=$migrated."
+        Publish-QueueStateSnapshot
+    }
+    catch {
+        Write-Log "Could not migrate legacy queue state: $($_.Exception.Message)" 'WARN'
+        Ensure-QueueDirectories
+        Publish-QueueStateSnapshot
+    }
 }
 
 function New-QueueItem {
@@ -756,29 +965,16 @@ function Update-QueueItemProgress {
         UpdatedAt = $now
     }
 
-    $null = Update-QueueState -Operation "Progress:$Id" -ScriptBlock {
-        param($state)
-        foreach ($item in @($state.Queue)) {
-            if (-not $item) { continue }
-            if ($item.Id -eq $Id) {
-                $item.Stage = $Stage
-                $item.StageText = $StageText
-                $item.ProgressPercent = $ProgressPercent
-                $item.IsIndeterminate = $IsIndeterminate
-                $state.Current = [pscustomobject][ordered]@{
-                    Id = $item.Id
-                    Action = $item.Action
-                    Alias = $item.Alias
-                    DisplayName = $item.DisplayName
-                    Stage = $Stage
-                    StageText = $StageText
-                    ProgressPercent = $ProgressPercent
-                    IsIndeterminate = $IsIndeterminate
-                }
-                break
-            }
-        }
-    }
+    $found = Find-QueueItemFile -Id $Id -Directories @($QueueRunningDir, $QueuePendingDir)
+    if (-not $found -or -not $found.Item) { return }
+
+    $item = $found.Item
+    $item.Stage = $Stage
+    $item.StageText = $StageText
+    $item.ProgressPercent = $ProgressPercent
+    $item.IsIndeterminate = $IsIndeterminate
+    [void](Write-QueueItemFile -Item $item -Path $found.Path -DefaultState (Get-QueueDefaultStateForDirectory -Directory $found.Directory))
+    Publish-QueueStateSnapshot
 }
 
 function Get-RequiredAliasSet {
@@ -797,26 +993,37 @@ function Add-QueueItem {
         [int]$TimeoutSeconds = 30
     )
 
-    $result = $null
-    $null = Update-QueueState -ScriptBlock {
-        param($state)
-        $queue = @($state.Queue)
+    Ensure-QueueDirectories
+    $record = ConvertTo-QueueItemRecord -Item $Item -DefaultState Queued
+    $record.State = 'Queued'
+    if ([string]::IsNullOrWhiteSpace($record.Stage)) { $record.Stage = 'Queued' }
+    if ([string]::IsNullOrWhiteSpace($record.StageText)) { $record.StageText = 'In Warteschlange' }
+    $record.ProgressPercent = $null
+    $record.IsIndeterminate = $false
+    $record.StartedAt = $null
+    $record.FinishedAt = $null
+    $record.ExitCode = $null
+    $record.Message = ''
 
-        foreach ($existing in $queue) {
-            if (-not $existing) { continue }
-            if ($existing.State -in @('Queued','Running') -and $existing.Action -eq $Item.Action -and [string]::Equals([string]$existing.Alias, [string]$Item.Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
-                $script:QueueAddResult = [pscustomobject]@{ Added = $false; Item = $existing }
-                return
-            }
+    foreach ($existing in @(
+        @(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued) +
+        @(Get-QueueItemsInDirectory -Directory $QueueRunningDir -DefaultState Running)
+    )) {
+        if (-not $existing) { continue }
+        if ($existing.Action -eq $record.Action -and [string]::Equals([string]$existing.Alias, [string]$record.Alias, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ Added = $false; Item = $existing }
         }
+    }
 
-        $state.Queue = @($queue + $Item)
-        $script:QueueAddResult = [pscustomobject]@{ Added = $true; Item = $Item }
-    } -TimeoutSeconds $TimeoutSeconds -Operation "AddQueueItem:$($Item.Action):$($Item.Alias)"
+    $path = Get-QueueItemPath -Directory $QueuePendingDir -Id $record.Id
+    if (Test-Path -LiteralPath $path) {
+        $record.Id = [Guid]::NewGuid().ToString('N')
+        $path = Get-QueueItemPath -Directory $QueuePendingDir -Id $record.Id
+    }
 
-    $result = $script:QueueAddResult
-    $script:QueueAddResult = $null
-    return $result
+    $written = Write-QueueItemFile -Item $record -Path $path -DefaultState Queued
+    Publish-QueueStateSnapshot
+    return [pscustomobject]@{ Added = $true; Item = $written }
 }
 
 function Add-SoftwareRequestToQueue {
@@ -924,29 +1131,6 @@ function Test-WingetLockAvailable {
     }
 }
 
-function Test-QueueStateLockAvailable {
-    $mutex = New-Object System.Threading.Mutex($false, $QueueStateMutexName)
-    $hasLock = $false
-
-    try {
-        try {
-            $hasLock = $mutex.WaitOne(0)
-        }
-        catch [System.Threading.AbandonedMutexException] {
-            $hasLock = $true
-            Write-Log "Recovered abandoned queue state lock '$QueueStateMutexName' during availability check." 'WARN'
-        }
-
-        return $hasLock
-    }
-    finally {
-        if ($hasLock) {
-            $mutex.ReleaseMutex()
-        }
-        $mutex.Dispose()
-    }
-}
-
 function ConvertTo-ProcessArgument {
     param([Parameter(Mandatory)][string]$Value)
 
@@ -1006,6 +1190,11 @@ function Start-QueueWorker {
     try {
         $task = Get-ScheduledTask -TaskName $QueueTaskName -ErrorAction SilentlyContinue
         if ($task) {
+            if ([string]$task.State -eq 'Running') {
+                Write-Log "Scheduled queue task '$QueueTaskName' is already running."
+                return $true
+            }
+
             Start-ScheduledTask -TaskName $QueueTaskName -ErrorAction Stop
             Write-Log "Started scheduled queue task '$QueueTaskName'."
             return $true
@@ -1027,16 +1216,6 @@ function Start-QueueWorker {
 }
 
 function Start-QueueWorkerIfAvailable {
-    if (-not (Test-WingetLockAvailable)) {
-        Write-Log 'Queue worker not started because winget lock is already held.'
-        return $false
-    }
-
-    if (-not (Test-QueueStateLockAvailable)) {
-        Write-Log 'Queue worker not started because queue state lock is already held.' 'WARN'
-        return $false
-    }
-
     return (Start-QueueWorker)
 }
 
@@ -2805,10 +2984,7 @@ function Invoke-RequiredSoftwarePolicy {
         $queued = Ensure-RequiredSoftwareQueued -TimeoutSeconds 5
     }
     catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Required software queueing skipped because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-            return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0; Queued = 0 }
-        }
+        Write-Log "Required software queueing failed: $($_.Exception.Message)" 'WARN'
         throw
     }
 
@@ -2820,55 +2996,78 @@ function Invoke-RequiredSoftwarePolicy {
 }
 
 function Reset-RunningQueueItems {
-    $null = Update-QueueState -Operation 'ResetRunningQueueItems' -ScriptBlock {
-        param($state)
-        foreach ($item in @($state.Queue)) {
-            if (-not $item) { continue }
-            if ($item.State -eq 'Running') {
-                $item.State = 'Queued'
-                $item.Stage = 'Queued'
-                $item.StageText = 'Nach Neustart erneut eingereiht'
-                $item.ProgressPercent = $null
-                $item.IsIndeterminate = $false
-                $item.StartedAt = $null
-            }
+    Ensure-QueueDirectories
+    $resetCount = 0
+
+    foreach ($file in @(Get-QueueItemFiles -Directory $QueueRunningDir)) {
+        $item = Read-QueueItemFile -Path $file.FullName -DefaultState Running
+        if (-not $item) {
+            Move-CorruptQueueFileToFailed -Path $file.FullName -Message 'Running queue item could not be read during reset.'
+            continue
         }
-        $state.Current = $null
+
+        $item.State = 'Queued'
+        $item.Stage = 'Queued'
+        $item.StageText = 'Nach Neustart erneut eingereiht'
+        $item.ProgressPercent = $null
+        $item.IsIndeterminate = $false
+        $item.StartedAt = $null
+        $item.FinishedAt = $null
+        $item.ExitCode = $null
+        $item.Message = ''
+
+        $destination = Get-QueueItemPath -Directory $QueuePendingDir -Id $item.Id
+        try {
+            Move-Item -LiteralPath $file.FullName -Destination $destination -Force -ErrorAction Stop
+            [void](Write-QueueItemFile -Item $item -Path $destination -DefaultState Queued)
+            $resetCount++
+        }
+        catch {
+            Write-Log "Could not reset running queue item '$($file.FullName)': $($_.Exception.Message)" 'WARN'
+        }
     }
+
+    if ($resetCount -gt 0) {
+        Write-Log "Reset running queue items count=$resetCount."
+    }
+    Publish-QueueStateSnapshot
+    return $resetCount
 }
 
 function Get-NextQueuedItem {
-    $script:NextQueueItem = $null
-    $null = Update-QueueState -Operation 'GetNextQueuedItem' -ScriptBlock {
-        param($state)
-        foreach ($item in (@($state.Queue) | Sort-Object CreatedAt)) {
-            if (-not $item) { continue }
-            if ($item.State -eq 'Queued') {
-                $item.State = 'Running'
-                $item.Stage = 'Starting'
-                $item.StageText = 'Vorbereitung...'
-                $item.ProgressPercent = $null
-                $item.IsIndeterminate = $true
-                $item.StartedAt = (Get-Date).ToString('o')
-                $state.Current = [pscustomobject][ordered]@{
-                    Id = $item.Id
-                    Action = $item.Action
-                    Alias = $item.Alias
-                    DisplayName = $item.DisplayName
-                    Stage = $item.Stage
-                    StageText = $item.StageText
-                    ProgressPercent = $item.ProgressPercent
-                    IsIndeterminate = $item.IsIndeterminate
-                }
-                $script:NextQueueItem = $item
-                break
-            }
+    Ensure-QueueDirectories
+
+    foreach ($file in @(Get-QueueItemFiles -Directory $QueuePendingDir | Sort-Object CreationTimeUtc, Name)) {
+        $item = Read-QueueItemFile -Path $file.FullName -DefaultState Queued
+        if (-not $item) {
+            Move-CorruptQueueFileToFailed -Path $file.FullName -Message 'Pending queue item could not be read.'
+            continue
         }
+
+        $runningPath = Get-QueueItemPath -Directory $QueueRunningDir -Id $item.Id
+        try {
+            Move-Item -LiteralPath $file.FullName -Destination $runningPath -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        $item.State = 'Running'
+        $item.Stage = 'Starting'
+        $item.StageText = 'Vorbereitung...'
+        $item.ProgressPercent = $null
+        $item.IsIndeterminate = $true
+        $item.StartedAt = (Get-Date).ToString('o')
+        $item.FinishedAt = $null
+        $item.ExitCode = $null
+        $item.Message = ''
+        $item = Write-QueueItemFile -Item $item -Path $runningPath -DefaultState Running
+        Publish-QueueStateSnapshot
+        return $item
     }
 
-    $item = $script:NextQueueItem
-    $script:NextQueueItem = $null
-    return $item
+    Publish-QueueStateSnapshot
+    return $null
 }
 
 function Complete-QueueItem {
@@ -2879,24 +3078,37 @@ function Complete-QueueItem {
         [string]$Message
     )
 
-    $null = Update-QueueState -Operation "CompleteQueueItem:${Id}:${State}" -ScriptBlock {
-        param($queueState)
-        foreach ($item in @($queueState.Queue)) {
-            if (-not $item) { continue }
-            if ($item.Id -eq $Id) {
-                $item.State = $State
-                $item.Stage = $State
-                $item.StageText = $Message
-                $item.ProgressPercent = if ($State -eq 'Succeeded') { 100 } else { $null }
-                $item.IsIndeterminate = $false
-                $item.FinishedAt = (Get-Date).ToString('o')
-                $item.ExitCode = $ExitCode
-                $item.Message = $Message
-                break
-            }
-        }
-        $queueState.Current = $null
+    Ensure-QueueDirectories
+    $found = Find-QueueItemFile -Id $Id -Directories @($QueueRunningDir, $QueuePendingDir)
+    if (-not $found -or -not $found.Item) {
+        Write-Log "Could not complete queue item '$Id' because its queue file was not found." 'WARN'
+        Publish-QueueStateSnapshot
+        return
     }
+
+    $item = $found.Item
+    $item.State = $State
+    $item.Stage = $State
+    $item.StageText = $Message
+    $item.ProgressPercent = if ($State -eq 'Succeeded') { 100 } else { $null }
+    $item.IsIndeterminate = $false
+    $item.FinishedAt = (Get-Date).ToString('o')
+    $item.ExitCode = $ExitCode
+    $item.Message = $Message
+
+    if ($State -eq 'Succeeded') { $destinationDir = $QueueSucceededDir } else { $destinationDir = $QueueFailedDir }
+    $destination = Get-QueueItemPath -Directory $destinationDir -Id $item.Id
+
+    try {
+        [void](Write-QueueItemFile -Item $item -Path $destination -DefaultState $State)
+        Remove-Item -LiteralPath $found.Path -Force -ErrorAction SilentlyContinue
+        Limit-QueueHistory
+    }
+    catch {
+        Write-Log "Could not complete queue item '$Id': $($_.Exception.Message)" 'WARN'
+    }
+
+    Publish-QueueStateSnapshot
 }
 
 function Invoke-QueuedItem {
@@ -2954,6 +3166,7 @@ function Invoke-QueuedItem {
 function Invoke-ProcessQueueMode {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
+    Ensure-QueueDirectories
 
     $wingetPath = Ensure-WingetAvailable
     if (-not $wingetPath) {
@@ -2962,7 +3175,7 @@ function Invoke-ProcessQueueMode {
     }
 
     Invoke-WithWingetLock -ScriptBlock {
-        Reset-RunningQueueItems
+        [void](Reset-RunningQueueItems)
         $null = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
         $null = Ensure-RequiredSoftwareQueued
 
@@ -2980,7 +3193,7 @@ function Invoke-ProcessQueueMode {
             }
         }
 
-        $null = Update-QueueState -Operation 'ClearCurrentQueueItem' -ScriptBlock { param($state) $state.Current = $null }
+        Publish-QueueStateSnapshot
     }
 }
 
@@ -2989,16 +3202,7 @@ function Invoke-UpgradeAllMode {
     Ensure-Directory -Path $LogDir
 
     $item = New-QueueItem -Action UpgradeAll -DisplayName 'winget upgrade --all' -Source System -RequestedBy 'System' -RequestedBySid 'System'
-    try {
-        $result = Add-QueueItem -Item $item -TimeoutSeconds 5
-    }
-    catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Skipped 2-hour winget upgrade queueing because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-            return
-        }
-        throw
-    }
+    $result = Add-QueueItem -Item $item -TimeoutSeconds 5
 
     if ($result.Added) {
         Write-Log 'Queued 2-hour winget upgrade.'
@@ -3044,16 +3248,7 @@ function Invoke-ProcessRequestMode {
         return
     }
 
-    try {
-        $result = Add-SoftwareRequestToQueue -Action $RequestAction -Alias $alias -RequestedBy $RequestedBy -RequestedBySid $RequestedBySid -Source User -TimeoutSeconds 5
-    }
-    catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Worker request action=$RequestAction alias='$alias' could not be queued because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-            return
-        }
-        throw
-    }
+    $result = Add-SoftwareRequestToQueue -Action $RequestAction -Alias $alias -RequestedBy $RequestedBy -RequestedBySid $RequestedBySid -Source User -TimeoutSeconds 5
 
     Write-Log "Queued worker request action=$RequestAction alias='$alias' added=$($result.Added) RequestedBy='$RequestedBy' Sid='$RequestedBySid'"
     [void](Start-QueueWorkerIfAvailable)
@@ -3243,7 +3438,7 @@ function Restore-QueueLockFailedRequests {
 
             Move-Item -LiteralPath $requestPath -Destination $destination -Force -ErrorAction Stop
             Remove-Item -LiteralPath $errorFile.FullName -Force -ErrorAction SilentlyContinue
-            Write-Log "Restored failed request '$requestName' for retry after queue lock timeout."
+            Write-Log "Restored failed request '$requestName' for retry after transient queue failure."
         }
         catch {
             Write-Log "Could not restore failed request '$($errorFile.Name)': $($_.Exception.Message)" 'WARN'
@@ -3318,11 +3513,6 @@ function Invoke-ProcessRequestsMode {
         }
         catch {
             $message = $_.Exception.Message
-            if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-                Write-Log "Request file '$($file.Name)' will be retried because the queue state lock is busy: $message" 'WARN'
-                break
-            }
-
             Write-Log "Rejected request file '$($file.Name)': $message" 'WARN'
             try {
                 Move-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -ErrorMessage $message
@@ -3341,12 +3531,7 @@ function Invoke-ProcessRequestsMode {
         }
     }
     catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Required software queueing deferred because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-        }
-        else {
-            throw
-        }
+        Write-Log "Required software queueing deferred because of an error: $($_.Exception.Message)" 'WARN'
     }
 
     if ($shouldStartQueue) {
@@ -3367,11 +3552,20 @@ function Install-Service {
     Unregister-LegacyQueueTask
     Unregister-ObsoleteDaemonTask
     Restore-QueueLockFailedRequests
-    try { Reset-RunningQueueItems }
+    Migrate-LegacyQueueState
+    Ensure-QueueDirectories
+    Clear-QueueLockOwnerInfo
+    try { [void](Reset-RunningQueueItems) }
     catch { Write-Log "Could not reset running queue items during install/update: $($_.Exception.Message)" 'WARN' }
+    Publish-QueueStateSnapshot
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $QueueRootDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $QueuePendingDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $QueueRunningDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $QueueSucceededDir -UsersCanModify:$false
+    Set-DirectoryAcl -Path $QueueFailedDir -UsersCanModify:$false
     Set-RequestDirectoryAcl -Path $RequestsDir
     Set-DirectoryAcl -Path $ProcessedRequestsDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $FailedRequestsDir -UsersCanModify:$false
@@ -3391,21 +3585,12 @@ function Install-Service {
     Register-OrUpdateTasks
 
     try {
-        $queueState = Get-QueueStateSnapshot -TimeoutSeconds 5
-        foreach ($queuedItem in @($queueState.Queue)) {
-            if ($queuedItem -and $queuedItem.State -eq 'Queued') {
-                [void](Start-QueueWorkerIfAvailable)
-                break
-            }
+        if (Test-QueueHasPendingWork) {
+            [void](Start-QueueWorkerIfAvailable)
         }
     }
     catch {
-        if (Test-IsQueueStateLockTimeout -ErrorObject $_) {
-            Write-Log "Could not inspect queued work during install/update because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-        }
-        else {
-            Write-Log "Could not inspect queued work during install/update: $($_.Exception.Message)" 'WARN'
-        }
+        Write-Log "Could not inspect queued work during install/update: $($_.Exception.Message)" 'WARN'
     }
 
     Write-Log 'Install/update completed successfully.'
@@ -3427,11 +3612,6 @@ try {
 }
 catch {
     try {
-        if ($Mode -in @('ProcessRequests','UpgradeAll') -and (Test-IsQueueStateLockTimeout -ErrorObject $_)) {
-            Write-Log "Mode '$Mode' deferred because the queue state lock is busy: $($_.Exception.Message)" 'WARN'
-            return
-        }
-
         Write-Log "Fatal error in mode '$Mode': $($_.Exception.Message)" 'ERROR'
     }
     catch {
