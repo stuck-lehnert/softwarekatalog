@@ -67,6 +67,7 @@ $DaemonTaskName         = 'Softwarekatalog - Daemon'
 $RequestTaskName        = 'Softwarekatalog - Requests'
 $QueueTaskName          = 'Softwarekatalog - Queue'
 $UpgradeTaskName        = 'Softwarekatalog - Winget Upgrade'
+$WingetSourceName       = 'winget'
 $WingetMutexName        = 'Global\Softwarekatalog-Winget'
 $QueueStateMutexName    = 'Global\Softwarekatalog-QueueState'
 $PowerShellExe          = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -926,13 +927,82 @@ function Get-ProgressPercentFromLine {
     param([string]$Line)
 
     if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
     $match = [regex]::Match($Line, '(?<!\d)(100|[1-9]?\d)(?:[\.,]\d+)?\s*%')
-    if (-not $match.Success) { return $null }
-    $raw = $match.Groups[1].Value
-    $value = [int]$raw
-    if ($value -lt 0) { return 0 }
-    if ($value -gt 100) { return 100 }
-    return $value
+    if ($match.Success) {
+        $value = [int]$match.Groups[1].Value
+        if ($value -lt 0) { return 0 }
+        if ($value -gt 100) { return 100 }
+        return $value
+    }
+
+    $transferMatch = [regex]::Match(
+        $Line,
+        '(?<current>\d+(?:[\.,]\d+)?)\s*(?<currentUnit>TB|GB|MB|KB|B)\s*/\s*(?<total>\d+(?:[\.,]\d+)?)\s*(?<totalUnit>TB|GB|MB|KB|B)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if (-not $transferMatch.Success) { return $null }
+
+    try {
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $current = [double]::Parse($transferMatch.Groups['current'].Value.Replace(',', '.'), $culture)
+        $total = [double]::Parse($transferMatch.Groups['total'].Value.Replace(',', '.'), $culture)
+
+        switch ($transferMatch.Groups['currentUnit'].Value.ToUpperInvariant()) {
+            'TB' { $current *= 1099511627776 }
+            'GB' { $current *= 1073741824 }
+            'MB' { $current *= 1048576 }
+            'KB' { $current *= 1024 }
+        }
+        switch ($transferMatch.Groups['totalUnit'].Value.ToUpperInvariant()) {
+            'TB' { $total *= 1099511627776 }
+            'GB' { $total *= 1073741824 }
+            'MB' { $total *= 1048576 }
+            'KB' { $total *= 1024 }
+        }
+
+        if ($total -le 0) { return $null }
+        $value = [int][Math]::Round(($current / $total) * 100)
+        if ($value -lt 0) { return 0 }
+        if ($value -gt 100) { return 100 }
+        return $value
+    }
+    catch {
+        return $null
+    }
+}
+
+function ConvertTo-WingetOutputLine {
+    param([string]$Line)
+
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+
+    $text = [regex]::Replace($Line, '\x1B\[[0-?]*[ -/]*[@-~]', '').Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+
+    $transferMatch = [regex]::Match(
+        $text,
+        '\d+(?:[\.,]\d+)?\s*(?:TB|GB|MB|KB|B)\s*/\s*\d+(?:[\.,]\d+)?\s*(?:TB|GB|MB|KB|B)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+    )
+    if ($transferMatch.Success) {
+        return $transferMatch.Value
+    }
+
+    # Older winget versions emit spinner and block-bar frames even when stdout is
+    # redirected. Ignore lines that contain no useful ASCII text; this also drops
+    # progress glyphs decoded through an OEM code page (for example, "Ôûê").
+    if ($text -notmatch '[A-Za-z0-9]') { return $null }
+    return $text
+}
+
+function Set-WingetOutputEncoding {
+    try {
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
+    catch {
+        # Some non-interactive hosts do not expose a mutable console encoding.
+    }
 }
 
 function Update-QueueItemProgress {
@@ -2731,6 +2801,7 @@ function Invoke-WingetInstall {
     $arguments = @(
         'install'
         '--id', $PackageId
+        '--source', $WingetSourceName
         '--exact'
         '--scope', 'machine'
         '--silent'
@@ -2744,17 +2815,16 @@ function Invoke-WingetInstall {
         Update-QueueItemProgress -Id $QueueItemId -Stage 'Install' -StageText 'Installation läuft...' -IsIndeterminate:$true
     }
 
-    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    Set-WingetOutputEncoding
     & $WingetPath @arguments 2>&1 | ForEach-Object {
         $line = [string]$_
-        [void]$outputLines.Add($line)
-        if ($line.Trim()) {
-            Write-Log "winget: $line"
-            if ($QueueItemId) {
-                $percent = Get-ProgressPercentFromLine -Line $line
-                if ($null -ne $percent) {
-                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Download' -StageText ("Download läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
-                }
+        $displayLine = ConvertTo-WingetOutputLine -Line $line
+        if ($displayLine) { Write-Log "winget: $displayLine" }
+
+        if ($QueueItemId) {
+            $percent = Get-ProgressPercentFromLine -Line $line
+            if ($null -ne $percent) {
+                Update-QueueItemProgress -Id $QueueItemId -Stage 'Download' -StageText ("Download läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
             }
         }
     }
@@ -2773,6 +2843,7 @@ function Invoke-WingetUninstall {
     $arguments = @(
         'uninstall'
         '--id', $PackageId
+        '--source', $WingetSourceName
         '--exact'
         '--scope', 'machine'
         '--silent'
@@ -2785,17 +2856,16 @@ function Invoke-WingetUninstall {
         Update-QueueItemProgress -Id $QueueItemId -Stage 'Uninstall' -StageText 'Deinstallation läuft...' -IsIndeterminate:$true
     }
 
-    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    Set-WingetOutputEncoding
     & $WingetPath @arguments 2>&1 | ForEach-Object {
         $line = [string]$_
-        [void]$outputLines.Add($line)
-        if ($line.Trim()) {
-            Write-Log "winget: $line"
-            if ($QueueItemId) {
-                $percent = Get-ProgressPercentFromLine -Line $line
-                if ($null -ne $percent) {
-                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Uninstall' -StageText ("Deinstallation läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
-                }
+        $displayLine = ConvertTo-WingetOutputLine -Line $line
+        if ($displayLine) { Write-Log "winget: $displayLine" }
+
+        if ($QueueItemId) {
+            $percent = Get-ProgressPercentFromLine -Line $line
+            if ($null -ne $percent) {
+                Update-QueueItemProgress -Id $QueueItemId -Stage 'Uninstall' -StageText ("Deinstallation läuft... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
             }
         }
     }
@@ -2813,6 +2883,7 @@ function Invoke-WingetUpgradeAll {
     $arguments = @(
         'upgrade'
         '--all'
+        '--source', $WingetSourceName
         '--scope', 'machine'
         '--silent'
         '--accept-package-agreements'
@@ -2825,17 +2896,16 @@ function Invoke-WingetUpgradeAll {
         Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText 'Updates laufen...' -IsIndeterminate:$true
     }
 
-    $outputLines = New-Object 'System.Collections.Generic.List[string]'
+    Set-WingetOutputEncoding
     & $WingetPath @arguments 2>&1 | ForEach-Object {
         $line = [string]$_
-        [void]$outputLines.Add($line)
-        if ($line.Trim()) {
-            Write-Log "winget upgrade: $line"
-            if ($QueueItemId) {
-                $percent = Get-ProgressPercentFromLine -Line $line
-                if ($null -ne $percent) {
-                    Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText ("Updates laufen... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
-                }
+        $displayLine = ConvertTo-WingetOutputLine -Line $line
+        if ($displayLine) { Write-Log "winget upgrade: $displayLine" }
+
+        if ($QueueItemId) {
+            $percent = Get-ProgressPercentFromLine -Line $line
+            if ($null -ne $percent) {
+                Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText ("Updates laufen... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
             }
         }
     }
@@ -2859,6 +2929,7 @@ function Update-InstalledPackagesSnapshot {
     $arguments = @(
         'export'
         '--output', $tempFile
+        '--source', $WingetSourceName
         '--accept-source-agreements'
         '--disable-interactivity'
     )
@@ -2867,15 +2938,26 @@ function Update-InstalledPackagesSnapshot {
     if ($QueueItemId) {
         Update-QueueItemProgress -Id $QueueItemId -Stage 'Snapshot' -StageText 'Installationsdaten werden aktualisiert...' -IsIndeterminate:$true
     }
+    Set-WingetOutputEncoding
     $output = & $WingetPath @arguments 2>&1 | Out-String
     $exitCode = $LASTEXITCODE
 
+    $unmatchedPackageCount = 0
     if ($output) {
         foreach ($line in ($output -split "`r?`n")) {
-            if ($line.Trim()) {
-                Write-Log "winget export: $line"
+            $displayLine = ConvertTo-WingetOutputLine -Line $line
+            if (-not $displayLine) { continue }
+
+            if ($displayLine -match '^Installed package is not available from (?:any )?source:') {
+                $unmatchedPackageCount++
+                continue
             }
+
+            Write-Log "winget export: $displayLine"
         }
+    }
+    if ($unmatchedPackageCount -gt 0) {
+        Write-Log "winget export ignored $unmatchedPackageCount installed packages that are not represented in source '$WingetSourceName'."
     }
 
     if ($exitCode -ne 0) {

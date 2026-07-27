@@ -83,5 +83,7 @@ C:\ProgramData\__Softwarekatalog\Failed\
 ## Notes
 
 - Requires Windows, Desktop App Installer, and `winget`.
+- Catalog installs, uninstalls, exports, and automatic upgrades explicitly target
+  the `winget` community source, so an unavailable Microsoft Store source does not block them.
 - SYSTEM scheduled tasks validate and execute requests; keep catalog policy restricted to trusted admins.
 - Package IDs and silent machine-scope support depend on upstream `winget` packages.
