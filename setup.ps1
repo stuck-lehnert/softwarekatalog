@@ -1100,7 +1100,14 @@ function Invoke-WithWingetLock {
     $hasLock = $false
 
     try {
-        $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        try {
+            $hasLock = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+            Write-Log "Recovered abandoned winget lock '$WingetMutexName'." 'WARN'
+        }
+
         if (-not $hasLock) {
             throw "Timed out waiting for winget lock '$WingetMutexName'."
         }
@@ -1120,7 +1127,14 @@ function Test-WingetLockAvailable {
     $hasLock = $false
 
     try {
-        $hasLock = $mutex.WaitOne(0)
+        try {
+            $hasLock = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $hasLock = $true
+            Write-Log "Recovered abandoned winget lock '$WingetMutexName' while checking availability." 'WARN'
+        }
+
         return $hasLock
     }
     finally {
@@ -2216,12 +2230,31 @@ function Load-AppList {
 `$btnClose.Anchor = 'Right, Bottom'
 `$btnClose.Text = 'Schließen'
 
-`$script:StateWatcher = `$null
-`$script:SnapshotWatcher = `$null
+function Get-CatalogFileStamp {
+    param([Parameter(Mandatory=`$true)][string]`$Path)
+
+    try {
+        if (-not (Test-Path -LiteralPath `$Path -PathType Leaf)) {
+            return 'missing'
+        }
+
+        `$file = Get-Item -LiteralPath `$Path -Force -ErrorAction Stop
+        return '{0}:{1}:{2}' -f `$file.CreationTimeUtc.Ticks, `$file.LastWriteTimeUtc.Ticks, `$file.Length
+    }
+    catch {
+        return 'unavailable'
+    }
+}
+
+# Keep change detection on the WinForms UI thread. Direct PowerShell handlers on
+# FileSystemWatcher events run on worker threads and can terminate the host when
+# no PowerShell runspace is available on the callback thread.
 `$stateRefreshTimer = New-Object System.Windows.Forms.Timer
 `$stateRefreshTimer.Interval = 500
 `$script:StateRefreshPending = `$false
 `$script:RequestWorkerBusy = `$false
+`$script:LastQueueStateStamp = Get-CatalogFileStamp -Path `$QueueStatePath
+`$script:LastSnapshotStamp = Get-CatalogFileStamp -Path `$InstalledPackagesPath
 
 function Start-AppRequestAsync {
     param(
@@ -2391,11 +2424,22 @@ function Start-RefreshStatusAsync {
 })
 
 `$stateRefreshTimer.Add_Tick({
+    `$queueStateStamp = Get-CatalogFileStamp -Path `$QueueStatePath
+    `$snapshotStamp = Get-CatalogFileStamp -Path `$InstalledPackagesPath
+    if (`$queueStateStamp -ne `$script:LastQueueStateStamp -or `$snapshotStamp -ne `$script:LastSnapshotStamp) {
+        `$script:LastQueueStateStamp = `$queueStateStamp
+        `$script:LastSnapshotStamp = `$snapshotStamp
+        `$script:StateRefreshPending = `$true
+    }
+
     if (-not `$script:StateRefreshPending) { return }
     if (`$script:RequestWorkerBusy) { return }
     `$script:StateRefreshPending = `$false
     try { Load-AppList }
-    catch { `$status.Text = "Fehler bei automatischer Aktualisierung: " + `$_.Exception.Message }
+    catch {
+        `$script:StateRefreshPending = `$true
+        `$status.Text = "Fehler bei automatischer Aktualisierung: " + `$_.Exception.Message
+    }
 })
 
 `$btnOpenLog.Add_Click({
@@ -2429,44 +2473,13 @@ function Start-RefreshStatusAsync {
 `$btnClose.Add_Click({ `$form.Close() })
 
 `$form.Add_Shown({
-    try {
-        `$stateDir = Split-Path -Path `$QueueStatePath -Parent
-        `$stateFile = Split-Path -Path `$QueueStatePath -Leaf
-        if (Test-Path -LiteralPath `$stateDir) {
-            `$script:StateWatcher = New-Object System.IO.FileSystemWatcher(`$stateDir, `$stateFile)
-            `$script:StateWatcher.NotifyFilter = [System.IO.NotifyFilters]'LastWrite, FileName, Size'
-            `$script:StateWatcher.Add_Changed({ `$script:StateRefreshPending = `$true })
-            `$script:StateWatcher.Add_Created({ `$script:StateRefreshPending = `$true })
-            `$script:StateWatcher.Add_Renamed({ `$script:StateRefreshPending = `$true })
-            `$script:StateWatcher.EnableRaisingEvents = `$true
-        }
-    }
-    catch {
-        `$status.Text = "Statusueberwachung konnte nicht gestartet werden: " + `$_.Exception.Message
-    }
-
-    try {
-        `$snapshotDir = Split-Path -Path `$InstalledPackagesPath -Parent
-        `$snapshotFile = Split-Path -Path `$InstalledPackagesPath -Leaf
-        if (Test-Path -LiteralPath `$snapshotDir) {
-            `$script:SnapshotWatcher = New-Object System.IO.FileSystemWatcher(`$snapshotDir, `$snapshotFile)
-            `$script:SnapshotWatcher.NotifyFilter = [System.IO.NotifyFilters]'LastWrite, FileName, Size'
-            `$script:SnapshotWatcher.Add_Changed({ `$script:StateRefreshPending = `$true })
-            `$script:SnapshotWatcher.Add_Created({ `$script:StateRefreshPending = `$true })
-            `$script:SnapshotWatcher.Add_Renamed({ `$script:StateRefreshPending = `$true })
-            `$script:SnapshotWatcher.EnableRaisingEvents = `$true
-        }
-    }
-    catch {
-        `$status.Text = "Snapshotueberwachung konnte nicht gestartet werden: " + `$_.Exception.Message
-    }
+    `$script:LastQueueStateStamp = Get-CatalogFileStamp -Path `$QueueStatePath
+    `$script:LastSnapshotStamp = Get-CatalogFileStamp -Path `$InstalledPackagesPath
     `$stateRefreshTimer.Start()
 })
 `$form.Add_FormClosing({
     `$stateRefreshTimer.Stop()
     `$stateRefreshTimer.Dispose()
-    if (`$null -ne `$script:StateWatcher) { `$script:StateWatcher.Dispose() }
-    if (`$null -ne `$script:SnapshotWatcher) { `$script:SnapshotWatcher.Dispose() }
 })
 
 `$list.Add_SelectedIndexChanged({ Update-InstallButtonState })
