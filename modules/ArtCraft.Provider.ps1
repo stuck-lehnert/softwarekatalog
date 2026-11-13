@@ -687,7 +687,13 @@ function Invoke-ArtCraftUpdates {
         foreach ($id in @(Get-ArtCraftInventory | Select-Object -ExpandProperty PackageId -Unique)) {
             $record = @(Get-ArtCraftOwnership | Where-Object { $_.PackageId -ceq $id })
             if ($record.Count -eq 1 -and $record[0].Stage -eq 'Owned' -and $record[0].LastCheckedUtc) {
-                $checked = [datetime]::Parse($record[0].LastCheckedUtc).ToUniversalTime()
+                $lastChecked = $record[0].LastCheckedUtc
+                # PS7 JSON may already contain a UTC DateTime. Parse(DateTime)
+                # first stringifies it without its Kind/offset, shifting the
+                # instant by the machine's timezone and delaying update checks.
+                $checked = if ($lastChecked -is [datetime]) { $lastChecked.ToUniversalTime() }
+                elseif ($lastChecked -is [datetimeoffset]) { $lastChecked.UtcDateTime }
+                else { [datetime]::Parse([string]$lastChecked,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
                 # Persisted success timestamp plus stable per-client jitter avoids
                 # fourteen REST requests and synchronized fleet polling.
                 $jitter = 0

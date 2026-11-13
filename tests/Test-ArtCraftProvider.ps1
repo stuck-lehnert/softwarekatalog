@@ -176,7 +176,7 @@ try {
         Assert ($script:logLevels -contains 'WARN')
         Assert (($script:logs -join '|') -match 'metadata unavailable/offline; last successful check retained')
         Assert (($script:logs -join '|') -notmatch 'https?://')
-        Equal ([datetime]'2020-01-01T00:00:00Z').Ticks ([datetime]$r.LastCheckedUtc).ToUniversalTime().Ticks; Equal '2.0.0' $r.Version
+        Equal ([datetime]'2020-01-01T00:00:00Z').ToUniversalTime().Ticks ([datetime]$r.LastCheckedUtc).ToUniversalTime().Ticks; Equal '2.0.0' $r.Version
         $script:inventory=@(New-Installed '3.0.0')
         Equal 0 (Invoke-ArtCraftInstall $definition.PackageId); Equal 1 $script:msiCalls.Count
     }
@@ -280,6 +280,13 @@ try {
         Equal 0 (Invoke-ArtCraftUpdates); Equal 1 $script:releaseCalls; Equal 1 $script:msiCalls.Count
         Equal 0 (Invoke-ArtCraftUpdates); Equal 1 $script:releaseCalls
         $script:inventory=@(); Equal 0 (Invoke-ArtCraftUpdates); Equal 1 $script:releaseCalls
+    }
+    Test 'Expired UTC JSON freshness is not shifted into the future by a non-UTC local timezone' {
+        Initialize-ArtCraftStorage
+        $r=New-ArtCraftRecord $definition; $r.LastCheckedUtc=[datetime]::UtcNow.AddHours(-3).ToString('o'); Set-ArtCraftRecord $r
+        $script:inventory=@(New-Installed)
+        Equal 0 (Invoke-ArtCraftUpdates)
+        Equal 1 $script:releaseCalls; Equal 1 $script:msiCalls.Count
     }
     Test 'Stable version parser rejects prerelease, injection, x86 and MSI overflow' {
         foreach ($version in @('v1.0.0','1.0','01.2.3','1.2.3-beta','1.2.3/evil','256.1.1','1.256.1','1.1.65536')) {

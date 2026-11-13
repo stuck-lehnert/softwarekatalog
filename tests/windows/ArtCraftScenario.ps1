@@ -5,7 +5,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem -or
     -not (Test-Path -LiteralPath (Join-Path $Root '.disposable-ci-fixture'))) { throw 'Disposable real SYSTEM fixture required.' }
+$script:artCraftFixtureRoot = [IO.Path]::GetFullPath($Root)
 $config = Get-Content -LiteralPath (Join-Path $Root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json
+$script:artCraftFixtureConfig = $config
 $wingetConfig = Get-Content -LiteralPath (Join-Path $Root 'fixture-config.json') -Raw | ConvertFrom-Json
 $source = [IO.File]::ReadAllText((Join-Path $env:ProgramData '__Softwarekatalog\SelfServiceWinget.ps1'))
 $entry = $source.IndexOf('# Entry point')
@@ -32,12 +34,12 @@ function Ensure-WingetAvailable { $script:fixtureWinget }
 function Start-QueueWorkerIfAvailable { $true }
 # This is a test-local publisher allowlist, NOT a trust bypass. The actual MSI
 # is signed, Windows must return Valid, and hash/family/architecture are checked.
-function Get-ArtCraftAllowedSignerSubjects { $config.CertificateSubject }
+function Get-ArtCraftAllowedSignerSubjects { $script:artCraftFixtureConfig.CertificateSubject }
 function Invoke-ArtCraftHttp {
     param([uri]$Uri, $Definition, [string]$Tag, [string]$AssetName, [switch]$Latest,
         [string]$Destination, [long]$MaxBytes = 1048576)
     $script:httpCalls++
-    $packages = @($config.Packages | Where-Object { $_.PackageId -ceq $Definition.PackageId })
+    $packages = @($script:artCraftFixtureConfig.Packages | Where-Object { $_.PackageId -ceq $Definition.PackageId })
     if ($packages.Count -ne 1 -or $Uri.Scheme -cne 'https' -or $Uri.Host -cne 'github.com' -or
         -not $Uri.AbsolutePath.StartsWith(('/' + $Definition.Repository + '/releases/'), [StringComparison]::Ordinal)) {
         throw 'Fixture transport refuses unrelated repository/URI.'
@@ -59,7 +61,10 @@ function Invoke-ArtCraftHttp {
 function Invoke-ArtCraftMsi {
     param([Parameter(Mandatory)][string]$Arguments)
     $script:msiCalls.Add($Arguments)
-    Add-Content -LiteralPath (Join-Path $Root 'artcraft-msi-invocations.jsonl') -Value ($Arguments | ConvertTo-Json -Compress)
+    # Production Invoke-ArtCraftInstall has a local $root=ProgramFiles. Use an
+    # explicit script-scoped fixture path: PowerShell's dynamic scope would
+    # otherwise put this log AND the kill marker in that caller's ProgramFiles.
+    Add-Content -LiteralPath (Join-Path $script:artCraftFixtureRoot 'artcraft-msi-invocations.jsonl') -Value ($Arguments | ConvertTo-Json -Compress)
     $code = & $script:originalArtCraftMsi -Arguments $Arguments
     # The only fault injection is AFTER a real, successful native MSI removal.
     # Kill the worker process, not merely a helper or catchable scriptblock.
@@ -68,7 +73,7 @@ function Invoke-ArtCraftMsi {
         $script:faultInjected = $true
         New-ItemProperty -Path $PolicyRoot -Name EnableArtCraft -PropertyType DWord -Value 0 -Force | Out-Null
         [pscustomobject]@{ ProcessId = $PID; ProductCode = $script:faultProductCode; ExitCode = $code; TimeUtc = [datetime]::UtcNow.ToString('o') } |
-            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'artcraft-interruption.json') -Encoding UTF8
+            ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:artCraftFixtureRoot 'artcraft-interruption.json') -Encoding UTF8
         [Diagnostics.Process]::GetCurrentProcess().Kill()
         throw 'The bounded real-process termination injector did not terminate the worker.'
     }

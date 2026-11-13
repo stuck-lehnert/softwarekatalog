@@ -148,9 +148,100 @@ $artConfig.CertificateSubject = $certificate.Subject
 $artConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $artConfigPath -Encoding UTF8
 $publicCertificate = Join-Path $Root 'artcraft-ci.cer'
 Export-Certificate -Cert $certificate -FilePath $publicCertificate | Out-Null
-foreach ($store in @('Cert:\LocalMachine\Root', 'Cert:\LocalMachine\TrustedPublisher')) {
-    Import-Certificate -FilePath $publicCertificate -CertStoreLocation $store | Out-Null
+# The ARM64 hosted runner's administrator cannot import into these machine
+# stores (E_ACCESSDENIED). Use a real native SYSTEM token for both trust setup
+# and revocation, without changing store ACLs/policy or weakening signature trust.
+$certificateHelper = Join-Path $Root 'Manage-ArtCraftCertificate.ps1'
+$certificateHelperSource = @'
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$Root,
+    [Parameter(Mandatory)][ValidateSet('x64','arm64')][string]$ExpectedArchitecture,
+    [Parameter(Mandatory)][ValidateSet('Trust','Remove')][string]$Operation,
+    [switch]$SystemWorker)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+if (-not (Test-Path -LiteralPath (Join-Path $Root '.disposable-ci-fixture'))) { throw 'Disposable fixture marker required.' }
+. (Join-Path $Root 'WindowsArchitecture.ps1')
+$resultPath = Join-Path $Root ("certificate-$Operation.result.json")
+$architecturePath = Join-Path $Root ("certificate-$Operation.architecture.json")
+if ($SystemWorker) {
+    if (-not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) { throw 'Certificate store operation requires real SYSTEM.' }
+    $success = $false; $detail = ''; $evidence = $null
+    try {
+        $evidence = Assert-CiWindowsArchitecture -ExpectedArchitecture $ExpectedArchitecture -ExpectedOSArchitecture $ExpectedArchitecture -RequireNative -OutputPath $architecturePath
+        $config = Get-Content -LiteralPath (Join-Path $Root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json
+        $thumbprint = [string]$config.CertificateThumbprint
+        if ($thumbprint -notmatch '^[A-Fa-f0-9]{40}$') { throw 'Invalid owned certificate thumbprint.' }
+        $publicPath = Join-Path $Root 'artcraft-ci.cer'
+        $publicCert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($publicPath)
+        if ($publicCert.Thumbprint -cne $thumbprint -or $publicCert.Subject -cne $config.CertificateSubject) { throw 'Public certificate does not match exact fixture ownership.' }
+        $errors = @()
+        $stores = if ($Operation -eq 'Trust') { @('Root','TrustedPublisher') } else { @('Root','TrustedPublisher','My') }
+        foreach ($store in $stores) {
+            try {
+                $storePath = "Cert:\LocalMachine\$store"
+                $certificatePath = "$storePath\$thumbprint"
+                if ($Operation -eq 'Trust') {
+                    Import-Certificate -FilePath $publicPath -CertStoreLocation $storePath | Out-Null
+                    if (-not (Test-Path -LiteralPath $certificatePath)) { throw 'Certificate absent after real machine-store import.' }
+                }
+                else {
+                    if (Test-Path -LiteralPath $certificatePath) {
+                        if ($store -eq 'My') { Remove-Item -LiteralPath $certificatePath -DeleteKey -Force }
+                        else { Remove-Item -LiteralPath $certificatePath -Force }
+                    }
+                    if (Test-Path -LiteralPath $certificatePath) { throw 'Certificate remains after removal.' }
+                }
+            }
+            catch { $errors += "${store}: $($_ | Out-String)" }
+        }
+        if ($errors.Count) { throw ($errors -join "`n") }
+        $success = $true
+    }
+    catch { $detail = $_ | Out-String }
+    finally {
+        [pscustomobject]@{ Success = $success; Operation = $Operation; Architecture = $evidence; Error = $detail } |
+            ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $resultPath -Encoding UTF8
+    }
+    if (-not $success) { exit 1 }; exit 0
 }
+$taskName = 'Softwarekatalog certificate CI ' + [guid]::NewGuid().ToString('N')
+try {
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Root "' + $Root + '" -ExpectedArchitecture ' + $ExpectedArchitecture + ' -Operation ' + $Operation + ' -SystemWorker'
+    $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument $arguments
+    $principal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 3) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings | Out-Null
+    $lastRun = (Get-ScheduledTaskInfo -TaskName $taskName).LastRunTime
+    Start-ScheduledTask -TaskName $taskName
+    $deadline = (Get-Date).AddMinutes(3)
+    while (-not (Test-Path -LiteralPath $resultPath)) {
+        if ((Get-Date) -gt $deadline) { throw "SYSTEM certificate $Operation timed out." }
+        $info = Get-ScheduledTaskInfo -TaskName $taskName
+        if ($info.LastRunTime -gt $lastRun -and (Get-ScheduledTask -TaskName $taskName).State -notin @('Running','Queued')) {
+            throw "SYSTEM certificate $Operation exited without evidence (task code $($info.LastTaskResult))."
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
+        if ((Get-Date) -gt $deadline) { throw "SYSTEM certificate $Operation did not exit." }
+        Start-Sleep -Milliseconds 200
+    }
+    $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+    if (-not $result.Success) { throw "SYSTEM certificate ${Operation}: $($result.Error)" }
+    Assert-CiArchitectureRecord $result.Architecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
+    if ($result.Architecture.Sid -ne 'S-1-5-18' -or (Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult -ne 0) { throw 'Certificate operation lacked a successful native SYSTEM token.' }
+    Write-Output "PASS native $ExpectedArchitecture SYSTEM certificate $Operation (real LocalMachine stores)"
+}
+finally {
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    }
+}
+'@
+[IO.File]::WriteAllText($certificateHelper, $certificateHelperSource, (New-Object Text.UTF8Encoding($true)))
+& $certificateHelper -Root $Root -ExpectedArchitecture $Architecture -Operation Trust
 
 function Build-ArtCraftFixtureMsi($Definition, [string]$Version, [string]$ProductCode, [string]$OutputPath) {
     $exe = Join-Path $Root ($Definition.Alias + '.exe')

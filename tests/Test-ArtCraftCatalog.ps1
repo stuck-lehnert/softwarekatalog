@@ -38,7 +38,7 @@ function Test([string]$Name,[scriptblock]$Body) {
     $script:policy=@{Enabled=1;EnableArtCraft=1}; $script:rows=@(); $script:required=@()
     $script:owners=@(); $script:inventory=@(); $script:log=@(); $script:customCalls=@(); $script:wingetCalls=@(); $script:completion=$null; $script:customCode=0
     try { & $Body; $script:passed++; Write-Output "PASS $Name" }
-    catch { throw "FAIL ${Name}: $_" }
+    catch { throw "FAIL ${Name}: $_ at $($_.ScriptStackTrace)" }
 }
 try {
     Test 'All 14 exact user catalog rows match the accepted source descriptions and MSI profiles' {
@@ -98,7 +98,10 @@ try {
         Assert ($s.InstalledPackageIds -notcontains 'ArtCraft.PdfCraft' -and -not $s.WingetRefreshed)
         Assert (@($s.Packages).Count -eq 2)
         $grid=@($s.Packages | Where-Object PackageId -eq 'ArtCraft.GridCraft')[0]
-        Assert ($grid.MetadataStale -and $grid.LastError -eq 'Offline' -and $grid.LastCheckedUtc -eq '2026-11-12T00:00:00Z')
+        Assert ($grid.MetadataStale -and $grid.LastError -eq 'Offline') 'Snapshot lost stale-metadata diagnostics'
+        # PS7 deserializes ISO dates as DateTime; the ARM runner is non-UTC.
+        # Compare the actual instant, not its local wall-clock representation.
+        Assert (([datetime]$grid.LastCheckedUtc).ToUniversalTime().Ticks -eq ([datetime]'2026-11-12T00:00:00Z').ToUniversalTime().Ticks) 'Snapshot changed the last successful check instant'
     }
     Test 'Malformed previous inventory is preserved in quarantine and rebuilt' {
         Set-Content $script:InstalledPackagesPath '[broken'

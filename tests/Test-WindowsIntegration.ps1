@@ -68,6 +68,18 @@ function Stop-ProductTasks {
     } while ((Get-Date) -lt $deadline)
     throw 'Production tasks did not stop in time.'
 }
+function Get-SystemPhaseFailureDetails([string]$Phase, [bool]$ExpectedInterruption) {
+    $markerPath = Join-Path $root 'artcraft-interruption.json'
+    $detail = "ExpectedInterruption=$ExpectedInterruption; marker='$markerPath'; markerExists=$(Test-Path -LiteralPath $markerPath)"
+    foreach ($path in @($markerPath, (Join-Path $root "$Phase.transcript.txt"),
+        (Join-Path $root 'artcraft-msi-invocations.jsonl'), (Join-Path $base 'ArtCraft\State.json'))) {
+        if (Test-Path -LiteralPath $path) {
+            try { $detail += "`n--- $path ---`n" + ((Get-Content -LiteralPath $path -Tail 24) -join "`n") }
+            catch { $detail += "`nCould not read diagnostic '$path': $_" }
+        }
+    }
+    $detail
+}
 function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInterrupted) {
     $scriptPath = Join-Path $PSScriptRoot 'windows\SystemScenario.ps1'
     $architecturePath = Join-Path $root "$Phase.architecture.json"
@@ -92,7 +104,8 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInter
                 $wasInterrupted = $true
                 break
             }
-            throw "SYSTEM phase '$Phase' exited without a result (task code $($info.LastTaskResult))."
+            $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
+            throw "SYSTEM phase '$Phase' exited without a result (task code $($info.LastTaskResult)).`n$diagnostic"
         }
         Start-Sleep -Milliseconds 250
     }
@@ -259,7 +272,17 @@ finally {
     }
     # Revoke the fixture trust before any artifact/user/task operation that
     # might itself throw. Native fixture removals above are individually caught.
+    $certificateHelper = Join-Path $root 'Manage-ArtCraftCertificate.ps1'
     if (Test-Path -LiteralPath (Join-Path $root 'artcraft-fixture-config.json')) {
+        if (Test-Path -LiteralPath $certificateHelper) {
+            try {
+                & $certificateHelper -Root $root -ExpectedArchitecture $ExpectedArchitecture -Operation Remove
+                Record "Native $ExpectedArchitecture SYSTEM revokes exact disposable certificate and private key"
+            }
+            catch { $failed = $true; Write-Warning "SYSTEM fixture certificate cleanup failed: $_"; Write-CiError ($_ | Out-String) }
+        }
+        # Also verify all stores from this token, and try each store even if a
+        # failed build never reached the SYSTEM helper/bootstrap creation.
         $ownedCertificate = (Get-Content -LiteralPath (Join-Path $root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json).CertificateThumbprint
         if ($ownedCertificate -match '^[A-Fa-f0-9]{40}$') {
             foreach ($store in @('Root','TrustedPublisher','My')) {
@@ -274,6 +297,10 @@ finally {
                 catch { $failed = $true; Write-Warning "Could not remove disposable fixture certificate/key from ${store}: $_" }
             }
         }
+    }
+    if (Test-Path -LiteralPath $certificateHelper) {
+        try { Remove-Item -LiteralPath $certificateHelper -Force -ErrorAction Stop }
+        catch { $failed = $true; Write-Warning "Could not remove fixture certificate helper: $_" }
     }
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask $taskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask $taskName -Confirm:$false }
     if ($createdDeployment) {
