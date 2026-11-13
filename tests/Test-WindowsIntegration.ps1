@@ -139,6 +139,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows\StandardUserScenario.ps1') -Destination $userScript
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $userScript, $userResult
     $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $userOutput -PassThru -RedirectStandardOutput (Join-Path $userOutput 'stdout.log') -RedirectStandardError (Join-Path $userOutput 'stderr.log')
+    $handle = $process.Handle
     if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Standard-user scenario timed out.' }
     Check ($process.ExitCode -eq 0 -and (Test-Path $userResult)) 'Standard-user scenario failed (see stdout/stderr artifacts).'
     $result = Get-Content $userResult -Raw | ConvertFrom-Json

@@ -41,8 +41,11 @@ $stdout = Join-Path $Root 'wix.stdout.log'
 $stderr = Join-Path $Root 'wix.stderr.log'
 $arguments = 'build -arch x64 -o "{0}" "{1}"' -f $config.Msi, $source
 $process = Start-Process -FilePath $WixPath -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+# Retain the process handle: Windows PowerShell 5.1 otherwise loses ExitCode
+# when Start-Process returns before a later WaitForExit call.
+$handle = $process.Handle
 if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Fixture MSI build timed out.' }
 $output = [IO.File]::ReadAllText($stdout) + [IO.File]::ReadAllText($stderr)
 Write-Output $output
-if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $config.Msi)) { throw "Fixture MSI build failed: $output" }
+if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $config.Msi)) { throw "Fixture MSI build failed (exit=$($process.ExitCode), exists=$(Test-Path -LiteralPath $config.Msi)): $output" }
 Write-Output "Built disposable MSI fixture $productCode"

@@ -14,6 +14,7 @@ foreach ($suite in @('Test-GeneratedScripts.ps1', 'Test-Core.ps1', 'Test-ScopeRe
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $suitePath
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $process = Start-Process -FilePath $engine -ArgumentList $arguments -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    $handle = $process.Handle
     $timedOut = -not $process.WaitForExit(180000)
     if ($timedOut) { $process.Kill(); $process.WaitForExit() }
     $watch.Stop()

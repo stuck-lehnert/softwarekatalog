@@ -33,6 +33,7 @@ function Case([string]$Name, [scriptblock]$Body) {
 }
 function Run-Msi([string]$Arguments) {
     $p = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\msiexec.exe') -ArgumentList $Arguments -PassThru
+    $handle = $p.Handle
     if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'MSI fixture operation timed out.' }
     return $p.ExitCode
 }

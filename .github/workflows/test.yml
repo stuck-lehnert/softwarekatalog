@@ -60,8 +60,19 @@ jobs:
         run: |
           $engine = $env:TEST_ENGINE
           if ($engine -eq 'powershell-x86') { $engine = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" }
-          & $engine -NoProfile -ExecutionPolicy Bypass -File tests/Invoke-Tests.ps1
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path test-results -Force | Out-Null
+          $exitCode = 1
+          try {
+            $output = & $engine -NoProfile -ExecutionPolicy Bypass -File tests/Invoke-Tests.ps1 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+          } catch { $output = $_ | Out-String }
+          $output | Set-Content test-results/engine-launch.log -Encoding UTF8
+          Write-Output $output
+          if ($exitCode -ne 0) {
+            $detail = $output.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Test engine startup::$detail"
+            exit $exitCode
+          }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
