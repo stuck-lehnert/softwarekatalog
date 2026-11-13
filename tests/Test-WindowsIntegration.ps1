@@ -97,7 +97,10 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInter
     $deadline = (Get-Date).AddMinutes(8)
     $wasInterrupted = $false
     while (-not (Test-Path -LiteralPath $resultPath)) {
-        if ((Get-Date) -gt $deadline) { throw "SYSTEM phase timed out: $Phase" }
+        if ((Get-Date) -gt $deadline) {
+            $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
+            throw "SYSTEM phase timed out: $Phase`n$diagnostic"
+        }
         $info = Get-ScheduledTaskInfo -TaskName $taskName
         if ($info.LastRunTime -gt $lastRun -and (Get-ScheduledTask -TaskName $taskName).State -notin @('Running', 'Queued')) {
             if ($ExpectInterrupted -and $Phase -eq 'ArtCraftInterrupt' -and (Test-Path -LiteralPath (Join-Path $root 'artcraft-interruption.json'))) {
@@ -110,7 +113,10 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInter
         Start-Sleep -Milliseconds 250
     }
     while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
-        if ((Get-Date) -gt $deadline) { throw "SYSTEM phase did not exit: $Phase" }
+        if ((Get-Date) -gt $deadline) {
+            $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
+            throw "SYSTEM phase did not exit: $Phase`n$diagnostic"
+        }
         Start-Sleep -Milliseconds 200
     }
     $systemArchitecture = Get-Content -LiteralPath $architecturePath -Raw | ConvertFrom-Json
@@ -163,9 +169,26 @@ try {
     foreach ($path in $shortcuts) { Check (Test-Path $path) "All-users catalog shortcut missing: $path" }
     Record 'Actual distribution deployment, task principals/settings, generated runtime and shortcuts'
     Run-SystemPhase Lifecycle
-    Run-SystemPhase ArtCraft
-    Run-SystemPhase ArtCraftInterrupt -ExpectInterrupted
-    Run-SystemPhase ArtCraftResume
+    # Isolate ArtCraft's Required=gridcraft test from the original ci request
+    # security lane. Restore actual registry values/types even when a phase fails.
+    $requiredPath = "$policy\Required"
+    $requiredKey = Get-Item -LiteralPath $requiredPath
+    $requiredBeforeArtCraft = @(foreach ($name in $requiredKey.GetValueNames()) {
+        [pscustomobject]@{ Name = $name; Kind = $requiredKey.GetValueKind($name); Value = $requiredKey.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+    })
+    $enforceBeforeArtCraft = (Get-ItemProperty -LiteralPath $policy -Name EnforceRequired).EnforceRequired
+    try {
+        Run-SystemPhase ArtCraft
+        Run-SystemPhase ArtCraftInterrupt -ExpectInterrupted
+        Run-SystemPhase ArtCraftResume
+    }
+    finally {
+        foreach ($name in (Get-Item -LiteralPath $requiredPath).GetValueNames()) { Remove-ItemProperty -LiteralPath $requiredPath -Name $name }
+        foreach ($value in $requiredBeforeArtCraft) { New-ItemProperty -LiteralPath $requiredPath -Name $value.Name -PropertyType $value.Kind -Value $value.Value -Force | Out-Null }
+        New-ItemProperty -LiteralPath $policy -Name EnforceRequired -PropertyType DWord -Value $enforceBeforeArtCraft -Force | Out-Null
+    }
+    Check ((Get-ItemProperty -LiteralPath $requiredPath -Name ci).ci -eq 1) 'Original Required=ci policy was not restored before the unchanged request-security scenario.'
+    Record 'ArtCraft Required-policy changes are isolated from original standard-user/Requests security lane'
 
     # Create a real non-admin account; never use the runner's elevated token
     # as a substitute for testing NTFS/registry enforcement.

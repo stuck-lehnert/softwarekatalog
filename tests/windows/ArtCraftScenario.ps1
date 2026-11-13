@@ -147,7 +147,9 @@ try {
             Remove-ItemProperty -Path $PolicyCatalogRoot -Name oldgrid
             Check ((Invoke-WithWingetLock { Invoke-ArtCraftUninstall -PackageId $grid.PackageId }) -in @(0,3010)) 'Could not remove fixture for Required test.'
             $null = Update-InstalledPackagesSnapshot -WingetPath ''
-            New-Item -Path $PolicyRequiredRoot -Force | Out-Null
+            # Registry New-Item -Force replaces an existing key and erases its
+            # values, including the original lifecycle fixture's Required=ci.
+            if (-not (Test-Path -LiteralPath $PolicyRequiredRoot)) { New-Item -Path $PolicyRequiredRoot | Out-Null }
             New-ItemProperty -Path $PolicyRequiredRoot -Name gridcraft -PropertyType String -Value 1 -Force | Out-Null
             New-ItemProperty -Path $PolicyRoot -Name EnforceRequired -PropertyType DWord -Value 1 -Force | Out-Null
             Check (@((Get-ItemProperty -Path $PolicyCatalogRoot).PSObject.Properties | Where-Object { [string]$_.Value -like '*ArtCraft.GridCraft*' }).Count -eq 0) 'Required test unexpectedly has a per-app ArtCraft Catalog value.'

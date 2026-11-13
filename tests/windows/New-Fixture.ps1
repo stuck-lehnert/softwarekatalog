@@ -176,7 +176,10 @@ if ($SystemWorker) {
         $publicCert = New-Object Security.Cryptography.X509Certificates.X509Certificate2($publicPath)
         if ($publicCert.Thumbprint -cne $thumbprint -or $publicCert.Subject -cne $config.CertificateSubject) { throw 'Public certificate does not match exact fixture ownership.' }
         $errors = @()
-        $stores = if ($Operation -eq 'Trust') { @('Root','TrustedPublisher') } else { @('Root','TrustedPublisher','My') }
+        # Authenticode needs the trusted Root chain, not TrustedPublisher.
+        # ARM64 hosted images deny TrustedPublisher writes even to SYSTEM;
+        # leave that store untouched during setup, with no ACL/policy changes.
+        $stores = if ($Operation -eq 'Trust') { @('Root') } else { @('Root','TrustedPublisher','My') }
         foreach ($store in $stores) {
             try {
                 $storePath = "Cert:\LocalMachine\$store"
