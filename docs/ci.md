@@ -181,8 +181,10 @@ a reviewed dependency change.
   expected CLI arguments; the deterministic adapter is not live WinGet.
 - Interactive GUI clicking/rendering, shell sessions, reboot/power-loss rollback,
   and OS upgrades. GUI syntax/helper/control tests are not desktop UI automation.
-- Windows 10/11 client-specific behavior, ARM64, domain GPO delivery/refresh,
-  endpoint security products, redirected profiles and organizational policies.
+- Windows releases/images beyond the tested Server 2022/2025 x64 and Windows
+  11 ARM64 runners, domain GPO delivery/refresh, endpoint security products,
+  redirected profiles and organizational policies. The native ARM64 fixtures
+  do not certify third-party ARM64 installers or emulated vendor applications.
 - Transactional rollback across two different installers; durable repair intent
   improves recovery but cannot make uninstall+install atomic.
 
