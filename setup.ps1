@@ -1675,6 +1675,7 @@ if (-not ('ListViewColumnSorter' -as [type])) {
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 public class ListViewColumnSorter : IComparer {
@@ -1696,6 +1697,61 @@ public class ListViewColumnSorter : IComparer {
 
         int result = StringComparer.CurrentCultureIgnoreCase.Compare(a, b);
         return Order == SortOrder.Descending ? -result : result;
+    }
+}
+
+// Items.Clear() resets both scroll bars. Anchor the viewport to the visible
+// application's alias, independently of a selection that may be off screen.
+public sealed class ListViewViewport {
+    private string topAlias, selectedAlias, focusedAlias;
+    private int topIndex = -1, horizontalOffset;
+
+    [DllImport("user32.dll")]
+    private static extern int GetScrollPos(IntPtr window, int bar);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
+
+    private static string Alias(ListViewItem item) {
+        return item != null && item.SubItems.Count > 3 ? item.SubItems[3].Text : null;
+    }
+
+    public static int GetHorizontalOffset(ListView list) {
+        return list.IsHandleCreated ? GetScrollPos(list.Handle, 0) : 0; // SB_HORZ
+    }
+
+    public static void SetHorizontalOffset(ListView list, int offset) {
+        if (!list.IsHandleCreated) return;
+        int delta = Math.Max(0, offset) - GetHorizontalOffset(list);
+        if (delta != 0) SendMessage(list.Handle, 0x1014, new IntPtr(delta), IntPtr.Zero); // LVM_SCROLL
+    }
+
+    public static ListViewViewport Capture(ListView list) {
+        var state = new ListViewViewport();
+        state.selectedAlias = list.SelectedItems.Count > 0 ? Alias(list.SelectedItems[0]) : null;
+        state.focusedAlias = Alias(list.FocusedItem);
+        if (list.IsHandleCreated && list.TopItem != null) {
+            state.topAlias = Alias(list.TopItem);
+            state.topIndex = list.TopItem.Index;
+        }
+        state.horizontalOffset = GetHorizontalOffset(list);
+        return state;
+    }
+
+    public void Restore(ListView list) {
+        ListViewItem top = null;
+        foreach (ListViewItem item in list.Items) {
+            string alias = Alias(item);
+            if (alias == null) continue;
+            if (selectedAlias != null && StringComparer.OrdinalIgnoreCase.Equals(alias, selectedAlias)) item.Selected = true;
+            if (focusedAlias != null && StringComparer.OrdinalIgnoreCase.Equals(alias, focusedAlias)) item.Focused = true;
+            if (topAlias != null && StringComparer.OrdinalIgnoreCase.Equals(alias, topAlias)) top = item;
+        }
+        // If the anchor was removed, keep the nearest remaining row, not row 0.
+        if (top == null && topIndex >= 0 && list.Items.Count > 0) top = list.Items[Math.Min(topIndex, list.Items.Count - 1)];
+        if (top != null) list.TopItem = top;
+        // Restore last: selecting/focusing an item or setting TopItem must not
+        // pull the view to the selection or reset its horizontal position.
+        SetHorizontalOffset(list, horizontalOffset);
     }
 }
 '@ -ReferencedAssemblies @('System.dll','System.Windows.Forms.dll')
@@ -2279,13 +2335,9 @@ function Update-ProgressArea {
 }
 
 function Load-AppList {
-    `$selectedAlias = `$null
+    `$viewState = [ListViewViewport]::Capture(`$list)
     `$list.BeginUpdate()
     try {
-        if (`$list.SelectedItems.Count -gt 0) {
-            `$selectedAlias = [string]`$list.SelectedItems[0].SubItems[3].Text
-        }
-
         `$list.Items.Clear()
 
         `$apps = Get-CatalogApps
@@ -2371,17 +2423,7 @@ function Load-AppList {
     }
     finally {
         `$list.EndUpdate()
-
-        if (-not [string]::IsNullOrWhiteSpace(`$selectedAlias)) {
-            foreach (`$item in `$list.Items) {
-                if (`$item.SubItems.Count -gt 3 -and [string]::Equals(`$item.SubItems[3].Text, `$selectedAlias, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    `$item.Selected = `$true
-                    `$item.EnsureVisible()
-                    break
-                }
-            }
-        }
-
+        `$viewState.Restore(`$list)
         Update-InstallButtonState
     }
 }

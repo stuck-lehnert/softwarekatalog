@@ -82,6 +82,9 @@ try {
         } finally { $form.Dispose() }
         Write-Output 'PASS generated GUI C# helpers compile, sort and create Windows Forms controls (no interactive dialog)'
         $count++
+        $viewportOutput = @(& (Join-Path $PSScriptRoot 'windows/Test-CatalogViewport.ps1') -GuiPath $CatalogGuiPath)
+        $viewportOutput | Write-Output
+        $count += @($viewportOutput | Where-Object { $_ -like 'PASS *' }).Count
     }
     # Check every checked-in PS file, including Windows-only harnesses, with
     # Windows PowerShell 5.1 as well as PS7 in CI. Parsing does not execute them.
