@@ -157,7 +157,7 @@ try {
     $userArchitecturePath = Join-Path $userOutput 'architecture.json'
     # PS5.1 Add-Type uses CodeDOM temporary files. Do not rely on an inherited
     # runner-admin TEMP directory being writable by this real standard user.
-    $command = "`$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
+    $command = "Write-Output 'Standard-user process started'; `$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; Write-Output 'Native architecture verified'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
     $userLog = Join-Path $userOutput 'console.log'
     $command = "& { `$ErrorActionPreference = 'Stop'; $command } *> '$($userLog.Replace("'", "''"))'"
     $arguments = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
@@ -168,6 +168,7 @@ try {
     $userSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
     Register-ScheduledTask -TaskName $userTaskName -Action $userAction -Settings $userSettings -User $credential.UserName `
         -Password ($credential.GetNetworkCredential().Password) -RunLevel Limited -Force | Out-Null
+    Export-ScheduledTask -TaskName $userTaskName | Set-Content -LiteralPath (Join-Path $ResultsDirectory 'standard-user-task.xml')
     $lastRun = (Get-ScheduledTaskInfo -TaskName $userTaskName).LastRunTime
     Start-ScheduledTask -TaskName $userTaskName
     $deadline = (Get-Date).AddMinutes(2)
@@ -175,7 +176,11 @@ try {
         $info = Get-ScheduledTaskInfo -TaskName $userTaskName
         $state = (Get-ScheduledTask -TaskName $userTaskName).State
         if ($info.LastRunTime -gt $lastRun -and $state -notin @('Running', 'Queued')) { break }
-        if ((Get-Date) -gt $deadline) { throw 'Standard-user scheduled scenario timed out.' }
+        if ((Get-Date) -gt $deadline) {
+            $userDetail = if (Test-Path $userLog) { (Get-Content $userLog -Tail 40) -join "`n" } else { 'No console log.' }
+            $taskXml = Export-ScheduledTask -TaskName $userTaskName
+            throw "Standard-user scenario timed out: state=$state code=$($info.LastTaskResult) previous=$lastRun last=$($info.LastRunTime) result=$(Test-Path $userResult) architecture=$(Test-Path $userArchitecturePath). $userDetail`n$taskXml"
+        }
         Start-Sleep -Milliseconds 200
     }
     $userDetail = if (Test-Path $userLog) { (Get-Content $userLog -Tail 40) -join "`n" } else { 'No standard-user console log was written.' }
