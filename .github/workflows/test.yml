@@ -63,12 +63,16 @@ jobs:
           New-Item -ItemType Directory -Path test-results -Force | Out-Null
           $exitCode = 1
           try {
+            # PS5 otherwise throws on native stderr and discards earlier stdout,
+            # including the suite's actionable GitHub error annotations.
+            $ErrorActionPreference = 'Continue'
             $output = & $engine -NoProfile -ExecutionPolicy Bypass -File tests/Invoke-Tests.ps1 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
-          } catch { $output = $_ | Out-String }
+          } catch { $output = $_ | Out-String } finally { $ErrorActionPreference = 'Stop' }
           $output | Set-Content test-results/engine-launch.log -Encoding UTF8
           Write-Output $output
           if ($exitCode -ne 0) {
+            if ($output.Length -gt 12000) { $output = $output.Substring($output.Length - 12000) }
             $detail = $output.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Output "::error title=Test engine startup::$detail"
             exit $exitCode

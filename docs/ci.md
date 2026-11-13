@@ -16,7 +16,7 @@ does not request larger or paid custom runner sizes.
 | Core regression | PS5.1 and PS7 on Server 2022/2025; additional PS5.1 x86 | Actual temporary-file queue/snapshot transitions, deduplication, recovery, corrupt-file quarantine, catalog/required policy and request validation, size/depth/root limits and privilege/allowlist boundaries |
 | Generated clients | Same engine matrix | Generate and parse the request helper and GUI, including apostrophes in paths; correct BOMs; VBS invocation; PS5.1 compiles GUI C# helpers and constructs Windows Forms controls without opening a modal dialog |
 | Scope regression | Same engine matrix | Detection, identity correlation, MSI switch profiles, guarded uninstall/reinstall, recovery journal, PS5.1 JSON behavior, false-success rejection, snapshot filtering, upgrade ordering, the native NULL-SID bridge contract and a real read-only MSI lookup of a random unknown product (must return UNKNOWN_PRODUCT, not INVALID_PARAMETER) |
-| SYSTEM integration | Server 2022/2025, actual SYSTEM scheduled tasks | Deploy the real built bootstrap, compare the installed payload byte-for-byte, inspect task principals/settings and generated files/shortcuts; real per-user MSI in SYSTEM AppData; native cache/component lookups; migrate to Program Files; second-pass idempotence; actual queued uninstall/reinstall; required-software restoration |
+| SYSTEM integration | Server 2022/2025, actual SYSTEM scheduled tasks | Deploy the real built bootstrap, compare the installed payload byte-for-byte, inspect task principals/settings and generated files/shortcuts; real MSI with per-user defaults in SYSTEM AppData, inspecting its actual ARP scope; native cache/component lookups; migrate to Program Files and remove the old executable; second-pass idempotence; actual queued uninstall/reinstall; required-software restoration |
 | Standard-user integration | New local non-admin token on the same disposable VM | Create requests using the generated helper; spoofed requester metadata cannot replace the real NTFS owner; tampering with privileged script/queue/journal/another owner's request and HKLM policy is denied; unapproved/oversized/array-root/required-uninstall requests are quarantined; the machine MSI executable and shared shortcut are accessible |
 
 `fail-fast: false` keeps other matrix jobs running after a failure so their
@@ -32,6 +32,10 @@ cannot enforce repository merge rules without that administrator setting.
 dual-context MSI using pinned WiX 5.0.2. Its product/upgrade GUIDs and install
 directories are unique for each run. The executable only prints a test marker.
 No ArtCraft application, vendor account or paid installer is downloaded.
+Under SYSTEM, Windows Installer can register this per-user-default installation
+in machine ARP despite its SYSTEM AppData payload. The test deliberately follows
+the observed registration scope; install path alone is not a scope assertion.
+Both registry scopes remain covered by the deterministic scope regressions.
 
 `FixtureWinget.cs` is a deliberately restricted **CLI boundary adapter**, not a
 claim that Microsoft's WinGet has been tested. It discovers real MSI

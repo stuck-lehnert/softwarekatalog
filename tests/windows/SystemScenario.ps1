@@ -40,13 +40,16 @@ function Run-Msi([string]$Arguments) {
 Start-Transcript -Path (Join-Path $Root "$Phase.transcript.txt") | Out-Null
 try {
     if ($Phase -eq 'Lifecycle') {
-        Case 'Actual SYSTEM identity and real per-user MSI installation' {
+        Case 'Actual SYSTEM identity and real MSI installation with per-user defaults into SYSTEM AppData' {
             $arguments = '/i "{0}" ALLUSERS=2 MSIINSTALLPERUSER=1 INSTALLFOLDER="{1}" /qn /norestart /l*v "{2}"' -f $config.Msi, $config.LegacyDir, (Join-Path $Root 'legacy-install.log')
-            Check ((Run-Msi $arguments) -eq 0) 'Could not seed the legacy per-user MSI.'
+            Check ((Run-Msi $arguments) -eq 0) 'Could not seed the legacy SYSTEM-profile MSI.'
             Check (Test-Path -LiteralPath (Join-Path $config.LegacyDir 'fixture.exe')) 'Legacy executable is missing.'
         }
         Case 'Native context-specific MSI cache and component APIs under SYSTEM' {
-            $registration = @(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'user' })
+            # SYSTEM's per-user MSI defaults can register in machine ARP even
+            # though the payload is in SYSTEM AppData. Inspect the actual scope
+            # rather than assuming that install path and registration coincide.
+            $registration = @(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode })
             if ($registration.Count -eq 0) {
                 $contexts = @()
                 foreach ($scope in @('user', 'machine')) {
@@ -55,7 +58,7 @@ try {
                     $contexts += "$scope native=$($null -ne $native)"
                 }
                 $arp = @(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode } | ForEach-Object { "$($_.Scope):$($_.InstallLocation)" }) -join '; '
-                throw "No SYSTEM-user MSI registration. $($contexts -join '; '); ARP=$arp"
+                throw "No SYSTEM MSI registration. $($contexts -join '; '); ARP=$arp"
             }
             $evidence = Get-MsiRegistrationEvidence -Registration $registration[0]
             Check ($null -ne $evidence) 'Native MSI lookup failed (NULL SID regression).'
@@ -65,6 +68,7 @@ try {
         Case 'Production repair loop migrates real MSI to Program Files' {
             Invoke-ProcessQueueMode
             Check (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe')) 'Machine executable is missing.'
+            Check (-not (Test-Path -LiteralPath (Join-Path $config.LegacyDir 'fixture.exe'))) 'Old SYSTEM-profile executable remains after MSI migration.'
             Check (@(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'user' }).Count -eq 0) 'Old user registration remains.'
             Check (@(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'machine' }).Count -gt 0) 'Machine MSI registration is missing.'
             Check ((Get-InstalledPackageIdSet).Contains($config.PackageId)) 'Installed snapshot not updated.'
