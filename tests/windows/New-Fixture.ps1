@@ -79,19 +79,37 @@ if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Fixture MSI bui
 $output = [IO.File]::ReadAllText($stdout) + [IO.File]::ReadAllText($stderr)
 Write-Output $output
 if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $config.Msi)) { throw "Fixture MSI build failed (exit=$($process.ExitCode), exists=$(Test-Path -LiteralPath $config.Msi)): $output" }
-$installer = $null
-$summary = $null
-try {
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $summary = $installer.GetType().InvokeMember('SummaryInformation', 'GetProperty', $null, $installer, @($config.Msi, [int]0))
-    $template = [string]$summary.GetType().InvokeMember('Property', 'GetProperty', $null, $summary, @([int]7))
-    $expectedTemplate = if ($Architecture -eq 'arm64') { 'Arm64' } else { 'x64' }
-    if (($template -split ';')[0] -ine $expectedTemplate) { throw "MSI template '$template' does not target $expectedTemplate." }
-    $config['MsiTemplate'] = $template
-    $config | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'fixture-config.json') -Encoding UTF8
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+namespace Softwarekatalog {
+    public static class CiMsiSummary {
+        [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+        static extern uint MsiGetSummaryInformation(uint database, string path, uint updates, out uint summary);
+        [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+        static extern uint MsiSummaryInfoGetProperty(uint summary, uint property, out uint type,
+            out int integer, out long fileTime, StringBuilder value, ref uint length);
+        [DllImport("msi.dll")]
+        static extern uint MsiCloseHandle(uint handle);
+        public static string ReadTemplate(string path) {
+            uint summary;
+            uint code = MsiGetSummaryInformation(0, path, 0, out summary);
+            if (code != 0) throw new InvalidOperationException("Cannot open MSI summary: " + code);
+            try {
+                var value = new StringBuilder(32768); uint length = 32768, type;
+                int integer; long fileTime;
+                code = MsiSummaryInfoGetProperty(summary, 7, out type, out integer, out fileTime, value, ref length);
+                if (code != 0 || type != 30) throw new InvalidOperationException("Cannot read MSI Template: " + code + "; type=" + type);
+                return value.ToString();
+            } finally { MsiCloseHandle(summary); }
+        }
+    }
 }
-finally {
-    if ($summary) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($summary) }
-    if ($installer) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) }
-}
+'@
+$template = [Softwarekatalog.CiMsiSummary]::ReadTemplate([string]$config.Msi)
+$expectedTemplate = if ($Architecture -eq 'arm64') { 'Arm64' } else { 'x64' }
+if (($template -split ';')[0] -ine $expectedTemplate) { throw "MSI template '$template' does not target $expectedTemplate." }
+$config['MsiTemplate'] = $template
+$config | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'fixture-config.json') -Encoding UTF8
 Write-Output "Built disposable $Architecture MSI fixture $productCode (template=$template)"
