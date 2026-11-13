@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scope-repairs:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 regression tests
+        shell: powershell
+        run: ./tests/Test-ScopeRepairs.ps1
+      - name: PowerShell 7 regression tests
+        shell: pwsh
+        run: ./tests/Test-ScopeRepairs.ps1

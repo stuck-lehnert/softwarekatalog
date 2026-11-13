@@ -1,0 +1,364 @@
+# No Pester dependency. Runs with Windows PowerShell 5.1 and PowerShell 7.
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'setup.ps1'
+$tokens = $null
+$parseErrors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+# Load only function definitions, never setup configuration or its entry point.
+foreach ($statement in $ast.EndBlock.Statements) {
+    if ($statement -is [Management.Automation.Language.FunctionDefinitionAst]) {
+        . ([scriptblock]::Create($statement.Extent.Text))
+    }
+}
+
+$script:passed = 0
+$script:tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('scope-tests-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $script:tempRoot | Out-Null
+$originalSystemRoot = $env:SystemRoot
+$env:SystemRoot = 'C:\Windows'
+
+function Assert($Condition, [string]$Message = 'Assertion failed') {
+    if (-not $Condition) { throw $Message }
+}
+function Assert-Throws([scriptblock]$Body, [string]$Pattern) {
+    try { & $Body } catch {
+        if ($_.Exception.Message -notmatch $Pattern) { throw }
+        return
+    }
+    throw "Expected exception matching '$Pattern'."
+}
+function Test([string]$Name, [scriptblock]$Body) {
+    $script:events = @()
+    $script:registrations = @()
+    $script:machineInstalled = $false
+    $script:installCode = 0
+    $script:ScopeRepairFailures = @()
+    $script:BaseDir = Join-Path $script:tempRoot ([Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $script:BaseDir | Out-Null
+    $script:ScopeRepairPath = Join-Path $script:BaseDir 'Scope-Repairs.json'
+    $script:InstalledPackagesPath = Join-Path $script:BaseDir 'Installed-Packages.json'
+    $script:WingetSourceName = 'winget'
+    $script:catalog = @([pscustomobject]@{ PackageId = 'ArtCraft.GridCraft'; Alias = 'grid'; DisplayName = 'Custom catalog label' })
+    & $Body
+    $script:passed++
+    Write-Output "PASS $Name"
+}
+function New-Registration([string]$Location = 'C:\Windows\System32\config\systemprofile\AppData\Local\Programs\ArtCraft\GridCraft', [string]$Name = 'GridCraft') {
+    [pscustomobject]@{
+        ProductCode = '{EA4ACB4A-7AB6-43B8-9F85-944EBBFBE7A1}'
+        DisplayName = $Name; InstallLocation = $Location; DisplayIcon = ''
+        WindowsInstaller = $true; Scope = 'user'; RegistryView = 'Registry64'
+    }
+}
+function Write-Log { param($Message, $Level) }
+function Test-SoftwareCatalogPolicyEnabled { return $true }
+function Test-RunningAsLocalSystem { return $true }
+function Get-AppCatalogObjects { $script:catalog }
+function Get-RegisteredApplications { $script:registrations }
+function Get-MsiRegistrationEvidence {
+    param($Registration)
+    [pscustomobject]@{
+        UpgradeCode = '{5511327B-F305-41BE-92D0-EB84944E7C4D}'
+        ExecutablePaths = @('C:\Windows\System32\config\systemprofile\AppData\Local\Programs\ArtCraft\GridCraft\gridcraft.exe')
+    }
+}
+function Test-WingetMachineInstallation { param($WingetPath, $PackageId) return $script:machineInstalled }
+function Invoke-WingetQuery {
+    param($WingetPath, $Arguments)
+    $script:events += ($Arguments -join ' ')
+    if ($Arguments[0] -eq 'uninstall') {
+        Assert (Test-Path -LiteralPath $script:ScopeRepairPath) 'Journal must precede uninstall'
+        $script:registrations = @()
+    }
+    [pscustomobject]@{ ExitCode = 0; Output = 'GridCraft ArtCraft.GridCraft 0.16.0 winget' }
+}
+# Keep the real install/upgrade implementations available for argument tests.
+$realInstall = ${function:Invoke-WingetInstall}
+$realMachineTest = [scriptblock]::Create(($ast.EndBlock.Statements | Where-Object {
+    $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Test-WingetMachineInstallation'
+}).Body.Extent.Text.TrimStart('{').TrimEnd('}'))
+function Invoke-WingetInstall {
+    param($WingetPath, $PackageId)
+    $script:events += 'machine-install'
+    $script:machineInstalled = ($script:installCode -eq 0)
+    return $script:installCode
+}
+
+try {
+    Test 'Native MSI declarations compile and use context-aware APIs' {
+        $nativeSource = @($ast.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Value -match 'public static class NativeMsi'
+        }, $true))[0].Value
+        if (-not ('Softwarekatalog.NativeMsi' -as [type])) { Add-Type -TypeDefinition $nativeSource }
+        Assert ([Softwarekatalog.NativeMsi].GetMethod('MsiGetProductInfoEx').GetParameters().Count -eq 6)
+        Assert ([Softwarekatalog.NativeMsi].GetMethod('MsiGetComponentPathEx').GetParameters().Count -eq 6)
+        $inventory = ($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Get-RegisteredApplications' }).Extent.Text
+        Assert ($inventory.Contains('Registry64') -and $inventory.Contains('Registry32'))
+        Assert ($inventory.Contains('S-1-5-18\'))
+    }
+    Test 'AppData detection is case-insensitive, boundary-safe and includes WOW64' {
+        foreach ($path in @(
+            'C:\Windows\System32\config\systemprofile\AppData\Local\Programs\app',
+            'c:\WINDOWS\syswow64\CONFIG\systemprofile\APPDATA\Roaming\app',
+            '"C:\Windows\System32\config\systemprofile\AppData\Local\app.exe",0'
+        )) { Assert (Test-SystemProfileAppDataPath $path) $path }
+        foreach ($path in @('', 'C:\Users\Alice\AppData\Local\app', 'C:\Program Files\app',
+            'C:\Windows\System32\config\systemprofile\AppDataOther\app',
+            'C:\Windows\System32\config\systemprofile\AppData\..\other')) {
+            Assert (-not (Test-SystemProfileAppDataPath $path)) $path
+        }
+    }
+    Test 'MSI executable evidence detects WiX packages without ARP InstallLocation' {
+        $reg = New-Registration -Location ''
+        Assert (@(Get-SystemProfileApplications -Registrations @($reg)).Count -eq 1)
+        function Get-MsiRegistrationEvidence { [pscustomobject]@{ UpgradeCode = ''; ExecutablePaths = @() } }
+        Assert (@(Get-SystemProfileApplications -Registrations @($reg)).Count -eq 0)
+    }
+    Test 'Cached icons and ordinary user data are not mistaken for program payloads' {
+        $reg = New-Registration -Location 'C:\Program Files\ArtCraft\GridCraft'
+        $reg.DisplayIcon = 'C:\Windows\System32\config\systemprofile\AppData\Local\icons\app.ico'
+        Assert (@(Get-SystemProfileApplications -Registrations @($reg)).Count -eq 0)
+        $reg.InstallLocation = ''
+        $reg.WindowsInstaller = $false
+        Assert (@(Get-SystemProfileApplications -Registrations @($reg)).Count -eq 0)
+        $reg.DisplayIcon = '"C:\Windows\System32\config\systemprofile\AppData\Local\app\app.exe",0'
+        Assert (@(Get-SystemProfileApplications -Registrations @($reg)).Count -eq 1)
+    }
+    Test 'GridCraft MSI identity maps even without winget correlation or matching catalog display name' {
+        $reg = New-Registration
+        $candidate = @(Get-SystemProfileApplications -Registrations @($reg))[0]
+        $app = Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg)
+        Assert ($app.PackageId -eq 'ArtCraft.GridCraft')
+        Assert (@(Find-SystemProfileCatalogApp fake $candidate @() @($reg)).Count -eq 0) 'Policy required'
+    }
+    Test 'Generic package uses exact winget correlation, not catalog display name' {
+        function Get-MsiRegistrationEvidence { return $null }
+        $reg = New-Registration -Name 'Some app'
+        $reg.WindowsInstaller = $false
+        $script:catalog = @([pscustomobject]@{ PackageId = 'Vendor.App'; Alias = 'a'; DisplayName = 'Different' })
+        function Invoke-WingetQuery {
+            param($WingetPath, $Arguments)
+            Assert ($Arguments -contains '--exact')
+            Assert ($Arguments -contains '--scope')
+            [pscustomobject]@{ ExitCode = 0; Output = "Name Id Version`nSome app Vendor.App 1.0" }
+        }
+        $candidate = [pscustomobject]@{ Registration = $reg; MsiEvidence = $null }
+        Assert ((Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg)).PackageId -eq 'Vendor.App')
+        $duplicate = New-Registration -Name 'Some app'
+        $duplicate.ProductCode = 'other-registration'
+        Assert (@(Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg, $duplicate)).Count -eq 0)
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = 0; Output = 'Some app Vendor.App.Other 1.0' } }
+        Assert (@(Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg)).Count -eq 0) 'Reject ID prefixes'
+    }
+    Test 'Migration downloads, journals, uninstalls exact user product, installs and verifies' {
+        $script:registrations = @(New-Registration)
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events[0] -match '^download .*--scope machine')
+        Assert ($script:events[1] -match '^uninstall .*--product-code .*--scope user')
+        Assert ($script:events[2] -eq 'machine-install')
+        Assert ((Get-Content $script:ScopeRepairPath -Raw).Trim() -eq '[]')
+        Assert ($script:ScopeRepairFailures.Count -eq 0)
+        $script:events = @()
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 0) 'Second pass must be idempotent'
+    }
+    Test 'Mislocated machine registration is repaired too, not only per-user registrations' {
+        $reg = New-Registration
+        $reg.Scope = 'machine'
+        $script:registrations = @($reg)
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events[1] -match '^uninstall .*--scope machine')
+        Assert ($script:events[2] -eq 'machine-install')
+        Assert ($script:ScopeRepairFailures.Count -eq 0)
+    }
+    Test 'No machine installer/network failure retains original installation' {
+        $script:registrations = @(New-Registration)
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = 1; Output = '' } }
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:registrations.Count -eq 1)
+        Assert (-not (Test-Path $script:ScopeRepairPath))
+        Assert ($script:ScopeRepairFailures -contains 'ArtCraft.GridCraft')
+    }
+    Test 'Failed reinstall persists intent and resumes even with old registration gone' {
+        $script:registrations = @(New-Registration)
+        $script:installCode = 42
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:registrations.Count -eq 0)
+        Assert (@(Get-Content $script:ScopeRepairPath -Raw | ConvertFrom-Json).Count -eq 1)
+        Assert ($script:ScopeRepairFailures -contains 'ArtCraft.GridCraft')
+        $script:installCode = 0
+        $script:events = @()
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 2) 'Resume: download and install, no second uninstall'
+        Assert ((Get-Content $script:ScopeRepairPath -Raw).Trim() -eq '[]')
+    }
+    Test 'Retained uninstall registration blocks reinstall and leaves repair intent' {
+        $script:registrations = @(New-Registration)
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = 0; Output = '' } }
+        Invoke-SystemProfileRepairs fake
+        Assert (-not $script:machineInstalled)
+        Assert ($script:ScopeRepairFailures.Count -eq 1)
+        Assert (Test-Path $script:ScopeRepairPath)
+    }
+    Test 'Existing valid machine copy is kept when removing a stray SYSTEM-user copy' {
+        $script:registrations = @(New-Registration)
+        $script:machineInstalled = $true
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 2) 'Only preflight and old-user uninstall, no machine reinstall'
+        Assert ($script:machineInstalled)
+        Assert ($script:ScopeRepairFailures.Count -eq 0)
+    }
+    Test 'Pending intent cannot reinstall packages removed from policy' {
+        Write-ScopeRepairJournal @([pscustomobject]@{ PackageId = 'Removed.App' })
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 0)
+        Assert ((Get-Content $script:ScopeRepairPath -Raw) -match 'Removed.App')
+    }
+    Test 'Unknown SYSTEM-profile programs are reported but never removed' {
+        $script:registrations = @(New-Registration)
+        function Get-MsiRegistrationEvidence { return $null }
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = 0; Output = 'Unlisted.App' } }
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:registrations.Count -eq 1)
+        Assert (-not (Test-Path $script:ScopeRepairPath))
+    }
+    Test 'Policy disabled and non-SYSTEM execution cannot mutate installations' {
+        function Test-RunningAsLocalSystem { return $false }
+        Assert-Throws { Invoke-SystemProfileRepairs fake } 'LocalSystem'
+        function Test-SoftwareCatalogPolicyEnabled { return $false }
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 0)
+    }
+    Test 'Corrupt journal fails closed' {
+        Set-Content $script:ScopeRepairPath -Value '{ broken json'
+        Assert-Throws { Invoke-SystemProfileRepairs fake } '.'
+        Assert ($script:events.Count -eq 0)
+    }
+    Test 'MSI fallback only for missing correlation, using registered GUID and no arbitrary command' {
+        $reg = New-Registration
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = -1978335212; Output = '' } }
+        function Join-Path { param($Path, $ChildPath) return "$Path\$ChildPath" }
+        function Start-Process {
+            param($FilePath, $ArgumentList, [switch]$Wait, [switch]$PassThru)
+            Assert ($FilePath -eq 'C:\Windows\System32\msiexec.exe')
+            Assert (($ArgumentList -join ' ') -eq "/x $($reg.ProductCode) /qn /norestart")
+            [pscustomobject]@{ ExitCode = 0 }
+        }
+        Uninstall-SystemProfileApplication fake ArtCraft.GridCraft $reg
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = 1603; Output = '' } }
+        function Start-Process { throw 'Fallback must not run for an arbitrary installer error' }
+        Assert-Throws { Uninstall-SystemProfileApplication fake ArtCraft.GridCraft $reg } 'returned 1603'
+        $reg.ProductCode = 'not-a-guid & bad.exe'
+        function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = -1978335212; Output = '' } }
+        Assert-Throws { Uninstall-SystemProfileApplication fake ArtCraft.GridCraft $reg } 'returned'
+    }
+    Test 'Real install arguments retain machine/source/silent flags and append ALLUSERS only for GridCraft' {
+        function Fake-Winget { $script:nativeArgs = @($args); $global:LASTEXITCODE = 0 }
+        function Set-WingetOutputEncoding {}
+        function Test-WingetMachineInstallation { return $true }
+        function Get-SystemProfileApplications { return @() }
+        $result = & $realInstall -WingetPath Fake-Winget -PackageId ArtCraft.GridCraft
+        Assert ($result -eq 0)
+        $line = $script:nativeArgs -join ' '
+        Assert ($line -match '--scope machine')
+        Assert ($line -match '--source winget')
+        Assert ($line -match '--custom ALLUSERS=1')
+        Assert ($line -notmatch '--override')
+        $null = & $realInstall -WingetPath Fake-Winget -PackageId Vendor.Other
+        Assert ($script:nativeArgs -notcontains '--custom')
+        function Test-WingetMachineInstallation { return $false }
+        Assert-Throws { & $realInstall -WingetPath Fake-Winget -PackageId ArtCraft.GridCraft } 'could not be verified'
+        Assert ($script:ScopeRepairFailures -contains 'ArtCraft.GridCraft')
+        Assert (Test-Path $script:ScopeRepairPath) 'False success must retain repair intent'
+    }
+    Test 'Reported machine success with payload in SYSTEM AppData is rejected and journaled' {
+        function Fake-Winget { $global:LASTEXITCODE = 0 }
+        function Set-WingetOutputEncoding {}
+        function Test-WingetMachineInstallation { return $true }
+        $script:registrations = @(New-Registration)
+        Assert-Throws { & $realInstall -WingetPath Fake-Winget -PackageId ArtCraft.GridCraft } 'SYSTEM AppData'
+        Assert ($script:ScopeRepairFailures -contains 'ArtCraft.GridCraft')
+        Assert (Test-Path $script:ScopeRepairPath)
+    }
+    Test 'Machine verification requires exact winget scope and GridCraft executable' {
+        function Invoke-WingetQuery {
+            param($WingetPath, $Arguments)
+            Assert (($Arguments -join ' ') -match '--scope machine')
+            [pscustomobject]@{ ExitCode = 0; Output = 'GridCraft ArtCraft.GridCraft 0.16.0' }
+        }
+        function Join-Path { param($Path, $ChildPath) "$Path\$ChildPath" }
+        function Test-Path { return $false }
+        $oldProgramFiles = $env:ProgramFiles
+        $env:ProgramFiles = 'C:\Program Files'
+        try {
+            Assert (-not (& $realMachineTest fake ArtCraft.GridCraft))
+            function Test-Path { param($LiteralPath) return $LiteralPath -eq 'C:\Program Files\ArtCraft\GridCraft\gridcraft.exe' }
+            Assert (& $realMachineTest fake ArtCraft.GridCraft)
+        } finally { $env:ProgramFiles = $oldProgramFiles }
+    }
+    Test 'Upgrade handles GridCraft with ALLUSERS before generic upgrade --all' {
+        Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft"]}'
+        $script:machineInstalled = $true
+        function Invoke-WingetQuery {
+            param($WingetPath, $Arguments)
+            $script:events += ($Arguments -join ' ')
+            [pscustomobject]@{ ExitCode = -1978335189; Output = '' }
+        }
+        function Fake-Winget { $script:events += ($args -join ' '); $global:LASTEXITCODE = 0 }
+        function Set-WingetOutputEncoding {}
+        Assert ((Invoke-WingetUpgradeAll Fake-Winget) -eq 0)
+        Assert ($script:events[0] -match '^upgrade --id ArtCraft.GridCraft .*--custom ALLUSERS=1')
+        Assert ($script:events[1] -match '^upgrade --all')
+        $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
+        Assert-Throws { Invoke-WingetUpgradeAll Fake-Winget } 'repairs failed'
+    }
+    Test 'Installed and required sets retain set semantics for zero, one and multiple values' {
+        $set = Get-InstalledPackageIdSet
+        Assert ($set -is [Collections.Generic.HashSet[string]])
+        Assert (-not $set.Contains('ArtCraft.GridCraft'))
+        Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft"]}'
+        Assert ((Get-InstalledPackageIdSet).Contains('artcraft.gridcraft'))
+        Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft","Vendor.Other"]}'
+        $set = Get-InstalledPackageIdSet
+        Assert ($set.Contains('artcraft.gridcraft'))
+        Assert (-not $set.Contains('GridCraft'))
+        function Get-RequiredAliases { 'grid' }
+        Assert ((Get-RequiredAliasSet).Contains('GRID'))
+    }
+    Test 'Snapshot excludes failed migrations rather than calling SYSTEM-user copies installed' {
+        $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
+        function Fake-Winget {
+            $pathIndex = [array]::IndexOf($args, '--output') + 1
+            Set-Content -LiteralPath $args[$pathIndex] -Value '{"Sources":[{"Packages":[{"PackageIdentifier":"ArtCraft.GridCraft"},{"PackageIdentifier":"Vendor.Other"}]}]}'
+            $global:LASTEXITCODE = 0
+        }
+        function Set-WingetOutputEncoding {}
+        Assert (Update-InstalledPackagesSnapshot -WingetPath Fake-Winget)
+        $set = Get-InstalledPackageIdSet
+        Assert ($set.Contains('Vendor.Other'))
+        Assert (-not $set.Contains('ArtCraft.GridCraft'))
+    }
+    Test 'Failed repair bypasses the installed shortcut with a failure, not already installed' {
+        $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
+        function Get-RequiredAliases { return @() }
+        $item = [pscustomobject]@{ Action = 'Install'; Alias = 'grid'; Id = 'test' }
+        Assert-Throws { Invoke-QueuedItem -Item $item -WingetPath fake } 'repair.*failed'
+        Assert ($script:events.Count -eq 0)
+    }
+    Test 'Worker repairs before snapshot/installed shortcut and deployment starts inventory without pending work' {
+        $worker = ($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-ProcessQueueMode' }).Extent.Text
+        Assert ($worker.IndexOf('Invoke-SystemProfileRepairs') -lt $worker.IndexOf('Update-InstalledPackagesSnapshot'))
+        $service = ($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Install-Service' }).Extent.Text
+        Assert ($service -match 'Start-QueueWorkerIfAvailable')
+        Assert ($service -notmatch 'Test-QueueHasPendingWork')
+    }
+    Write-Output "$script:passed tests passed."
+}
+finally {
+    $env:SystemRoot = $originalSystemRoot
+    Remove-Item -LiteralPath $script:tempRoot -Recurse -Force
+}

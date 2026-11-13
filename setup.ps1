@@ -45,6 +45,7 @@ $RequestToolPath        = Join-Path $BaseDir 'Request-App.ps1'
 $CatalogGuiPath         = Join-Path $BaseDir 'Software-Catalog.ps1'
 $CatalogLauncherPath    = Join-Path $BaseDir 'Launch-Software-Catalog.vbs'
 $InstalledPackagesPath  = Join-Path $BaseDir 'Installed-Packages.json'
+$ScopeRepairPath        = Join-Path $BaseDir 'Scope-Repairs.json'
 $QueueStatePath         = Join-Path $BaseDir 'Queue-State.json'
 $QueueLockInfoPath      = Join-Path $BaseDir 'Queue-Lock.json'
 $QueueRootDir           = Join-Path $BaseDir 'Queue'
@@ -79,6 +80,7 @@ $DesktopShortcutPath    = Join-Path $CommonDesktopDir "$CatalogDisplayName.lnk"
 $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
 $script:QueueProgressThrottle = @{}
 $script:SoftwarekatalogBuildCommit = $null
+$script:ScopeRepairFailures = @()
 
 # ----------------------------
 # Utility functions
@@ -1054,7 +1056,7 @@ function Get-RequiredAliasSet {
             [void]$set.Add([string]$alias)
         }
     }
-    return $set
+    return ,$set
 }
 
 function Add-QueueItem {
@@ -2791,6 +2793,363 @@ function Register-OrUpdateTasks {
     }
 }
 
+function Get-MachineInstallerArguments {
+    param([Parameter(Mandatory)][string]$PackageId)
+
+    # --scope selects a manifest installer; it does not set MSI properties.
+    # GridCraft's dual-context WiX installer defaults to per-user even though
+    # its winget manifest declares Scope: machine. Append, never --override.
+    if ($PackageId -eq 'ArtCraft.GridCraft') {
+        return @('--custom', 'ALLUSERS=1')
+    }
+}
+
+function Invoke-WingetQuery {
+    param([string]$WingetPath, [string[]]$Arguments)
+
+    Set-WingetOutputEncoding
+    $output = & $WingetPath @Arguments 2>&1 | Out-String
+    $code = $LASTEXITCODE
+    foreach ($line in ($output -split "`r?`n")) {
+        $displayLine = ConvertTo-WingetOutputLine -Line $line
+        if ($displayLine) { Write-Log "winget: $displayLine" }
+    }
+    return [pscustomobject]@{ ExitCode = $code; Output = $output }
+}
+
+function Test-RunningAsLocalSystem {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
+}
+
+function Test-SystemProfileAppDataPath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $pathValue = [Environment]::ExpandEnvironmentVariables($Path).Trim().Replace('/', '\')
+    if ($pathValue -match '^"([^"]+)"') { $pathValue = $Matches[1] }
+    $pathValue = ($pathValue -replace ',\s*-?\d+$', '').TrimEnd('\')
+    # Be conservative about noncanonical paths; never accept a sibling prefix.
+    if ($pathValue -match '(^|\\)\.\.?($|\\)') { return $false }
+    foreach ($systemDir in @('System32', 'SysWOW64', 'Sysnative')) {
+        $root = "$env:SystemRoot\$systemDir\config\systemprofile\AppData"
+        if ($pathValue.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or
+            $pathValue.StartsWith("$root\", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+function Get-RegisteredApplications {
+    # Explicit registry views avoid the caller's PowerShell bitness. Do not
+    # enumerate ordinary users' hives or use Win32_Product (triggers repairs).
+    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
+        foreach ($scope in @('machine', 'user')) {
+            $hive = if ($scope -eq 'machine') { [Microsoft.Win32.RegistryHive]::LocalMachine } else { [Microsoft.Win32.RegistryHive]::Users }
+            $prefix = if ($scope -eq 'user') { 'S-1-5-18\' } else { '' }
+            $base = $null
+            $uninstall = $null
+            try {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
+                $uninstall = $base.OpenSubKey("${prefix}Software\Microsoft\Windows\CurrentVersion\Uninstall")
+                if (-not $uninstall) { continue }
+                foreach ($name in $uninstall.GetSubKeyNames()) {
+                    $key = $uninstall.OpenSubKey($name)
+                    if (-not $key) { continue }
+                    try {
+                        $displayName = [string]$key.GetValue('DisplayName', '')
+                        if (-not $displayName) { continue }
+                        [pscustomobject]@{
+                            ProductCode = $name
+                            DisplayName = $displayName
+                            InstallLocation = [string]$key.GetValue('InstallLocation', '')
+                            DisplayIcon = [string]$key.GetValue('DisplayIcon', '')
+                            WindowsInstaller = ([int]$key.GetValue('WindowsInstaller', 0) -eq 1)
+                            Scope = $scope
+                            RegistryView = $view
+                        }
+                    }
+                    finally { $key.Dispose() }
+                }
+            }
+            finally {
+                if ($uninstall) { $uninstall.Dispose() }
+                if ($base) { $base.Dispose() }
+            }
+        }
+    }
+}
+
+function Get-MsiRegistrationEvidence {
+    param([Parameter(Mandatory)]$Registration)
+
+    if (-not $Registration.WindowsInstaller -or $Registration.ProductCode -notmatch '^\{[0-9A-Fa-f-]{36}\}$') { return }
+    $installer = $null
+    $database = $null
+    $view = $null
+    try {
+        if ($Registration.Scope -eq 'user' -and -not (Test-RunningAsLocalSystem)) { return }
+        if (-not ('Softwarekatalog.NativeMsi' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+namespace Softwarekatalog {
+    public static class NativeMsi {
+        [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+        public static extern uint MsiGetProductInfoEx(string product, string sid,
+            uint context, string property, StringBuilder value, ref uint length);
+        [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+        public static extern int MsiGetComponentPathEx(string product, string component,
+            string sid, uint context, StringBuilder path, ref uint length);
+    }
+}
+'@
+        }
+        # Context-free ProductInfo/ComponentPath may return the user copy when
+        # the SAME product GUID is also installed machine-wide. Resolve the
+        # registration's exact context so a healthy machine copy is not removed.
+        # A null SID means the current SYSTEM user; do not pass S-1-5-18 to MSI.
+        $contexts = if ($Registration.Scope -eq 'machine') { @(4) } else { @(2, 1) }
+        $msiContext = 0
+        $cache = $null
+        foreach ($context in $contexts) {
+            $buffer = New-Object System.Text.StringBuilder 32768
+            $length = [uint32]32768
+            $result = [Softwarekatalog.NativeMsi]::MsiGetProductInfoEx(
+                $Registration.ProductCode, $null, [uint32]$context, 'LocalPackage', $buffer, [ref]$length)
+            if ($result -eq 0) { $cache = $buffer.ToString(); $msiContext = $context; break }
+        }
+        if (-not $cache) { throw 'No cached MSI in the registered installation context.' }
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $database = $installer.OpenDatabase($cache, 0) # Read-only, never install/repair.
+        $view = $database.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''UpgradeCode''')
+        $view.Execute()
+        $record = $view.Fetch()
+        $upgradeCode = if ($record) { [string]$record.StringData(1) } else { '' }
+        if ($record) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) }
+        $view.Close()
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
+        $view = $database.OpenView('SELECT `ComponentId` FROM `Component`')
+        $view.Execute()
+        $paths = @()
+        while ($null -ne ($record = $view.Fetch())) {
+            try {
+                $componentId = [string]$record.StringData(1)
+                if ($componentId) {
+                    $buffer = New-Object System.Text.StringBuilder 32768
+                    $length = [uint32]32768
+                    $state = [Softwarekatalog.NativeMsi]::MsiGetComponentPathEx(
+                        $Registration.ProductCode, $componentId, $null, [uint32]$msiContext, $buffer, [ref]$length)
+                    $pathValue = $buffer.ToString()
+                    # Settings in AppData are normal; only executable payloads
+                    # are evidence when ARP has no InstallLocation (e.g. WiX).
+                    if ($state -eq 3 -and $pathValue -match '(?i)\.exe$') { $paths += $pathValue }
+                }
+            }
+            finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) }
+        }
+        return [pscustomobject]@{ UpgradeCode = $upgradeCode; ExecutablePaths = $paths }
+    }
+    catch { Write-Log "Cannot inspect MSI '$($Registration.ProductCode)': $($_.Exception.Message)" 'WARN' }
+    finally {
+        if ($view) { $view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
+        if ($database) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
+        if ($installer) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) }
+    }
+}
+
+function Get-SystemProfileApplications {
+    param([object[]]$Registrations = @(Get-RegisteredApplications))
+
+    foreach ($registration in $Registrations) {
+        $paths = @($registration.InstallLocation)
+        $evidence = $null
+        if ([string]::IsNullOrWhiteSpace($registration.InstallLocation)) {
+            # A cached .ico in AppData is not an application installation.
+            if ($registration.DisplayIcon -match '(?i)\.exe"?(,\s*-?\d+)?$') { $paths += $registration.DisplayIcon }
+            if ($registration.WindowsInstaller) {
+                $evidence = Get-MsiRegistrationEvidence -Registration $registration
+                if ($evidence) { $paths += @($evidence.ExecutablePaths) }
+            }
+        }
+        if (@($paths | Where-Object { Test-SystemProfileAppDataPath -Path $_ }).Count -gt 0) {
+            Write-Log "SYSTEM-profile installation detected: '$($registration.DisplayName)' product='$($registration.ProductCode)' scope='$($registration.Scope)' paths='$($paths -join '; ')'." 'WARN'
+            [pscustomobject]@{ Registration = $registration; MsiEvidence = $evidence }
+        }
+    }
+}
+
+function Find-SystemProfileCatalogApp {
+    param([string]$WingetPath, $Candidate, [object[]]$Catalog, [object[]]$Registrations)
+
+    $registration = $Candidate.Registration
+    $evidence = $Candidate.MsiEvidence
+    if (-not $evidence -and $registration.WindowsInstaller) {
+        $evidence = Get-MsiRegistrationEvidence -Registration $registration
+    }
+    # Stable vendor MSI identity also works when winget cannot correlate an
+    # old user installation. Never infer identity from a folder/display name.
+    if ($evidence -and $evidence.UpgradeCode -eq '{5511327B-F305-41BE-92D0-EB84944E7C4D}') {
+        return $Catalog | Where-Object { $_.PackageId -eq 'ArtCraft.GridCraft' } | Select-Object -First 1
+    }
+
+    # For other packages require an unambiguous ARP name in this scope AND an
+    # exact winget source correlation. Ambiguous/unknown products are logged,
+    # not guessed at. The uninstall is additionally restricted by product code.
+    $sameName = @($Registrations | Where-Object {
+        $_.Scope -eq $registration.Scope -and $_.DisplayName -eq $registration.DisplayName
+    } | Select-Object -ExpandProperty ProductCode -Unique)
+    if ($sameName.Count -ne 1) { return }
+    $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments @(
+        'list', '--name', $registration.DisplayName, '--exact', '--scope', $registration.Scope,
+        '--source', $WingetSourceName, '--accept-source-agreements', '--disable-interactivity'
+    )
+    if ($result.ExitCode -ne 0) { return }
+    $apps = @($Catalog | Where-Object {
+        $result.Output -match ('(?m)(?<!\S)' + [regex]::Escape($_.PackageId) + '(?!\S)')
+    } | Sort-Object -Property PackageId -Unique)
+    if ($apps.Count -eq 1) { return $apps[0] }
+}
+
+function Test-WingetMachineInstallation {
+    param([string]$WingetPath, [string]$PackageId)
+
+    $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments @(
+        'list', '--id', $PackageId, '--exact', '--scope', 'machine', '--source', $WingetSourceName,
+        '--accept-source-agreements', '--disable-interactivity'
+    )
+    if ($result.ExitCode -ne 0 -or $result.Output -notmatch ('(?m)(?<!\S)' + [regex]::Escape($PackageId) + '(?!\S)')) { return $false }
+    if ($PackageId -eq 'ArtCraft.GridCraft') {
+        foreach ($root in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Select-Object -Unique) {
+            if ($root -and (Test-Path -LiteralPath (Join-Path $root 'ArtCraft\GridCraft\gridcraft.exe'))) { return $true }
+        }
+        return $false
+    }
+    return $true
+}
+
+function Uninstall-SystemProfileApplication {
+    param([string]$WingetPath, [string]$PackageId, $Registration)
+
+    $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments @(
+        'uninstall', '--id', $PackageId, '--exact', '--product-code', $Registration.ProductCode,
+        '--scope', $Registration.Scope, '--source', $WingetSourceName, '--silent',
+        '--accept-source-agreements', '--disable-interactivity'
+    )
+    # Only fall back when winget lacks correlation/uninstall metadata, not on
+    # arbitrary installer errors. Execute a validated product GUID, never an
+    # arbitrary registry command line. This also works for SYSTEM's user MSI.
+    if ($result.ExitCode -in @(-1978335212, -1978335185) -and $Registration.WindowsInstaller -and
+        $Registration.ProductCode -match '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+        $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+        Write-Log "Using registered MSI uninstall for '$PackageId' product '$($Registration.ProductCode)'."
+        $msiArguments = @('/x', $Registration.ProductCode, '/qn', '/norestart')
+        if ($Registration.Scope -eq 'machine') { $msiArguments += 'ALLUSERS=1' }
+        $process = Start-Process -FilePath $msiexec -ArgumentList $msiArguments -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "MSI uninstall of '$PackageId' returned $($process.ExitCode); retry after any required restart." }
+    }
+    elseif ($result.ExitCode -ne 0) { throw "Uninstall of '$PackageId' returned $($result.ExitCode)." }
+
+    $remaining = @(Get-RegisteredApplications | Where-Object {
+        $_.ProductCode -eq $Registration.ProductCode -and $_.Scope -eq $Registration.Scope
+    })
+    if ($remaining.Count -gt 0) { throw "Registration '$($Registration.ProductCode)' still exists after uninstall; machine install deferred." }
+}
+
+function Write-ScopeRepairJournal {
+    param([object[]]$Entries)
+
+    $tempPath = "$ScopeRepairPath.tmp"
+    ConvertTo-Json -InputObject @($Entries) -Depth 5 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $ScopeRepairPath -Force
+}
+
+function Add-ScopeRepairIntent {
+    param([string]$PackageId)
+
+    $entries = @()
+    if (Test-Path -LiteralPath $ScopeRepairPath) {
+        $entries = @(Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    if (@($entries | Where-Object { $_.PackageId -eq $PackageId }).Count -eq 0) {
+        $entries += [pscustomobject]@{ PackageId = $PackageId; StartedAt = (Get-Date).ToString('o') }
+        Write-ScopeRepairJournal -Entries $entries
+    }
+}
+
+function Invoke-SystemProfileRepairs {
+    param([string]$WingetPath)
+
+    $script:ScopeRepairFailures = @()
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return }
+    if (-not (Test-RunningAsLocalSystem)) {
+        throw 'SYSTEM-profile repair must run as LocalSystem.'
+    }
+    $catalog = @(Get-AppCatalogObjects)
+    $journal = @()
+    if (Test-Path -LiteralPath $ScopeRepairPath) {
+        # A corrupt journal must not be silently discarded after an uninstall.
+        $journal = @(Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    }
+    $registrations = @(Get-RegisteredApplications)
+    $repairs = @{}
+    foreach ($candidate in @(Get-SystemProfileApplications -Registrations $registrations)) {
+        $app = Find-SystemProfileCatalogApp -WingetPath $WingetPath -Candidate $candidate -Catalog $catalog -Registrations $registrations
+        if (-not $app) {
+            Write-Log "No unambiguous allowed catalog package for '$($candidate.Registration.DisplayName)'; leaving registration and files untouched." 'WARN'
+            continue
+        }
+        if (-not $repairs.ContainsKey($app.PackageId)) { $repairs[$app.PackageId] = @() }
+        $repairs[$app.PackageId] += $candidate.Registration
+    }
+    foreach ($entry in $journal) {
+        if (@($catalog | Where-Object { $_.PackageId -eq $entry.PackageId }).Count -gt 0 -and -not $repairs.ContainsKey($entry.PackageId)) {
+            $repairs[$entry.PackageId] = @()
+        }
+    }
+    foreach ($packageId in @($repairs.Keys)) {
+        try {
+            $downloadDir = Join-Path $BaseDir ('Scope-Repair-Download-' + (ConvertTo-SafeQueueFileName -Id $packageId))
+            # `show` can return success even with no applicable installer.
+            # Resolve and download the machine installer before uninstalling;
+            # this also catches source/network/hash failures non-destructively.
+            $preflight = Invoke-WingetQuery -WingetPath $WingetPath -Arguments @(
+                'download', '--id', $packageId, '--exact', '--scope', 'machine', '--source', $WingetSourceName,
+                '--download-directory', $downloadDir, '--skip-dependencies',
+                '--accept-package-agreements', '--accept-source-agreements', '--disable-interactivity'
+            )
+            if ($preflight.ExitCode -ne 0) { throw "No machine installer available for '$packageId'; original installation retained." }
+            if (@($journal | Where-Object { $_.PackageId -eq $packageId }).Count -eq 0) {
+                $journal += [pscustomobject]@{ PackageId = $packageId; StartedAt = (Get-Date).ToString('o') }
+            }
+            # Write BEFORE removing anything. Retain this intent across failed
+            # downloads, queue failures, process termination and device restarts.
+            Write-ScopeRepairJournal -Entries $journal
+            foreach ($registration in @($repairs[$packageId] | Sort-Object -Property Scope, ProductCode -Unique)) {
+                Uninstall-SystemProfileApplication -WingetPath $WingetPath -PackageId $packageId -Registration $registration
+            }
+            if (-not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $packageId)) {
+                $code = Invoke-WingetInstall -WingetPath $WingetPath -PackageId $packageId
+                if ($code -ne 0) { throw "Machine reinstall of '$packageId' failed ($code); repair intent retained." }
+            }
+            $remaining = @(Get-SystemProfileApplications | Where-Object {
+                $app = Find-SystemProfileCatalogApp -WingetPath $WingetPath -Candidate $_ -Catalog $catalog -Registrations @(Get-RegisteredApplications)
+                $app -and $app.PackageId -eq $packageId
+            })
+            if ($remaining.Count -gt 0 -or -not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $packageId)) {
+                throw "Machine installation of '$packageId' could not be verified; repair intent retained."
+            }
+            $journal = @($journal | Where-Object { $_.PackageId -ne $packageId })
+            Write-ScopeRepairJournal -Entries $journal
+            Write-Log "SYSTEM-profile repair completed for '$packageId'."
+            if (Test-Path -LiteralPath $downloadDir) { Remove-Item -LiteralPath $downloadDir -Recurse -Force }
+        }
+        catch {
+            $script:ScopeRepairFailures += $packageId
+            Write-Log "SYSTEM-profile repair failed for '$packageId': $($_.Exception.Message)" 'ERROR'
+        }
+    }
+}
+
 function Invoke-WingetInstall {
     param(
         [Parameter(Mandatory)][string]$WingetPath,
@@ -2809,6 +3168,7 @@ function Invoke-WingetInstall {
         '--accept-source-agreements'
         '--disable-interactivity'
     )
+    $arguments += @(Get-MachineInstallerArguments -PackageId $PackageId)
 
     Write-Log "Executing: `"$WingetPath`" $($arguments -join ' ')"
     if ($QueueItemId) {
@@ -2830,6 +3190,21 @@ function Invoke-WingetInstall {
     }
     $exitCode = $LASTEXITCODE
 
+    if ($exitCode -eq 0 -and -not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $PackageId)) {
+        $script:ScopeRepairFailures += $PackageId
+        Add-ScopeRepairIntent -PackageId $PackageId
+        throw "winget reported success for '$PackageId', but a machine installation could not be verified."
+    }
+    if ($exitCode -eq 0) {
+        foreach ($candidate in @(Get-SystemProfileApplications)) {
+            $app = Find-SystemProfileCatalogApp -WingetPath $WingetPath -Candidate $candidate -Catalog @(Get-AppCatalogObjects) -Registrations @(Get-RegisteredApplications)
+            if ($app -and $app.PackageId -eq $PackageId) {
+                $script:ScopeRepairFailures += $PackageId
+                Add-ScopeRepairIntent -PackageId $PackageId
+                throw "'$PackageId' installed into SYSTEM AppData despite --scope machine; refusing to report success."
+            }
+        }
+    }
     return $exitCode
 }
 
@@ -2879,6 +3254,27 @@ function Invoke-WingetUpgradeAll {
         [Parameter(Mandatory)][string]$WingetPath,
         [string]$QueueItemId
     )
+
+    if ($script:ScopeRepairFailures.Count -gt 0) {
+        throw "Automatic upgrades deferred because SYSTEM-profile repairs failed: $($script:ScopeRepairFailures -join ', ')."
+    }
+    # The general --all command cannot append package-specific MSI properties.
+    # Upgrade the dual-context package first; once current it is not selected
+    # by --all. Do not pin packages or change the user's winget settings.
+    $installedSet = Get-InstalledPackageIdSet
+    if ($installedSet.Contains('ArtCraft.GridCraft')) {
+        $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments (@(
+            'upgrade', '--id', 'ArtCraft.GridCraft', '--exact', '--source', $WingetSourceName,
+            '--scope', 'machine', '--silent', '--accept-package-agreements',
+            '--accept-source-agreements', '--disable-interactivity'
+        ) + @(Get-MachineInstallerArguments -PackageId 'ArtCraft.GridCraft'))
+        if ($result.ExitCode -notin @(0, -1978335189)) { # UPDATE_NOT_APPLICABLE
+            throw "GridCraft machine upgrade failed ($($result.ExitCode)); upgrade --all deferred."
+        }
+        if (-not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId 'ArtCraft.GridCraft')) {
+            throw 'GridCraft machine installation could not be verified after upgrade.'
+        }
+    }
 
     $arguments = @(
         'upgrade'
@@ -2993,6 +3389,9 @@ function Update-InstalledPackagesSnapshot {
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             ForEach-Object { $_.Trim() } |
             Sort-Object -Unique
+        # A correlated SYSTEM-profile copy is not a usable machine install.
+        # Do not let export turn a failed migration into "already installed".
+        $packageIds = @($packageIds | Where-Object { $_ -notin $script:ScopeRepairFailures })
 
         $snapshot = [ordered]@{
             GeneratedAt          = (Get-Date).ToString('o')
@@ -3022,13 +3421,13 @@ function Get-InstalledPackageIdSet {
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
     if (-not (Test-Path -LiteralPath $InstalledPackagesPath)) {
-        return $set
+        return ,$set
     }
 
     try {
         $raw = Get-Content -LiteralPath $InstalledPackagesPath -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) {
-            return $set
+            return ,$set
         }
 
         $snapshot = $raw | ConvertFrom-Json
@@ -3042,7 +3441,7 @@ function Get-InstalledPackageIdSet {
         Write-Log "Failed to read installed package snapshot: $($_.Exception.Message)" 'WARN'
     }
 
-    return $set
+    return ,$set
 }
 
 function Invoke-RequiredSoftwarePolicy {
@@ -3236,6 +3635,10 @@ function Invoke-QueuedItem {
         return
     }
 
+    if ($Item.Action -eq 'Install' -and [string]$app.PackageId -in $script:ScopeRepairFailures) {
+        throw "SYSTEM-profile repair of '$($app.PackageId)' failed; see service.log."
+    }
+
     $installedSet = Get-InstalledPackageIdSet
     if ($Item.Action -eq 'Install' -and $installedSet.Contains([string]$app.PackageId)) {
         Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode 0 -Message 'Bereits installiert.'
@@ -3271,6 +3674,9 @@ function Invoke-ProcessQueueMode {
 
     Invoke-WithWingetLock -ScriptBlock {
         [void](Reset-RunningQueueItems)
+        # Run before the installed-state shortcut and before upgrade --all.
+        # Also resumes durable reinstall intents after an interrupted repair.
+        Invoke-SystemProfileRepairs -WingetPath $wingetPath
         $null = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
         $null = Ensure-RequiredSoftwareQueued
 
@@ -3680,9 +4086,8 @@ function Install-Service {
     Register-OrUpdateTasks
 
     try {
-        if (Test-QueueHasPendingWork) {
-            [void](Start-QueueWorkerIfAvailable)
-        }
+        # Run one inventory/repair pass on deployment even with an empty queue.
+        [void](Start-QueueWorkerIfAvailable)
     }
     catch {
         Write-Log "Could not inspect queued work during install/update: $($_.Exception.Message)" 'WARN'
