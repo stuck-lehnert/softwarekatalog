@@ -45,7 +45,19 @@ try {
     $vbs = [IO.File]::ReadAllText($CatalogLauncherPath)
     if ($vbs -notmatch '-STA' -or $vbs -notmatch 'False') { throw 'Launcher must use STA without waiting for the UI' }
     Write-Output 'PASS generated VBS launcher encoding and invocation'
-    $count = 4
+    $guiAst = [Management.Automation.Language.Parser]::ParseFile($CatalogGuiPath, [ref]$tokens, [ref]$parseErrors)
+    $snapshotFunction = $guiAst.Find({ param($n)
+        $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-InstalledPackageState'
+    }, $true)
+    if (-not $snapshotFunction) { throw 'Generated GUI snapshot reader missing.' }
+    . ([scriptblock]::Create($snapshotFunction.Extent.Text))
+    Set-Content -LiteralPath $InstalledPackagesPath -Encoding UTF8 -Value '{"GeneratedAt":"2020-01-01T00:00:00Z","InstalledPackageIds":[]}'
+    $snapshotState = Get-InstalledPackageState
+    if (([datetime]$snapshotState.GeneratedAt).ToUniversalTime().Ticks -ne ([datetime]'2020-01-01T00:00:00Z').ToUniversalTime().Ticks) {
+        throw 'Generated GUI lost the snapshot instant/offset during JSON deserialization.'
+    }
+    Write-Output 'PASS generated GUI snapshot preserves timestamp kind/offset across PS5 and PS7'
+    $count = 5
     if ($env:OS -eq 'Windows_NT' -and $PSVersionTable.PSEdition -eq 'Desktop') {
         Add-Type -AssemblyName System.Windows.Forms
         $guiAst = [Management.Automation.Language.Parser]::ParseFile($CatalogGuiPath, [ref]$tokens, [ref]$parseErrors)

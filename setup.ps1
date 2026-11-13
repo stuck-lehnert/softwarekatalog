@@ -2018,7 +2018,9 @@ function Get-InstalledPackageState {
         `$snapshot = `$raw | ConvertFrom-Json
         if (`$snapshot.PSObject.Properties['Packages']) { `$state.Details = @(`$snapshot.Packages) }
         if (`$snapshot.GeneratedAt) {
-            `$state.GeneratedAt = [string]`$snapshot.GeneratedAt
+            # PS7 JSON dates may already be DateTime. Keep Kind/offset instead
+            # of stringifying to a timezone-less local representation.
+            `$state.GeneratedAt = `$snapshot.GeneratedAt
         }
 
         foreach (`$id in @(`$snapshot.InstalledPackageIds)) {
@@ -2347,7 +2349,7 @@ function Load-AppList {
 
         if (`$installedState.GeneratedAt) {
             try {
-                `$timestamp = [DateTime]::Parse(`$installedState.GeneratedAt).ToLocalTime()
+                `$timestamp = ([DateTime]`$installedState.GeneratedAt).ToLocalTime()
                 `$snapshotLabel.Text = 'Installationsdaten vom: ' + `$timestamp.ToString('dd.MM.yyyy HH:mm:ss')
             }
             catch {
