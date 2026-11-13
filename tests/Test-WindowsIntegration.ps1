@@ -71,7 +71,8 @@ function Stop-ProductTasks {
 function Get-SystemPhaseFailureDetails([string]$Phase, [bool]$ExpectedInterruption) {
     $markerPath = Join-Path $root 'artcraft-interruption.json'
     $detail = "ExpectedInterruption=$ExpectedInterruption; marker='$markerPath'; markerExists=$(Test-Path -LiteralPath $markerPath)"
-    foreach ($path in @($markerPath, (Join-Path $root "$Phase.transcript.txt"),
+    foreach ($path in @($markerPath, (Join-Path $root 'ArtCraftInterrupt.process-exit.json'),
+        (Join-Path $root "$Phase.architecture.json"), (Join-Path $root "$Phase.transcript.txt"),
         (Join-Path $root 'artcraft-msi-invocations.jsonl'), (Join-Path $base 'ArtCraft\State.json'))) {
         if (Test-Path -LiteralPath $path) {
             try { $detail += "`n--- $path ---`n" + ((Get-Content -LiteralPath $path -Tail 24) -join "`n") }
@@ -79,6 +80,26 @@ function Get-SystemPhaseFailureDetails([string]$Phase, [bool]$ExpectedInterrupti
         }
     }
     $detail
+}
+function Test-CiProcessAlreadyExited([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $process = [Diagnostics.Process]::GetProcessById($ProcessId)
+        try { return $process.HasExited } finally { $process.Dispose() }
+    }
+    catch [ArgumentException] { return $true } # That exact PID no longer exists.
+    # Permission/other observation errors must not be mistaken for process death.
+}
+function Test-CiInterruptionBoundary($Marker, $ArchitectureEvidence, [string]$ArchitectureName,
+    [string]$SourceProductCode, [bool]$ProcessAlreadyExited) {
+    if (-not $ProcessAlreadyExited -or -not $SourceProductCode) { return $false }
+    try {
+        Assert-CiArchitectureRecord $ArchitectureEvidence $ArchitectureName $ArchitectureName -RequireNative
+        return ($ArchitectureEvidence.Sid -eq 'S-1-5-18' -and [int]$Marker.ProcessId -gt 0 -and
+            $Marker.ProcessId -eq $ArchitectureEvidence.ProcessId -and
+            $Marker.ProductCode -eq $SourceProductCode -and $Marker.ExitCode -in @(0,3010))
+    }
+    catch { return $false }
 }
 function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInterrupted) {
     $scriptPath = Join-Path $PSScriptRoot 'windows\SystemScenario.ps1'
@@ -96,23 +117,49 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInter
     Start-ScheduledTask -TaskName $taskName
     $deadline = (Get-Date).AddMinutes(8)
     $wasInterrupted = $false
+    $processExitEvidence = $null
     while (-not (Test-Path -LiteralPath $resultPath)) {
         if ((Get-Date) -gt $deadline) {
             $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
             throw "SYSTEM phase timed out: $Phase`n$diagnostic"
         }
-        $info = Get-ScheduledTaskInfo -TaskName $taskName
-        if ($info.LastRunTime -gt $lastRun -and (Get-ScheduledTask -TaskName $taskName).State -notin @('Running', 'Queued')) {
-            if ($ExpectInterrupted -and $Phase -eq 'ArtCraftInterrupt' -and (Test-Path -LiteralPath (Join-Path $root 'artcraft-interruption.json'))) {
+        $markerPath = Join-Path $root 'artcraft-interruption.json'
+        if ($ExpectInterrupted -and $Phase -eq 'ArtCraftInterrupt' -and
+            (Test-Path -LiteralPath $markerPath) -and (Test-Path -LiteralPath $architecturePath)) {
+            # Check actual process death BEFORE CIM timestamps/task state. On
+            # Windows 2022 those can remain stale after the real worker Kill().
+            try {
+                $marker = Get-Content -LiteralPath $markerPath -Raw | ConvertFrom-Json
+                $candidateArchitecture = Get-Content -LiteralPath $architecturePath -Raw | ConvertFrom-Json
+            }
+            catch { Start-Sleep -Milliseconds 100; continue } # Marker write still in progress.
+            Check ($marker.ProcessId -eq $candidateArchitecture.ProcessId -and [int]$marker.ProcessId -gt 0) 'Interruption marker PID does not match the actual architecture-proof worker.'
+            $word = $artConfig.Packages | Where-Object Alias -eq wordcraft
+            $alreadyExited = Test-CiProcessAlreadyExited -ProcessId ([int]$marker.ProcessId)
+            if (Test-CiInterruptionBoundary $marker $candidateArchitecture $ExpectedArchitecture $word.OldProductCode $alreadyExited) {
+                $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
+                $processExitEvidence = [pscustomobject]@{ ProcessAlreadyExited = $alreadyExited; ProcessId = $marker.ProcessId
+                    ProductCode = $marker.ProductCode; MsiExitCode = $marker.ExitCode; ObservedUtc = [datetime]::UtcNow.ToString('o')
+                    TaskStateBeforeDrain = [string](Get-ScheduledTask -TaskName $taskName).State
+                    LastRunTimeBeforeDrain = [string]$taskInfo.LastRunTime; LastTaskResultBeforeDrain = $taskInfo.LastTaskResult }
+                $processExitEvidence | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'ArtCraftInterrupt.process-exit.json') -Encoding UTF8
+                Write-Output ('Actual interruption boundary, BEFORE any task drain: ' + ($processExitEvidence | ConvertTo-Json -Compress))
                 $wasInterrupted = $true
                 break
             }
+            Check (-not $alreadyExited) 'Dead worker marker lacks the exact native SYSTEM/source GUID/successful MSI boundary evidence.'
+            # A marker from a STILL LIVING worker is never accepted or killed.
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+        $info = Get-ScheduledTaskInfo -TaskName $taskName
+        if ($info.LastRunTime -gt $lastRun -and (Get-ScheduledTask -TaskName $taskName).State -notin @('Running', 'Queued')) {
             $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
             throw "SYSTEM phase '$Phase' exited without a result (task code $($info.LastTaskResult)).`n$diagnostic"
         }
         Start-Sleep -Milliseconds 250
     }
-    while ((Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
+    while (-not $wasInterrupted -and (Get-ScheduledTask -TaskName $taskName).State -eq 'Running') {
         if ((Get-Date) -gt $deadline) {
             $diagnostic = Get-SystemPhaseFailureDetails -Phase $Phase -ExpectedInterruption ([bool]$ExpectInterrupted)
             throw "SYSTEM phase did not exit: $Phase`n$diagnostic"
@@ -127,7 +174,17 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInter
         $interruption = Get-Content -LiteralPath (Join-Path $root 'artcraft-interruption.json') -Raw | ConvertFrom-Json
         $word = $artConfig.Packages | Where-Object Alias -eq wordcraft
         Check ($interruption.ProcessId -eq $systemArchitecture.ProcessId -and $interruption.ProductCode -eq $word.OldProductCode -and $interruption.ExitCode -in @(0,3010)) 'Interruption was not the bounded successful-removal process boundary.'
-        Check ((Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult -ne 0) 'Interrupted process unexpectedly returned success.'
+        Check ($processExitEvidence.ProcessAlreadyExited -and (Test-CiProcessAlreadyExited ([int]$interruption.ProcessId))) 'Worker must already be dead before any stale task record is stopped/unregistered.'
+        Check (-not (Test-Path -LiteralPath $resultPath)) 'Expected Kill worker returned a normal scenario result.'
+        # Only now may a stale CI task record/descendant job be drained. Never
+        # use Stop-ScheduledTask as the test's process-boundary fault injector.
+        if ((Get-ScheduledTask -TaskName $taskName).State -in @('Running','Queued')) { Stop-ScheduledTask -TaskName $taskName }
+        $drainDeadline = (Get-Date).AddSeconds(15)
+        while ((Get-ScheduledTask -TaskName $taskName).State -in @('Running','Queued')) {
+            if ((Get-Date) -gt $drainDeadline) { throw 'Already-dead interruption worker has a CI task record that did not drain within 15 seconds.' }
+            Start-Sleep -Milliseconds 200
+        }
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         Record 'Real SYSTEM process terminated immediately after successful MSI removal'
         return
     }

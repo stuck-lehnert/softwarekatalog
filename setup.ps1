@@ -3645,6 +3645,7 @@ function Update-InstalledPackagesSnapshot {
                 PackageId = $definition.PackageId; Provider = 'ArtCraft'
                 Version = if ($record.Count) { [string]$record[0].Version } else { '' }
                 Architecture = if ($record.Count) { [string]$record[0].Architecture } else { '' }
+                Scope = if ($record.Count) { [string](Get-QueueObjectValue $record[0] 'Scope' '') } else { '' }
                 Healthy = ($record.Count -gt 0 -and $record[0].Healthy)
                 LatestVersion = if ($owner.Count) { Get-QueueObjectValue $owner[0] 'LatestVersion' '' } else { '' }
                 LastCheckedUtc = if ($owner.Count) { Get-QueueObjectValue $owner[0] 'LastCheckedUtc' '' } else { '' }

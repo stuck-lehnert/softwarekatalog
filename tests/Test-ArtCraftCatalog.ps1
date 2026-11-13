@@ -89,8 +89,8 @@ try {
     }
     Test 'Custom inventory merges atomically and excludes unhealthy or stale WinGet ArtCraft records' {
         Set-Content $script:InstalledPackagesPath '{"InstalledPackageIds":["ArtCraft.GridCraft","ArtCraft.PdfCraft","Vendor.Keep"]}'
-        $script:inventory=@([pscustomobject]@{PackageId='ArtCraft.GridCraft';Version='1.0.0';Architecture='arm64';Healthy=$true},
-            [pscustomobject]@{PackageId='ArtCraft.PdfCraft';Version='0.1.0';Architecture='x64';Healthy=$false})
+        $script:inventory=@([pscustomobject]@{PackageId='ArtCraft.GridCraft';Version='1.0.0';Architecture='arm64';Scope='machine';Healthy=$true},
+            [pscustomobject]@{PackageId='ArtCraft.PdfCraft';Version='0.1.0';Architecture='x64';Scope='user';Healthy=$false})
         $script:owners=@([pscustomobject]@{PackageId='ArtCraft.GridCraft';MetadataStale=$true;LastError='Offline';LastCheckedUtc='2026-11-12T00:00:00Z'})
         Assert (Update-InstalledPackagesSnapshot '')
         $s=Get-Content $script:InstalledPackagesPath -Raw | ConvertFrom-Json
@@ -98,6 +98,7 @@ try {
         Assert ($s.InstalledPackageIds -notcontains 'ArtCraft.PdfCraft' -and -not $s.WingetRefreshed)
         Assert (@($s.Packages).Count -eq 2)
         $grid=@($s.Packages | Where-Object PackageId -eq 'ArtCraft.GridCraft')[0]
+        Assert ($grid.Scope -eq 'machine') 'Snapshot lost the actual MSI registration scope'
         Assert ($grid.MetadataStale -and $grid.LastError -eq 'Offline') 'Snapshot lost stale-metadata diagnostics'
         # PS7 deserializes ISO dates as DateTime; the ARM runner is non-UTC.
         # Compare the actual instant, not its local wall-clock representation.
