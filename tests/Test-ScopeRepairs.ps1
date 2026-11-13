@@ -120,6 +120,19 @@ try {
         Assert ($inventory.Contains('Registry64') -and $inventory.Contains('Registry32'))
         Assert ($inventory.Contains('S-1-5-18\'))
     }
+    Test 'Context-free MSI fallback rejects duplicate GUIDs and uninspectable contexts' {
+        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 1605, 0))
+        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(2, 1605, 0, 1605))
+        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(1, 0, 1605, 1605))
+        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 0, 0)) 'Never take a user path for a machine registration'
+        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(2, 1605, 0, 0))
+        foreach ($errorCode in @(87, 5, 1610, 234)) {
+            Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, $errorCode, 1605, 0))
+            Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, $errorCode, 0))
+        }
+        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 1605, 1605))
+        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(7, 1605, 1605, 0))
+    }
     Test 'Native MSI failures remain visible with scope and Windows error diagnostics' {
         $script:diagnostics = @()
         function Write-Log { param($Message, $Level) $script:diagnostics += [string]$Message }

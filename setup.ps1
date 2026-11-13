@@ -2913,6 +2913,9 @@ namespace Softwarekatalog {
         [DllImport("msi.dll", CharSet = CharSet.Unicode)]
         public static extern int MsiGetComponentPathEx(string product, string component,
             string sid, uint context, StringBuilder path, ref uint length);
+        [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+        public static extern int MsiGetComponentPath(string product, string component,
+            StringBuilder path, ref uint length);
         // PowerShell converts $null to String.Empty for .NET string parameters.
         // Keep the mandatory native NULL SID inside C#, not at the PS boundary.
         public static uint GetProductInfo(string product, uint context, string property,
@@ -2921,7 +2924,27 @@ namespace Softwarekatalog {
         }
         public static int GetComponentPath(string product, string component, uint context,
             StringBuilder path, ref uint length) {
-            return MsiGetComponentPathEx(product, component, null, context, path, ref length);
+            int state = MsiGetComponentPathEx(product, component, null, context, path, ref length);
+            if (state != -1) return state;
+            // On SYSTEM, ComponentPathEx can report UNKNOWN while the classic
+            // API finds the published component. Never use that context-free
+            // result if this GUID is also registered in another current-user
+            // or machine context, or any context cannot be inspected reliably.
+            uint[] results = new uint[3];
+            uint[] contexts = { 1, 2, 4 };
+            for (int i = 0; i < contexts.Length; i++) {
+                var cache = new StringBuilder(32768); uint size = 32768;
+                results[i] = MsiGetProductInfoEx(product, null, contexts[i], "LocalPackage", cache, ref size);
+            }
+            if (!IsOnlyRegisteredContext(context, results[0], results[1], results[2])) return state;
+            path.Clear(); length = (uint)path.Capacity;
+            return MsiGetComponentPath(product, component, path, ref length);
+        }
+        public static bool IsOnlyRegisteredContext(uint context, uint managed, uint unmanaged, uint machine) {
+            // ERROR_UNKNOWN_PRODUCT (1605) is the only acceptable absence.
+            return (context == 1 && managed == 0 && unmanaged == 1605 && machine == 1605)
+                || (context == 2 && managed == 1605 && unmanaged == 0 && machine == 1605)
+                || (context == 4 && managed == 1605 && unmanaged == 1605 && machine == 0);
         }
     }
 }

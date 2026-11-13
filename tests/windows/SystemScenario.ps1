@@ -93,6 +93,10 @@ public static class FixtureMsiProbe {
                         $length = [uint32]32768
                         $state = [Softwarekatalog.NativeMsi]::GetComponentPath($config.ProductCode, $sample.ComponentId, [uint32]$context, $buffer, [ref]$length)
                         $probes += "context=$context state=$state path=$($buffer.ToString())"
+                        $buffer = New-Object Text.StringBuilder 32768
+                        $length = [uint32]32768
+                        $code = [Softwarekatalog.NativeMsi]::GetProductInfo($config.ProductCode, [uint32]$context, 'LocalPackage', $buffer, [ref]$length)
+                        $probes += "context=$context cacheCode=$code"
                     }
                 }
                 $msiLog = @(Get-Content (Join-Path $Root 'legacy-install.log') | Select-String 'Feature: Main|Component:|ComponentRegister|RegisterProduct|PublishProduct|PublishComponents|ALLUSERS|MSIINSTALLPERUSER' | Select-Object -Last 12) -join "`n"
