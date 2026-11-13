@@ -12,6 +12,7 @@ foreach ($statement in $ast.EndBlock.Statements) {
         . ([scriptblock]::Create($statement.Extent.Text))
     }
 }
+$realMsiEvidence = ${function:Get-MsiRegistrationEvidence}
 
 $script:passed = 0
 $script:tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('scope-tests-' + [Guid]::NewGuid().ToString('N'))
@@ -35,6 +36,7 @@ function Test([string]$Name, [scriptblock]$Body) {
     $script:machineInstalled = $false
     $script:installCode = 0
     $script:ScopeRepairFailures = @()
+    $script:MsiInspectionFailures = @()
     $script:BaseDir = Join-Path $script:tempRoot ([Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $script:BaseDir | Out-Null
     $script:ScopeRepairPath = Join-Path $script:BaseDir 'Scope-Repairs.json'
@@ -96,9 +98,33 @@ try {
         if (-not ('Softwarekatalog.NativeMsi' -as [type])) { Add-Type -TypeDefinition $nativeSource }
         Assert ([Softwarekatalog.NativeMsi].GetMethod('MsiGetProductInfoEx').GetParameters().Count -eq 6)
         Assert ([Softwarekatalog.NativeMsi].GetMethod('MsiGetComponentPathEx').GetParameters().Count -eq 6)
+        Assert ([Softwarekatalog.NativeMsi].GetMethod('GetProductInfo').GetParameters().Count -eq 5) 'PS boundary must not accept a nullable string SID'
+        Assert ([Softwarekatalog.NativeMsi].GetMethod('GetComponentPath').GetParameters().Count -eq 5)
+        Assert ($nativeSource -match 'MsiGetProductInfoEx\(product, null, context') 'Native NULL must be supplied inside C#'
+        Assert ($nativeSource -match 'MsiGetComponentPathEx\(product, component, null, context')
         $inventory = ($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Get-RegisteredApplications' }).Extent.Text
         Assert ($inventory.Contains('Registry64') -and $inventory.Contains('Registry32'))
         Assert ($inventory.Contains('S-1-5-18\'))
+    }
+    Test 'Native MSI failures remain visible with scope and Windows error diagnostics' {
+        $script:diagnostics = @()
+        function Write-Log { param($Message, $Level) $script:diagnostics += [string]$Message }
+        foreach ($scope in @('machine', 'user')) {
+            $registration = New-Registration
+            $registration.ProductCode = '{' + [Guid]::NewGuid().ToString() + '}'
+            $registration.Scope = $scope
+            $evidence = & $realMsiEvidence -Registration $registration
+            Assert ($null -eq $evidence) 'An unknown product must not supply executable evidence'
+            Assert ($script:MsiInspectionFailures -contains $registration.ProductCode)
+            $message = $script:diagnostics[-1]
+            Assert ($message -match "scope='$scope'")
+            if ($env:OS -eq 'Windows_NT') {
+                # Exercise the real read-only API even in ordinary unit jobs.
+                # A true NULL SID yields UNKNOWN_PRODUCT, not INVALID_PARAMETER.
+                Assert ($message -match 'Win32=1605') $message
+                Assert ($message -notmatch 'Win32=87\b') $message
+            }
+        }
     }
     Test 'AppData detection is case-insensitive, boundary-safe and includes WOW64' {
         foreach ($path in @(
@@ -134,6 +160,14 @@ try {
         $app = Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg)
         Assert ($app.PackageId -eq 'ArtCraft.GridCraft')
         Assert (@(Find-SystemProfileCatalogApp fake $candidate @() @($reg)).Count -eq 0) 'Policy required'
+    }
+    Test 'PDFCraft shares explicit MSI scope handling and stable verified identity' {
+        $script:catalog = @([pscustomobject]@{ PackageId = 'ArtCraft.PdfCraft'; Alias = 'pdf'; DisplayName = 'Custom PDF label' })
+        $reg = New-Registration -Name PdfCraft
+        $candidate = [pscustomobject]@{ Registration = $reg; MsiEvidence = [pscustomobject]@{ UpgradeCode = '{EA00C367-7270-4C50-9D8B-A7A5C88AD27F}' } }
+        Assert ((Find-SystemProfileCatalogApp fake $candidate $script:catalog @($reg)).PackageId -eq 'ArtCraft.PdfCraft')
+        Assert ((@(Get-MachineInstallerArguments ArtCraft.PdfCraft) -join ' ') -eq '--custom ALLUSERS=1')
+        Assert (@(Get-MachineInstallerArguments ArtCraft.UnverifiedExe).Count -eq 0) 'Never send MSI properties to arbitrary ArtCraft EXEs'
     }
     Test 'Generic package uses exact winget correlation, not catalog display name' {
         function Get-MsiRegistrationEvidence { return $null }
@@ -238,6 +272,24 @@ try {
         Assert-Throws { Invoke-SystemProfileRepairs fake } '.'
         Assert ($script:events.Count -eq 0)
     }
+    Test 'Journal loading tolerates Windows PowerShell 5.1 non-enumerating JSON arrays' {
+        function ConvertFrom-Json {
+            param([Parameter(ValueFromPipeline)]$InputObject)
+            process {
+                $value = Microsoft.PowerShell.Utility\ConvertFrom-Json -InputObject $InputObject
+                Write-Output -NoEnumerate @($value)
+            }
+        }
+        Write-ScopeRepairJournal -Entries @()
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 0)
+        Add-ScopeRepairIntent -PackageId 'Removed.App'
+        Add-ScopeRepairIntent -PackageId 'Other.RemovedApp'
+        Invoke-SystemProfileRepairs fake
+        Assert ($script:events.Count -eq 0)
+        $journalText = Get-Content $script:ScopeRepairPath -Raw
+        Assert ($journalText -match 'Removed.App' -and $journalText -match 'Other.RemovedApp')
+    }
     Test 'MSI fallback only for missing correlation, using registered GUID and no arbitrary command' {
         $reg = New-Registration
         function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = -1978335212; Output = '' } }
@@ -256,7 +308,7 @@ try {
         function Invoke-WingetQuery { [pscustomobject]@{ ExitCode = -1978335212; Output = '' } }
         Assert-Throws { Uninstall-SystemProfileApplication fake ArtCraft.GridCraft $reg } 'returned'
     }
-    Test 'Real install arguments retain machine/source/silent flags and append ALLUSERS only for GridCraft' {
+    Test 'Real install arguments retain machine/source/silent flags and append ALLUSERS only for verified MSI profiles' {
         function Fake-Winget { $script:nativeArgs = @($args); $global:LASTEXITCODE = 0 }
         function Set-WingetOutputEncoding {}
         function Test-WingetMachineInstallation { return $true }
@@ -268,6 +320,8 @@ try {
         Assert ($line -match '--source winget')
         Assert ($line -match '--custom ALLUSERS=1')
         Assert ($line -notmatch '--override')
+        $null = & $realInstall -WingetPath Fake-Winget -PackageId ArtCraft.PdfCraft
+        Assert (($script:nativeArgs -join ' ') -match '--custom ALLUSERS=1')
         $null = & $realInstall -WingetPath Fake-Winget -PackageId Vendor.Other
         Assert ($script:nativeArgs -notcontains '--custom')
         function Test-WingetMachineInstallation { return $false }
@@ -284,24 +338,32 @@ try {
         Assert ($script:ScopeRepairFailures -contains 'ArtCraft.GridCraft')
         Assert (Test-Path $script:ScopeRepairPath)
     }
-    Test 'Machine verification requires exact winget scope and GridCraft executable' {
+    Test 'Machine verification requires exact winget scope and each verified vendor executable' {
         function Invoke-WingetQuery {
             param($WingetPath, $Arguments)
             Assert (($Arguments -join ' ') -match '--scope machine')
-            [pscustomobject]@{ ExitCode = 0; Output = 'GridCraft ArtCraft.GridCraft 0.16.0' }
+            $id = $Arguments[[array]::IndexOf($Arguments, '--id') + 1]
+            [pscustomobject]@{ ExitCode = 0; Output = "Application $id 0.16.0" }
         }
         function Join-Path { param($Path, $ChildPath) "$Path\$ChildPath" }
-        function Test-Path { return $false }
+        function Test-Path { param($LiteralPath) return $script:payloadExists -and $LiteralPath -eq $script:expectedPayload }
         $oldProgramFiles = $env:ProgramFiles
         $env:ProgramFiles = 'C:\Program Files'
         try {
-            Assert (-not (& $realMachineTest fake ArtCraft.GridCraft))
-            function Test-Path { param($LiteralPath) return $LiteralPath -eq 'C:\Program Files\ArtCraft\GridCraft\gridcraft.exe' }
-            Assert (& $realMachineTest fake ArtCraft.GridCraft)
+            foreach ($profile in @(
+                @{ Id = 'ArtCraft.GridCraft'; Exe = 'ArtCraft\GridCraft\gridcraft.exe' }
+                @{ Id = 'ArtCraft.PdfCraft'; Exe = 'ArtCraft\PdfCraft\pdfcraft.exe' }
+            )) {
+                $script:expectedPayload = "C:\Program Files\$($profile.Exe)"
+                $script:payloadExists = $false
+                Assert (-not (& $realMachineTest fake $profile.Id))
+                $script:payloadExists = $true
+                Assert (& $realMachineTest fake $profile.Id)
+            }
         } finally { $env:ProgramFiles = $oldProgramFiles }
     }
-    Test 'Upgrade handles GridCraft with ALLUSERS before generic upgrade --all' {
-        Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft"]}'
+    Test 'Upgrade handles GridCraft and PdfCraft with ALLUSERS before generic upgrade --all' {
+        Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft","ArtCraft.PdfCraft"]}'
         $script:machineInstalled = $true
         function Invoke-WingetQuery {
             param($WingetPath, $Arguments)
@@ -312,7 +374,8 @@ try {
         function Set-WingetOutputEncoding {}
         Assert ((Invoke-WingetUpgradeAll Fake-Winget) -eq 0)
         Assert ($script:events[0] -match '^upgrade --id ArtCraft.GridCraft .*--custom ALLUSERS=1')
-        Assert ($script:events[1] -match '^upgrade --all')
+        Assert ($script:events[1] -match '^upgrade --id ArtCraft.PdfCraft .*--custom ALLUSERS=1')
+        Assert ($script:events[2] -match '^upgrade --all')
         $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
         Assert-Throws { Invoke-WingetUpgradeAll Fake-Winget } 'repairs failed'
     }

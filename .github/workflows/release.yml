@@ -1,31 +1,53 @@
 name: Release
 
 on:
-  push:
-    branches:
-      - main
-      - master
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  manual-checks:
+    if: github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    uses: ./.github/workflows/test.yml
+
   build-release:
+    needs: manual-checks
+    # Never release PR/fork artifacts through the privileged workflow_run event.
+    # Manual releases must execute the same complete CI, not bypass its gate.
+    if: >-
+      always() &&
+      ((github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' && github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.head_branch == 'main' || github.event.workflow_run.head_branch == 'master')) ||
+       (github.event_name == 'workflow_dispatch' && needs.manual-checks.result == 'success' &&
+        (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')))
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      BUILD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          persist-credentials: false
 
       - name: Build dist
         run: make dist
         env:
-          SOFTKAT_BUILD_COMMIT: ${{ github.sha }}
+          SOFTKAT_BUILD_COMMIT: ${{ env.BUILD_SHA }}
 
       - name: Package release zip
         run: |
-          short_sha="${GITHUB_SHA::7}"
+          short_sha="${BUILD_SHA::7}"
           archive="softwarekatalog-${short_sha}.zip"
 
           echo "SHORT_SHA=${short_sha}" >> "${GITHUB_ENV}"
@@ -51,7 +73,7 @@ jobs:
           : "${token:?No release token available}"
           : "${GITHUB_API_URL:?GITHUB_API_URL is required}"
           : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-          : "${GITHUB_SHA:?GITHUB_SHA is required}"
+          : "${BUILD_SHA:?BUILD_SHA is required}"
           : "${SHORT_SHA:?SHORT_SHA is required}"
           : "${ARCHIVE:?ARCHIVE is required}"
 
@@ -95,9 +117,9 @@ jobs:
 
           print(json.dumps({
               "tag_name": os.environ["SHORT_SHA"],
-              "target_commitish": os.environ["GITHUB_SHA"],
+              "target_commitish": os.environ["BUILD_SHA"],
               "name": os.environ["SHORT_SHA"],
-              "body": f"Automated build for {os.environ['GITHUB_SHA']}.",
+              "body": f"Automated build for {os.environ['BUILD_SHA']}.",
               "draft": False,
               "prerelease": False,
           }))

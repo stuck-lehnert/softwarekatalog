@@ -88,17 +88,19 @@ All normal installs, uninstalls and upgrades already use `--scope machine`.
 This selects an eligible WinGet installer; it is not a universal instruction
 that converts every installer into an all-users installation.
 
-For `ArtCraft.GridCraft`, the vendor's dual-context MSI defaults to per-user.
+For `ArtCraft.GridCraft` and `ArtCraft.PdfCraft`, the vendor's dual-context MSI defaults to per-user.
 The client therefore **appends** `--custom "ALLUSERS=1"` to its machine install
 and upgrade commands. It does not use `--override`, change WinGet settings,
-or send MSI properties to unrelated EXE installers. GridCraft is upgraded
-individually with that property before the general `upgrade --all` pass.
+or send MSI properties to unrelated EXE installers. These verified MSI packages
+are upgraded individually with that property before the general `upgrade --all` pass.
 
-References checked for GridCraft 0.16.0:
+References checked for GridCraft 0.16.0 and PDFCraft 0.18.1:
 
 - [Vendor installation policy](https://github.com/storytold/gridcraft/blob/v0.16.0/packaging/windows/INSTALLATION.md)
 - [Vendor WiX scope and cross-context checks](https://github.com/storytold/gridcraft/blob/v0.16.0/packaging/windows/install-policy.wxi)
 - [WinGet installer manifest](https://github.com/microsoft/winget-pkgs/blob/master/manifests/a/ArtCraft/GridCraft/0.16.0/ArtCraft.GridCraft.installer.yaml)
+- [PDFCraft 0.18.1 installation policy](https://github.com/storytold/pdfcraft/blob/v0.18.1/packaging/windows/INSTALLATION.md)
+- [PDFCraft WinGet manifest and stable MSI identity](https://github.com/microsoft/winget-pkgs/blob/master/manifests/a/ArtCraft/PdfCraft/0.18.1/ArtCraft.PdfCraft.installer.yaml)
 
 ### Automatic repair
 
@@ -118,7 +120,7 @@ The repair pass:
    icons and ordinary AppData settings are not treated as executable payloads.
    It does not use `Win32_Product`.
 2. Maps a suspect installation to a currently allowed catalog package. GridCraft
-   has a verified stable MSI UpgradeCode; other packages require an unambiguous
+   and PDFCraft have verified stable MSI UpgradeCodes; other packages require an unambiguous
    registration and exact WinGet name/source correlation to a catalog package ID.
    Catalog display labels do not have to match the registered application name.
 3. Resolves and downloads a machine-scope installer **before removing anything**.
@@ -129,8 +131,8 @@ The repair pass:
    correlated MSI/uninstall metadata, it uses `msiexec /x {validated-product-guid}
    /qn /norestart`. It never executes arbitrary registry uninstall command lines.
 5. Checks that the old registration disappeared, reinstalls with machine scope,
-   and verifies the result. For GridCraft this includes checking
-   `ArtCraft\GridCraft\gridcraft.exe` under the applicable Program Files directory.
+   and verifies the result. For the verified ArtCraft MSI profiles this includes checking
+   `ArtCraft\GridCraft\gridcraft.exe` (or `ArtCraft\PdfCraft\pdfcraft.exe`) under the applicable Program Files directory.
    An already valid machine copy is kept when only a stray SYSTEM-user copy
    needs removal.
 
@@ -152,6 +154,15 @@ pass so they are not silently treated as usable machine installations.
 
 Review `C:\ProgramData\__Softwarekatalog\Logs\service.log` for
 `SYSTEM-profile installation detected`, `repair completed`, or `repair failed`.
+Each pass also logs an inventory summary with suspect/package counts and failed
+MSI inspections. `Install/update completed successfully` refers to the catalog
+service deployment, **not** to an application repair. A `Cannot inspect MSI`
+warning is an incomplete inspection, not evidence that the package is healthy;
+the warning includes its scope, attempted contexts and native Windows error codes.
+The native MSI bridge deliberately supplies a true NULL SID inside C#: passing
+PowerShell `$null` to a .NET string parameter would produce an empty string and
+break context-sensitive MSI lookup. Repair journals are also normalized across
+the different JSON-array pipeline behavior of Windows PowerShell 5.1 and PS7.
 Failed attempts retain their downloaded installer under
 `Scope-Repair-Download-<package-id>` for diagnosis/recovery; successful repairs
 remove that temporary download directory. No reboot is triggered; if an MSI
@@ -169,17 +180,27 @@ Start-ScheduledTask -TaskName 'Softwarekatalog - Queue'
 
 ```sh
 make test                       # requires pwsh
+make test-static                # Python 3 + bash; distribution and policy XML
 make dist
 ```
 
-Or run `powershell.exe -NoProfile -File tests\Test-ScopeRepairs.ps1` on Windows.
-The dependency-free regression suite uses mocked registry/MSI/WinGet boundaries;
-CI runs it with Windows PowerShell 5.1 and PowerShell 7. It covers detection,
-policy/identity guards, uninstall/reinstall order, durable recovery, MSI fallback,
-machine-scope verification and installer/upgrade arguments. It does not replace
-a real SYSTEM-context installation/uninstallation test on Windows. In particular,
-verify the all-users Start menu entry and launch GridCraft as a standard second
-user after deployment.
+Or run `powershell.exe -NoProfile -File tests\Invoke-Tests.ps1` on Windows.
+Each suite runs in its own child process with a timeout; logs and JUnit XML are
+written to `test-results/`. The ordinary unit tests need no Pester/module install.
+
+The [Windows CI](docs/ci.md) covers Windows Server 2022/2025, Windows PowerShell
+5.1 and PowerShell 7, plus an x86 PowerShell pass. In addition to file-backed
+queue/policy/request and scope-repair regression tests, disposable hosted runners
+test the actual deployment bootstrap, real SYSTEM tasks, MSI migration and a
+real standard user's NTFS/registry permissions and application access. Releases
+are gated on successful CI for their exact commit, including manual releases.
+
+The deterministic integration fixture uses a controlled CLI adapter to isolate
+upstream WinGet/network behavior; the MSI engine and OS security boundaries are
+real. It does not certify arbitrary third-party installers, domain GPO delivery,
+or an interactive desktop GUI. See the coverage/limitations and safe invocation
+instructions in [docs/ci.md](docs/ci.md); do not run the destructive integration
+harness on a normal workstation.
 
 ## Notes
 

@@ -1,21 +1,118 @@
-name: Tests
+name: CI
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  scope-repairs:
-    runs-on: windows-latest
+  build:
+    name: Build and policy integrity
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Windows PowerShell 5.1 regression tests
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+      - name: Build, encoding, payload and policy resource tests
+        run: |
+          python3 -m unittest discover -s tests -p 'test_*.py' -v
+          make dist
+        env:
+          SOFTKAT_BUILD_COMMIT: ${{ github.sha }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distribution
+          path: dist/setup.ps1
+          if-no-files-found: error
+          retention-days: 7
+
+  unit:
+    name: Unit / ${{ matrix.os }} / ${{ matrix.engine }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+        engine: [powershell, pwsh]
+        include:
+          - os: windows-2022
+            engine: powershell-x86
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run isolated suites and produce JUnit reports
         shell: powershell
-        run: ./tests/Test-ScopeRepairs.ps1
-      - name: PowerShell 7 regression tests
-        shell: pwsh
-        run: ./tests/Test-ScopeRepairs.ps1
+        env:
+          TEST_ENGINE: ${{ matrix.engine }}
+        run: |
+          $engine = $env:TEST_ENGINE
+          if ($engine -eq 'powershell-x86') { $engine = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" }
+          & $engine -NoProfile -ExecutionPolicy Bypass -File tests/Invoke-Tests.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: unit-${{ matrix.os }}-${{ matrix.engine }}
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  system:
+    name: SYSTEM integration / ${{ matrix.os }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: distribution
+          path: dist
+      - name: Install pinned fixture-building tool
+        shell: powershell
+        run: |
+          dotnet tool install --tool-path "$env:RUNNER_TEMP\softkat-wix" wix --version 5.0.2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Real deployment, SYSTEM MSI migration and standard-user security checks
+        shell: powershell
+        run: ./tests/Test-WindowsIntegration.ps1 -AllowDisposableMachine -WixPath "$env:RUNNER_TEMP\softkat-wix\wix.exe"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: system-${{ matrix.os }}
+          path: test-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  gate:
+    name: CI passed
+    if: always()
+    needs: [build, unit, system]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every test layer to pass
+        env:
+          BUILD: ${{ needs.build.result }}
+          UNIT: ${{ needs.unit.result }}
+          SYSTEM: ${{ needs.system.result }}
+        run: test "$BUILD" = success && test "$UNIT" = success && test "$SYSTEM" = success

@@ -81,6 +81,7 @@ $StartMenuShortcutPath  = Join-Path $CommonProgramsDir "$CatalogDisplayName.lnk"
 $script:QueueProgressThrottle = @{}
 $script:SoftwarekatalogBuildCommit = $null
 $script:ScopeRepairFailures = @()
+$script:MsiInspectionFailures = @()
 
 # ----------------------------
 # Utility functions
@@ -671,6 +672,8 @@ function Read-QueueItemFile {
         if (-not (Test-Path -LiteralPath $Path)) { return $null }
         $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
         if ([string]::IsNullOrWhiteSpace($raw)) { throw 'Queue item file is empty.' }
+        # Validate the root before ConvertFrom-Json can unwrap singleton arrays.
+        if (-not $raw.TrimStart().StartsWith('{')) { throw 'Queue item JSON root is not an object.' }
         $item = $raw | ConvertFrom-Json
         if ($item -is [System.Array] -or $item -isnot [pscustomobject]) { throw 'Queue item JSON root is not an object.' }
         return (ConvertTo-QueueItemRecord -Item $item -DefaultState $DefaultState)
@@ -851,6 +854,7 @@ function Migrate-LegacyQueueState {
             return
         }
 
+        if (-not $raw.TrimStart().StartsWith('{')) { throw 'Legacy queue state root is not a JSON object.' }
         $legacy = $raw | ConvertFrom-Json
         if ($legacy -is [System.Array] -or $legacy -isnot [pscustomobject]) {
             Write-Log "Legacy queue state '$legacyPath' was not a JSON object; starting with an empty queue." 'WARN'
@@ -2793,13 +2797,21 @@ function Register-OrUpdateTasks {
     }
 }
 
+function Get-MachineMsiProfiles {
+    # Verified vendor MSI identities, not a wildcard over unrelated EXE apps.
+    @(
+        [pscustomobject]@{ PackageId = 'ArtCraft.GridCraft'; UpgradeCode = '{5511327B-F305-41BE-92D0-EB84944E7C4D}'; Executable = 'ArtCraft\GridCraft\gridcraft.exe' }
+        [pscustomobject]@{ PackageId = 'ArtCraft.PdfCraft'; UpgradeCode = '{EA00C367-7270-4C50-9D8B-A7A5C88AD27F}'; Executable = 'ArtCraft\PdfCraft\pdfcraft.exe' }
+    )
+}
+
 function Get-MachineInstallerArguments {
     param([Parameter(Mandatory)][string]$PackageId)
 
     # --scope selects a manifest installer; it does not set MSI properties.
-    # GridCraft's dual-context WiX installer defaults to per-user even though
+    # These vendors' dual-context WiX installers default to per-user even though
     # its winget manifest declares Scope: machine. Append, never --override.
-    if ($PackageId -eq 'ArtCraft.GridCraft') {
+    if (@(Get-MachineMsiProfiles | Where-Object { $_.PackageId -eq $PackageId }).Count -gt 0) {
         return @('--custom', 'ALLUSERS=1')
     }
 }
@@ -2885,6 +2897,7 @@ function Get-MsiRegistrationEvidence {
     $installer = $null
     $database = $null
     $view = $null
+    $lookupResults = @()
     try {
         if ($Registration.Scope -eq 'user' -and -not (Test-RunningAsLocalSystem)) { return }
         if (-not ('Softwarekatalog.NativeMsi' -as [type])) {
@@ -2900,6 +2913,16 @@ namespace Softwarekatalog {
         [DllImport("msi.dll", CharSet = CharSet.Unicode)]
         public static extern int MsiGetComponentPathEx(string product, string component,
             string sid, uint context, StringBuilder path, ref uint length);
+        // PowerShell converts $null to String.Empty for .NET string parameters.
+        // Keep the mandatory native NULL SID inside C#, not at the PS boundary.
+        public static uint GetProductInfo(string product, uint context, string property,
+            StringBuilder value, ref uint length) {
+            return MsiGetProductInfoEx(product, null, context, property, value, ref length);
+        }
+        public static int GetComponentPath(string product, string component, uint context,
+            StringBuilder path, ref uint length) {
+            return MsiGetComponentPathEx(product, component, null, context, path, ref length);
+        }
     }
 }
 '@
@@ -2914,8 +2937,9 @@ namespace Softwarekatalog {
         foreach ($context in $contexts) {
             $buffer = New-Object System.Text.StringBuilder 32768
             $length = [uint32]32768
-            $result = [Softwarekatalog.NativeMsi]::MsiGetProductInfoEx(
-                $Registration.ProductCode, $null, [uint32]$context, 'LocalPackage', $buffer, [ref]$length)
+            $result = [Softwarekatalog.NativeMsi]::GetProductInfo(
+                $Registration.ProductCode, [uint32]$context, 'LocalPackage', $buffer, [ref]$length)
+            $lookupResults += "context=$context Win32=$result"
             if ($result -eq 0) { $cache = $buffer.ToString(); $msiContext = $context; break }
         }
         if (-not $cache) { throw 'No cached MSI in the registered installation context.' }
@@ -2937,8 +2961,8 @@ namespace Softwarekatalog {
                 if ($componentId) {
                     $buffer = New-Object System.Text.StringBuilder 32768
                     $length = [uint32]32768
-                    $state = [Softwarekatalog.NativeMsi]::MsiGetComponentPathEx(
-                        $Registration.ProductCode, $componentId, $null, [uint32]$msiContext, $buffer, [ref]$length)
+                    $state = [Softwarekatalog.NativeMsi]::GetComponentPath(
+                        $Registration.ProductCode, $componentId, [uint32]$msiContext, $buffer, [ref]$length)
                     $pathValue = $buffer.ToString()
                     # Settings in AppData are normal; only executable payloads
                     # are evidence when ARP has no InstallLocation (e.g. WiX).
@@ -2949,7 +2973,10 @@ namespace Softwarekatalog {
         }
         return [pscustomobject]@{ UpgradeCode = $upgradeCode; ExecutablePaths = $paths }
     }
-    catch { Write-Log "Cannot inspect MSI '$($Registration.ProductCode)': $($_.Exception.Message)" 'WARN' }
+    catch {
+        $script:MsiInspectionFailures += $Registration.ProductCode
+        Write-Log "Cannot inspect MSI '$($Registration.ProductCode)' '$($Registration.DisplayName)' scope='$($Registration.Scope)' lookup='$($lookupResults -join '; ')': $($_.Exception.Message)" 'WARN'
+    }
     finally {
         if ($view) { $view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
         if ($database) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
@@ -2988,8 +3015,9 @@ function Find-SystemProfileCatalogApp {
     }
     # Stable vendor MSI identity also works when winget cannot correlate an
     # old user installation. Never infer identity from a folder/display name.
-    if ($evidence -and $evidence.UpgradeCode -eq '{5511327B-F305-41BE-92D0-EB84944E7C4D}') {
-        return $Catalog | Where-Object { $_.PackageId -eq 'ArtCraft.GridCraft' } | Select-Object -First 1
+    if ($evidence) {
+        $profile = Get-MachineMsiProfiles | Where-Object { $_.UpgradeCode -eq $evidence.UpgradeCode } | Select-Object -First 1
+        if ($profile) { return $Catalog | Where-Object { $_.PackageId -eq $profile.PackageId } | Select-Object -First 1 }
     }
 
     # For other packages require an unambiguous ARP name in this scope AND an
@@ -3018,9 +3046,10 @@ function Test-WingetMachineInstallation {
         '--accept-source-agreements', '--disable-interactivity'
     )
     if ($result.ExitCode -ne 0 -or $result.Output -notmatch ('(?m)(?<!\S)' + [regex]::Escape($PackageId) + '(?!\S)')) { return $false }
-    if ($PackageId -eq 'ArtCraft.GridCraft') {
+    $profile = Get-MachineMsiProfiles | Where-Object { $_.PackageId -eq $PackageId } | Select-Object -First 1
+    if ($profile) {
         foreach ($root in @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Select-Object -Unique) {
-            if ($root -and (Test-Path -LiteralPath (Join-Path $root 'ArtCraft\GridCraft\gridcraft.exe'))) { return $true }
+            if ($root -and (Test-Path -LiteralPath (Join-Path $root $profile.Executable))) { return $true }
         }
         return $false
     }
@@ -3068,7 +3097,8 @@ function Add-ScopeRepairIntent {
 
     $entries = @()
     if (Test-Path -LiteralPath $ScopeRepairPath) {
-        $entries = @(Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+        $parsedEntries = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $entries = @($parsedEntries)
     }
     if (@($entries | Where-Object { $_.PackageId -eq $PackageId }).Count -eq 0) {
         $entries += [pscustomobject]@{ PackageId = $PackageId; StartedAt = (Get-Date).ToString('o') }
@@ -3080,6 +3110,7 @@ function Invoke-SystemProfileRepairs {
     param([string]$WingetPath)
 
     $script:ScopeRepairFailures = @()
+    $script:MsiInspectionFailures = @()
     if (-not (Test-SoftwareCatalogPolicyEnabled)) { return }
     if (-not (Test-RunningAsLocalSystem)) {
         throw 'SYSTEM-profile repair must run as LocalSystem.'
@@ -3088,11 +3119,14 @@ function Invoke-SystemProfileRepairs {
     $journal = @()
     if (Test-Path -LiteralPath $ScopeRepairPath) {
         # A corrupt journal must not be silently discarded after an uninstall.
-        $journal = @(Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+        # PS 5.1 emits JSON arrays as one pipeline object; PS 7 enumerates them.
+        $parsedJournal = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $journal = @($parsedJournal)
     }
     $registrations = @(Get-RegisteredApplications)
     $repairs = @{}
-    foreach ($candidate in @(Get-SystemProfileApplications -Registrations $registrations)) {
+    $candidates = @(Get-SystemProfileApplications -Registrations $registrations)
+    foreach ($candidate in $candidates) {
         $app = Find-SystemProfileCatalogApp -WingetPath $WingetPath -Candidate $candidate -Catalog $catalog -Registrations $registrations
         if (-not $app) {
             Write-Log "No unambiguous allowed catalog package for '$($candidate.Registration.DisplayName)'; leaving registration and files untouched." 'WARN'
@@ -3106,6 +3140,7 @@ function Invoke-SystemProfileRepairs {
             $repairs[$entry.PackageId] = @()
         }
     }
+    Write-Log "SYSTEM-profile inventory: registrations=$($registrations.Count) suspects=$($candidates.Count) repairPackages=$($repairs.Count) MSI-inspection-failures=$(@($script:MsiInspectionFailures | Select-Object -Unique).Count)."
     foreach ($packageId in @($repairs.Keys)) {
         try {
             $downloadDir = Join-Path $BaseDir ('Scope-Repair-Download-' + (ConvertTo-SafeQueueFileName -Id $packageId))
@@ -3262,17 +3297,18 @@ function Invoke-WingetUpgradeAll {
     # Upgrade the dual-context package first; once current it is not selected
     # by --all. Do not pin packages or change the user's winget settings.
     $installedSet = Get-InstalledPackageIdSet
-    if ($installedSet.Contains('ArtCraft.GridCraft')) {
+    foreach ($profile in @(Get-MachineMsiProfiles | Where-Object { $installedSet.Contains($_.PackageId) })) {
+        $packageId = $profile.PackageId
         $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments (@(
-            'upgrade', '--id', 'ArtCraft.GridCraft', '--exact', '--source', $WingetSourceName,
+            'upgrade', '--id', $packageId, '--exact', '--source', $WingetSourceName,
             '--scope', 'machine', '--silent', '--accept-package-agreements',
             '--accept-source-agreements', '--disable-interactivity'
-        ) + @(Get-MachineInstallerArguments -PackageId 'ArtCraft.GridCraft'))
+        ) + @(Get-MachineInstallerArguments -PackageId $packageId))
         if ($result.ExitCode -notin @(0, -1978335189)) { # UPDATE_NOT_APPLICABLE
-            throw "GridCraft machine upgrade failed ($($result.ExitCode)); upgrade --all deferred."
+            throw "$packageId machine upgrade failed ($($result.ExitCode)); upgrade --all deferred."
         }
-        if (-not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId 'ArtCraft.GridCraft')) {
-            throw 'GridCraft machine installation could not be verified after upgrade.'
+        if (-not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $packageId)) {
+            throw "$packageId machine installation could not be verified after upgrade."
         }
     }
 
@@ -3973,6 +4009,7 @@ function Invoke-ProcessRequestsMode {
             }
 
             Assert-RequestJsonDepth -Raw $raw -MaxDepth 8
+            if (-not $raw.TrimStart().StartsWith('{')) { throw 'Request JSON must be an object.' }
             $request = $raw | ConvertFrom-Json
             if ($request -is [System.Array] -or $request -isnot [pscustomobject]) {
                 throw 'Request JSON must be an object.'
