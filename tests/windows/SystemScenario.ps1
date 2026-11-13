@@ -66,7 +66,19 @@ try {
             Check (@($evidence).Count -eq 1 -and $evidence -is [pscustomobject]) "MSI evidence must be one record without COM return values (got $types)."
             Check ($evidence.UpgradeCode -eq $config.UpgradeCode) 'Wrong cached MSI identity.'
             $detail = $evidence | ConvertTo-Json -Depth 5 -Compress
-            Check (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -gt 0) "Native component lookup did not find the SYSTEM-profile payload: $detail"
+            if (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -eq 0) {
+                $probes = @()
+                foreach ($sample in @($evidence.ComponentDiagnostics)) {
+                    foreach ($context in @(4, 2, 1)) {
+                        $buffer = New-Object Text.StringBuilder 32768
+                        $length = [uint32]32768
+                        $state = [Softwarekatalog.NativeMsi]::GetComponentPath($config.ProductCode, $sample.ComponentId, [uint32]$context, $buffer, [ref]$length)
+                        $probes += "context=$context state=$state path=$($buffer.ToString())"
+                    }
+                }
+                $msiLog = @(Get-Content (Join-Path $Root 'legacy-install.log') | Select-String 'Feature: Main|Component:|ComponentRegister|RegisterProduct|PublishProduct|PublishComponents|ALLUSERS|MSIINSTALLPERUSER' | Select-Object -Last 12) -join "`n"
+                throw "Native component lookup did not find the SYSTEM-profile payload: $detail; probes=$($probes -join '; '); MSI=$msiLog"
+            }
         }
         Case 'Production repair loop migrates real MSI to Program Files' {
             Invoke-ProcessQueueMode
