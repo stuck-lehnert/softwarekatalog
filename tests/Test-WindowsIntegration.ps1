@@ -2,10 +2,11 @@
 param(
     [Parameter(Mandatory)][switch]$AllowDisposableMachine,
     [Parameter(Mandatory)][string]$WixPath,
-    [string]$ResultsDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'test-results\windows-integration')
+    [string]$ResultsDirectory
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (-not $ResultsDirectory) { $ResultsDirectory = Join-Path (Split-Path $PSScriptRoot -Parent) 'test-results\windows-integration' }
 # This suite creates services' scheduled tasks, policy, a local user and real
 # MSI registrations. Never silently run it on a developer/domain workstation.
 if (-not $AllowDisposableMachine -or $env:OS -ne 'Windows_NT' -or

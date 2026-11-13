@@ -47,7 +47,16 @@ try {
         }
         Case 'Native context-specific MSI cache and component APIs under SYSTEM' {
             $registration = @(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'user' })
-            Check ($registration.Count -gt 0) 'No SYSTEM-user MSI registration.'
+            if ($registration.Count -eq 0) {
+                $contexts = @()
+                foreach ($scope in @('user', 'machine')) {
+                    $probe = [pscustomobject]@{ ProductCode = $config.ProductCode; Scope = $scope; WindowsInstaller = $true; DisplayName = $config.Name }
+                    $native = Get-MsiRegistrationEvidence -Registration $probe
+                    $contexts += "$scope native=$($null -ne $native)"
+                }
+                $arp = @(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode } | ForEach-Object { "$($_.Scope):$($_.InstallLocation)" }) -join '; '
+                throw "No SYSTEM-user MSI registration. $($contexts -join '; '); ARP=$arp"
+            }
             $evidence = Get-MsiRegistrationEvidence -Registration $registration[0]
             Check ($null -ne $evidence) 'Native MSI lookup failed (NULL SID regression).'
             Check ($evidence.UpgradeCode -eq $config.UpgradeCode) 'Wrong cached MSI identity.'

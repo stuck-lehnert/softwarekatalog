@@ -1,7 +1,9 @@
 [CmdletBinding()]
-param([string]$ResultsDirectory = (Join-Path (Split-Path $PSScriptRoot -Parent) 'test-results\unit'))
+param([string]$ResultsDirectory)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# PS5.1 can bind -File parameter defaults before initializing PSScriptRoot.
+if (-not $ResultsDirectory) { $ResultsDirectory = Join-Path (Split-Path $PSScriptRoot -Parent) 'test-results\unit' }
 $executable = if ($PSVersionTable.PSEdition -eq 'Desktop') { 'powershell.exe' } elseif ($env:OS -eq 'Windows_NT') { 'pwsh.exe' } else { 'pwsh' }
 $engine = Join-Path $PSHOME $executable
 New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
