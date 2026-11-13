@@ -33,6 +33,7 @@ if ((Test-Path $base) -or (Test-Path $policy) -or @($tasks | Where-Object { Get-
     @($shortcuts | Where-Object { Test-Path $_ }).Count -gt 0) { throw 'Refusing to overwrite a pre-existing Softwarekatalog installation/policy/task/shortcut.' }
 $root = Join-Path $env:PUBLIC ('Softwarekatalog-CI-' + [Guid]::NewGuid().ToString('N'))
 $taskName = 'Softwarekatalog CI ' + [Guid]::NewGuid().ToString('N')
+$userTaskName = $taskName + ' user'
 $userName = 'SoftkatCi' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $createdDeployment = $false
 $createdUser = $false
@@ -49,7 +50,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1
 function Check($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Record([string]$Name) { $cases.Add([pscustomobject]@{ Name = $Name; Success = $true; Error = '' }); Write-Output "PASS $Name" }
 function Write-CiError([string]$Detail) {
-    if ($Detail.Length -gt 12000) { $Detail = $Detail.Substring($Detail.Length - 12000) }
+    if ($Detail.Length -gt 12000) { $Detail = $Detail.Substring(0, 12000) }
     $Detail = $Detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
     Write-Output "::error title=Windows SYSTEM integration::$Detail"
 }
@@ -149,7 +150,6 @@ try {
     $rule = New-Object Security.AccessControl.FileSystemAccessRule($user.Sid, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
     $acl.AddAccessRule($rule)
     Set-Acl $userOutput $acl
-    Start-Service -Name seclogon
     $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$userName", $password)
     $userResult = Join-Path $userOutput 'result.json'
     $userScript = Join-Path $root 'StandardUserScenario.ps1'
@@ -158,11 +158,28 @@ try {
     # PS5.1 Add-Type uses CodeDOM temporary files. Do not rely on an inherited
     # runner-admin TEMP directory being writable by this real standard user.
     $command = "`$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
+    $userLog = Join-Path $userOutput 'console.log'
+    $command = "& { `$ErrorActionPreference = 'Stop'; $command } *> '$($userLog.Replace("'", "''"))'"
     $arguments = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-    $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $userOutput -PassThru -RedirectStandardOutput (Join-Path $userOutput 'stdout.log') -RedirectStandardError (Join-Path $userOutput 'stderr.log')
-    $handle = $process.Handle
-    if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Standard-user scenario timed out.' }
-    Check ($process.ExitCode -eq 0 -and (Test-Path $userResult)) 'Standard-user scenario failed (see stdout/stderr artifacts).'
+    # PS5.1 CreateProcessWithLogonW + redirected handles fails with error 87 on
+    # hosted service sessions. A password-logon task supplies the real local
+    # user's token without inheriting the runner's handles or admin privileges.
+    $userAction = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument $arguments -WorkingDirectory $userOutput
+    $userSettings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2) -MultipleInstances IgnoreNew
+    Register-ScheduledTask -TaskName $userTaskName -Action $userAction -Settings $userSettings -User $credential.UserName `
+        -Password ($credential.GetNetworkCredential().Password) -RunLevel Limited -Force | Out-Null
+    $lastRun = (Get-ScheduledTaskInfo -TaskName $userTaskName).LastRunTime
+    Start-ScheduledTask -TaskName $userTaskName
+    $deadline = (Get-Date).AddMinutes(2)
+    while ($true) {
+        $info = Get-ScheduledTaskInfo -TaskName $userTaskName
+        $state = (Get-ScheduledTask -TaskName $userTaskName).State
+        if ($info.LastRunTime -gt $lastRun -and $state -notin @('Running', 'Queued')) { break }
+        if ((Get-Date) -gt $deadline) { throw 'Standard-user scheduled scenario timed out.' }
+        Start-Sleep -Milliseconds 200
+    }
+    $userDetail = if (Test-Path $userLog) { (Get-Content $userLog -Tail 40) -join "`n" } else { 'No standard-user console log was written.' }
+    Check ($info.LastTaskResult -eq 0 -and (Test-Path $userResult)) "Standard-user scenario failed (task code $($info.LastTaskResult)): $userDetail"
     $result = Get-Content $userResult -Raw | ConvertFrom-Json
     $userArchitecture = Get-Content -LiteralPath $userArchitecturePath -Raw | ConvertFrom-Json
     Assert-CiArchitectureRecord $userArchitecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
@@ -186,6 +203,10 @@ catch {
     Write-CiError $detail
 }
 finally {
+    if (Get-ScheduledTask -TaskName $userTaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask $userTaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask $userTaskName -Confirm:$false
+    }
     if ($createdDeployment) {
         try { Stop-ProductTasks; Run-SystemPhase Cleanup } catch { $failed = $true; Write-Warning "Fixture cleanup failed: $_" }
     }
