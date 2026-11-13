@@ -103,6 +103,38 @@ function Invoke-WingetInstall {
 }
 
 try {
+    Test 'WinGet discovery prefers native ARM64 over newer emulated packages and PATH aliases' {
+        $arm = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.9.0.0_arm64__8wekyb3d8bbwe\winget.exe'
+        $x64 = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_9.99.0.0_x64__8wekyb3d8bbwe\winget.exe'
+        $alias = 'C:\Users\SYSTEM\AppData\Local\Microsoft\WindowsApps\winget.exe'
+        Assert ((Select-WingetPath -Candidates @($x64, $alias, $arm) -NativeArchitecture arm64) -eq $arm)
+        Assert ((Select-WingetPath -Candidates @($arm, $x64) -NativeArchitecture x64) -eq $x64)
+        Assert ($null -eq (Select-WingetPath -Candidates @($arm, $x64) -NativeArchitecture x86))
+    }
+    Test 'WinGet discovery sorts native package versions numerically and retains supported fallbacks' {
+        $old = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.9.0.0_arm64__8wekyb3d8bbwe\winget.exe'
+        $new = $old.Replace('1.9.0.0', '1.23.0.0')
+        $x64 = $new.Replace('_arm64_', '_x64_')
+        $x86 = $new.Replace('_arm64_', '_x86_')
+        Assert ((Select-WingetPath -Candidates @($old, $new, $new) -NativeArchitecture arm64) -eq $new)
+        Assert ((Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture arm64) -eq $x64)
+        Assert ((Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture x64) -eq $x64)
+        Assert ($null -eq (Select-WingetPath -Candidates @() -NativeArchitecture arm64))
+    }
+    Test 'Native OS architecture is independent of PowerShell process bitness' {
+        if ($env:OS -eq 'Windows_NT') {
+            $actual = Get-NativeWindowsArchitecture
+            Assert ($actual -in @('x86', 'x64', 'arm64'))
+            if ($env:SOFTKAT_EXPECTED_OS_ARCH) { Assert ($actual -eq $env:SOFTKAT_EXPECTED_OS_ARCH) }
+        } else {
+            $architectureSource = @($ast.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                    $node.Value -match 'public static class NativeArchitecture'
+            }, $true))[0].Value
+            if (-not ('Softwarekatalog.NativeArchitecture' -as [type])) { Add-Type -TypeDefinition $architectureSource }
+        }
+    }
     Test 'Native MSI declarations compile and use context-aware APIs' {
         $nativeSource = @($ast.FindAll({
             param($node)

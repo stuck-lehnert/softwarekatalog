@@ -1309,6 +1309,67 @@ function Start-QueueWorkerIfAvailable {
     return (Start-QueueWorker)
 }
 
+function Get-NativeWindowsArchitecture {
+    try {
+        if (-not ('Softwarekatalog.NativeArchitecture' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Softwarekatalog {
+    public static class NativeArchitecture {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool IsWow64Process2(IntPtr process, out ushort processMachine, out ushort nativeMachine);
+        public static ushort GetNativeMachine() {
+            ushort processMachine, nativeMachine;
+            if (!IsWow64Process2(new IntPtr(-1), out processMachine, out nativeMachine))
+                throw new InvalidOperationException("Cannot determine native Windows architecture.");
+            return nativeMachine;
+        }
+    }
+}
+'@
+        }
+        switch ([Softwarekatalog.NativeArchitecture]::GetNativeMachine()) {
+            0xAA64 { return 'arm64' }
+            0x8664 { return 'x64' }
+            0x014c { return 'x86' }
+        }
+    }
+    catch { }
+    # Compatibility fallback for older Windows. W6432 describes the host OS,
+    # unlike PROCESSOR_ARCHITECTURE in an emulated x86/x64 process on ARM64.
+    $architecture = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+    if ($architecture) { return $architecture.ToLowerInvariant().Replace('amd64', 'x64') }
+}
+
+function Select-WingetPath {
+    param([string[]]$Candidates, [string]$NativeArchitecture)
+
+    $preference = switch ($NativeArchitecture) {
+        'arm64' { @('arm64', 'neutral', 'unknown', 'x64', 'x86') }
+        'x64' { @('x64', 'neutral', 'unknown', 'x86') }
+        'x86' { @('x86', 'neutral', 'unknown') }
+        default { @('unknown', 'neutral', 'arm64', 'x64', 'x86') }
+    }
+    $ranked = @()
+    $index = 0
+    foreach ($candidate in @($Candidates | Select-Object -Unique)) {
+        $architecture = 'unknown'
+        $version = [version]'0.0.0.0'
+        if ($candidate -match '(?i)(?:^|[\\/])Microsoft\.DesktopAppInstaller_(?<Version>\d+(?:\.\d+){3})_(?<Architecture>arm64|x64|x86|arm|neutral)_') {
+            $architecture = $Matches.Architecture.ToLowerInvariant()
+            $version = [version]$Matches.Version
+        }
+        $rank = [array]::IndexOf($preference, $architecture)
+        if ($rank -ge 0) {
+            $ranked += [pscustomobject]@{ Path = $candidate; Rank = $rank; Version = $version; Index = $index }
+        }
+        $index++
+    }
+    $selected = $ranked | Sort-Object Rank, @{ Expression = { $_.Version }; Descending = $true }, Index | Select-Object -First 1
+    if ($selected) { return $selected.Path }
+}
+
 function Get-WingetPath {
     $candidates = @()
 
@@ -1336,7 +1397,8 @@ function Get-WingetPath {
     catch {
     }
 
-    $windowsAppsRoot = Join-Path $env:ProgramFiles 'WindowsApps'
+    $nativeProgramFiles = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:ProgramFiles }
+    $windowsAppsRoot = Join-Path $nativeProgramFiles 'WindowsApps'
     if (Test-Path -LiteralPath $windowsAppsRoot) {
         try {
             $items = Get-ChildItem -LiteralPath $windowsAppsRoot -Directory -ErrorAction Stop |
@@ -1354,8 +1416,7 @@ function Get-WingetPath {
         }
     }
 
-    $resolved = $candidates | Select-Object -Unique | Select-Object -First 1
-    return $resolved
+    return (Select-WingetPath -Candidates $candidates -NativeArchitecture (Get-NativeWindowsArchitecture))
 }
 
 function Ensure-WingetAvailable {

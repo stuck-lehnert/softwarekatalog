@@ -74,6 +74,21 @@ using System.Runtime.InteropServices;
 public static class FixtureMsiProbe {
     [DllImport("msi.dll", CharSet = CharSet.Unicode)]
     static extern int MsiGetComponentPath(string product, string component, StringBuilder path, ref uint length);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern uint MsiEnumProductsEx(string product, string sid, uint context, uint index, StringBuilder foundProduct, out uint foundContext, StringBuilder foundSid, ref uint sidLength);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern int MsiGetComponentPathEx(string product, string component, string sid, uint context, StringBuilder path, ref uint length);
+    public static string Enumerate(string product, uint context) {
+        var found = new StringBuilder(39); var sid = new StringBuilder(32768);
+        uint foundContext, size = 32768;
+        uint code = MsiEnumProductsEx(product, null, context, 0, found, out foundContext, sid, ref size);
+        return "enum context=" + context + " code=" + code + " found=" + found + " installedContext=" + foundContext + " SID=" + sid;
+    }
+    public static string SystemUser(string product, string component) {
+        var path = new StringBuilder(32768); uint length = 32768;
+        int state = MsiGetComponentPathEx(product, component, "S-1-5-18", 2, path, ref length);
+        return "explicit SYSTEM user state=" + state + " path=" + path;
+    }
     public static string Classic(string product, string component) {
         var path = new StringBuilder(32768); uint length = 32768;
         int state = MsiGetComponentPath(product, component, path, ref length);
@@ -85,6 +100,7 @@ public static class FixtureMsiProbe {
                 foreach ($sample in @($evidence.ComponentDiagnostics)) {
                     $probes += "product=$($config.ProductCode) component=$($sample.ComponentId)"
                     $probes += [FixtureMsiProbe]::Classic($config.ProductCode, $sample.ComponentId)
+                    $probes += [FixtureMsiProbe]::SystemUser($config.ProductCode, $sample.ComponentId)
                     $com = New-Object -ComObject WindowsInstaller.Installer
                     try { $probes += "COM path=$($com.ComponentPath($config.ProductCode, $sample.ComponentId))" }
                     finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($com) }
@@ -97,6 +113,10 @@ public static class FixtureMsiProbe {
                         $length = [uint32]32768
                         $code = [Softwarekatalog.NativeMsi]::GetProductInfo($config.ProductCode, [uint32]$context, 'LocalPackage', $buffer, [ref]$length)
                         $probes += "context=$context cacheCode=$code"
+                        $length = [uint32]32768
+                        $code = [Softwarekatalog.NativeMsi]::GetProductInfo($config.ProductCode, [uint32]$context, 'State', $buffer, [ref]$length)
+                        $probes += "context=$context productStateCode=$code state=$buffer"
+                        $probes += [FixtureMsiProbe]::Enumerate($config.ProductCode, [uint32]$context)
                     }
                 }
                 $msiLog = @(Get-Content (Join-Path $Root 'legacy-install.log') | Select-String 'Feature: Main|Component:|ComponentRegister|RegisterProduct|PublishProduct|PublishComponents|ALLUSERS|MSIINSTALLPERUSER' | Select-Object -Last 12) -join "`n"
