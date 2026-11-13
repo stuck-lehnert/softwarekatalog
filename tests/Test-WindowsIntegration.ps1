@@ -160,11 +160,16 @@ try {
     $command = "Write-Output 'Standard-user process started'; `$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; Write-Output 'Native architecture verified'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
     $userLog = Join-Path $userOutput 'console.log'
     $command = "& { `$ErrorActionPreference = 'Stop'; $command } *> '$($userLog.Replace("'", "''"))'"
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-    # Never combine PS5.1 credential logon with native redirected handles in a
-    # hosted service session (Win32 error 87). The user process redirects its
-    # own PowerShell streams above; no runner handles are inherited for logs.
-    $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments `
+    # CreateProcessWithLogonW limits the entire command line to 1024 characters.
+    # An encoded inline bootstrap exceeds that limit (Win32 error 87). Keep the
+    # bootstrap in the protected root, not the user-writable output directory.
+    $userBootstrap = Join-Path $root 'Run-StandardUser.ps1'
+    [IO.File]::WriteAllText($userBootstrap, $command, (New-Object Text.UTF8Encoding($true)))
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $userBootstrap + '"'
+    $userEngine = Join-Path $PSHOME 'powershell.exe'
+    Check (($userEngine.Length + $arguments.Length + 4) -lt 1024) 'Credential process command line exceeds the Windows logon API limit.'
+    # Redirect PowerShell streams inside the child; do not inherit runner log handles.
+    $process = Start-Process -FilePath $userEngine -ArgumentList $arguments `
         -Credential $credential -LoadUserProfile -WorkingDirectory $userOutput -PassThru
     $handle = $process.Handle
     if (-not $process.WaitForExit(120000)) {
