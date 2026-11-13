@@ -2912,6 +2912,7 @@ function Test-SystemProfileAppDataPath {
 }
 
 function Get-RegisteredApplications {
+    param([switch]$IncludeUnnamed)
     # Explicit registry views avoid the caller's PowerShell bitness. Do not
     # enumerate ordinary users' hives or use Win32_Product (triggers repairs).
     foreach ($view in @([Microsoft.Win32.RegistryView]::Registry64, [Microsoft.Win32.RegistryView]::Registry32)) {
@@ -2929,7 +2930,7 @@ function Get-RegisteredApplications {
                     if (-not $key) { continue }
                     try {
                         $displayName = [string]$key.GetValue('DisplayName', '')
-                        if (-not $displayName) { continue }
+                        if (-not $displayName -and -not $IncludeUnnamed) { continue }
                         [pscustomobject]@{
                             ProductCode = $name
                             DisplayName = $displayName
@@ -2951,6 +2952,21 @@ function Get-RegisteredApplications {
     }
 }
 
+function Test-MsiClassicLookupSafe {
+    param([Parameter(Mandatory)]$Registration,
+        [object[]]$Registrations = @(Get-RegisteredApplications -IncludeUnnamed))
+
+    # SYSTEM per-user MSIs can have machine ARP entries while every extended
+    # component/enumeration API reports UNKNOWN. Do not use LocalPackage/State
+    # to disambiguate: both contexts can return the same shared SYSTEM data.
+    # Only allow the classic current-user/machine lookup for one registered
+    # scope, including hidden/unnamed ARP records. Never inspect other users.
+    $matches = @($Registrations | Where-Object { $_.ProductCode -eq $Registration.ProductCode })
+    if ($matches.Count -eq 0 -or @($matches | Where-Object { -not $_.WindowsInstaller }).Count -gt 0) { return $false }
+    $scopes = @($matches | Select-Object -ExpandProperty Scope -Unique)
+    return ($scopes.Count -eq 1 -and $scopes[0] -eq $Registration.Scope)
+}
+
 function Get-MsiRegistrationEvidence {
     param([Parameter(Mandatory)]$Registration)
 
@@ -2959,6 +2975,7 @@ function Get-MsiRegistrationEvidence {
     $database = $null
     $view = $null
     $lookupResults = @()
+    $allowClassicLookup = $null
     try {
         if ($Registration.Scope -eq 'user' -and -not (Test-RunningAsLocalSystem)) { return }
         if (-not ('Softwarekatalog.NativeMsi' -as [type])) {
@@ -2985,27 +3002,7 @@ namespace Softwarekatalog {
         }
         public static int GetComponentPath(string product, string component, uint context,
             StringBuilder path, ref uint length) {
-            int state = MsiGetComponentPathEx(product, component, null, context, path, ref length);
-            if (state != -1) return state;
-            // On SYSTEM, ComponentPathEx can report UNKNOWN while the classic
-            // API finds the published component. Never use that context-free
-            // result if this GUID is also registered in another current-user
-            // or machine context, or any context cannot be inspected reliably.
-            uint[] results = new uint[3];
-            uint[] contexts = { 1, 2, 4 };
-            for (int i = 0; i < contexts.Length; i++) {
-                var cache = new StringBuilder(32768); uint size = 32768;
-                results[i] = MsiGetProductInfoEx(product, null, contexts[i], "LocalPackage", cache, ref size);
-            }
-            if (!IsOnlyRegisteredContext(context, results[0], results[1], results[2])) return state;
-            path.Clear(); length = (uint)path.Capacity;
-            return MsiGetComponentPath(product, component, path, ref length);
-        }
-        public static bool IsOnlyRegisteredContext(uint context, uint managed, uint unmanaged, uint machine) {
-            // ERROR_UNKNOWN_PRODUCT (1605) is the only acceptable absence.
-            return (context == 1 && managed == 0 && unmanaged == 1605 && machine == 1605)
-                || (context == 2 && managed == 1605 && unmanaged == 0 && machine == 1605)
-                || (context == 4 && managed == 1605 && unmanaged == 1605 && machine == 0);
+            return MsiGetComponentPathEx(product, component, null, context, path, ref length);
         }
     }
 }
@@ -3049,6 +3046,15 @@ namespace Softwarekatalog {
                     $length = [uint32]32768
                     $state = [Softwarekatalog.NativeMsi]::GetComponentPath(
                         $Registration.ProductCode, $componentId, [uint32]$msiContext, $buffer, [ref]$length)
+                    if ($state -eq -1 -and (Test-RunningAsLocalSystem)) {
+                        if ($null -eq $allowClassicLookup) { $allowClassicLookup = Test-MsiClassicLookupSafe -Registration $Registration }
+                        if ($allowClassicLookup) {
+                            [void]$buffer.Clear()
+                            $length = [uint32]32768
+                            $state = [Softwarekatalog.NativeMsi]::MsiGetComponentPath(
+                                $Registration.ProductCode, $componentId, $buffer, [ref]$length)
+                        }
+                    }
                     $pathValue = $buffer.ToString()
                     if ($componentDiagnostics.Count -lt 5) {
                         $componentDiagnostics += [pscustomobject]@{ ComponentId = $componentId; Context = $msiContext; State = $state; Path = $pathValue }

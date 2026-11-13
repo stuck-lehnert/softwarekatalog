@@ -152,18 +152,21 @@ try {
         Assert ($inventory.Contains('Registry64') -and $inventory.Contains('Registry32'))
         Assert ($inventory.Contains('S-1-5-18\'))
     }
-    Test 'Context-free MSI fallback rejects duplicate GUIDs and uninspectable contexts' {
-        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 1605, 0))
-        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(2, 1605, 0, 1605))
-        Assert ([Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(1, 0, 1605, 1605))
-        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 0, 0)) 'Never take a user path for a machine registration'
-        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(2, 1605, 0, 0))
-        foreach ($errorCode in @(87, 5, 1610, 234)) {
-            Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, $errorCode, 1605, 0))
-            Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, $errorCode, 0))
-        }
-        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(4, 1605, 1605, 1605))
-        Assert (-not [Softwarekatalog.NativeMsi]::IsOnlyRegisteredContext(7, 1605, 1605, 0))
+    Test 'SYSTEM classic MSI lookup rejects ambiguous registrations including unnamed copies' {
+        $machine = New-Registration
+        $machine.Scope = 'machine'
+        $user = New-Registration
+        $user.DisplayName = ''
+        Assert (Test-MsiClassicLookupSafe -Registration $machine -Registrations @($machine))
+        Assert (Test-MsiClassicLookupSafe -Registration $user -Registrations @($user))
+        Assert (-not (Test-MsiClassicLookupSafe -Registration $machine -Registrations @($machine, $user)))
+        Assert (-not (Test-MsiClassicLookupSafe -Registration $user -Registrations @($machine, $user)))
+        Assert (-not (Test-MsiClassicLookupSafe -Registration $machine -Registrations @()))
+        Assert (-not (Test-MsiClassicLookupSafe -Registration $machine -Registrations @($user)))
+        $machine.WindowsInstaller = $false
+        Assert (-not (Test-MsiClassicLookupSafe -Registration $machine -Registrations @($machine)))
+        $inventory = ($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Get-RegisteredApplications' }).Extent.Text
+        Assert ($inventory.Contains('$IncludeUnnamed'))
     }
     Test 'Native MSI failures remain visible with scope and Windows error diagnostics' {
         $script:diagnostics = @()
