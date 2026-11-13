@@ -19,7 +19,7 @@ mkdir -p "$out_dir"
 payload_src="$(mktemp)"
 trap 'rm -f "$payload_src"' EXIT
 printf '# Softwarekatalog build commit: %s\n' "$build_commit" > "$payload_src"
-cat "$src" >> "$payload_src"
+python3 "$(dirname "$0")/bundle-source.py" "$src" >> "$payload_src"
 
 if base64 --help 2>&1 | grep -q -- '-w'; then
   payload="$(base64 -w 0 "$payload_src")"

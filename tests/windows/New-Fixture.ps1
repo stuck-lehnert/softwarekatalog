@@ -113,3 +113,121 @@ if (($template -split ';')[0] -ine $expectedTemplate) { throw "MSI template '$te
 $config['MsiTemplate'] = $template
 $config | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'fixture-config.json') -Encoding UTF8
 Write-Output "Built disposable $Architecture MSI fixture $productCode (template=$template)"
+
+# These are real MSI databases with production ArtCraft profile identities and
+# only the harmless native-process probe as payload. Hash, Authenticode, MSI
+# family and native-architecture checks stay entirely in the production code.
+$catalogSource = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'modules/ArtCraft.Catalog.ps1'
+. ([scriptblock]::Create([IO.File]::ReadAllText($catalogSource, [Text.Encoding]::UTF8)))
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class CiArtCraftExistingProducts {
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    public static extern uint MsiEnumRelatedProducts(string upgradeCode, uint reserved, uint index, StringBuilder productCode);
+}
+'@
+foreach ($definition in @(Get-ArtCraftDefinitions | Where-Object { $_.Alias -in @('gridcraft','pdfcraft','wordcraft') })) {
+    $foundCode = New-Object Text.StringBuilder 39
+    $result = [CiArtCraftExistingProducts]::MsiEnumRelatedProducts($definition.UpgradeCode, 0, 0, $foundCode)
+    if ($result -ne 259) { throw "Refusing pre-existing/uninspectable ArtCraft MSI family: $($definition.Alias), code=$result, product=$foundCode" }
+    if (Test-Path -LiteralPath (Join-Path $env:ProgramFiles (Split-Path $definition.ExecutableRelativePath -Parent))) {
+        throw "Refusing pre-existing ArtCraft target directory: $($definition.Alias)"
+    }
+}
+$artConfigPath = Join-Path $Root 'artcraft-fixture-config.json'
+$artConfig = [ordered]@{ Architecture = $Architecture; CertificateThumbprint = ''; CertificateSubject = ''; Packages = @() }
+$certificate = New-SelfSignedCertificate -Type CodeSigningCert -Subject ('CN=Softwarekatalog Disposable CI ' + $suffix) `
+    -CertStoreLocation 'Cert:\LocalMachine\My' -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+    -KeyExportPolicy NonExportable -NotAfter (Get-Date).AddDays(2)
+$artConfig.CertificateThumbprint = $certificate.Thumbprint
+$artConfig.CertificateSubject = $certificate.Subject
+# Persist ownership before imports/builds can fail: the harness's finally
+# removes precisely this leaf from all three stores and deletes its private key.
+$artConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $artConfigPath -Encoding UTF8
+$publicCertificate = Join-Path $Root 'artcraft-ci.cer'
+Export-Certificate -Cert $certificate -FilePath $publicCertificate | Out-Null
+foreach ($store in @('Cert:\LocalMachine\Root', 'Cert:\LocalMachine\TrustedPublisher')) {
+    Import-Certificate -FilePath $publicCertificate -CertStoreLocation $store | Out-Null
+}
+
+function Build-ArtCraftFixtureMsi($Definition, [string]$Version, [string]$ProductCode, [string]$OutputPath) {
+    $exe = Join-Path $Root ($Definition.Alias + '.exe')
+    if (-not (Test-Path -LiteralPath $exe)) { Copy-Item -LiteralPath (Join-Path $Root 'fixture.exe') -Destination $exe }
+    $exeXml = [Security.SecurityElement]::Escape($exe)
+    $parts = [string[]]($Definition.ExecutableRelativePath -split '\\')
+    $directoryXml = ''
+    for ($i = 0; $i -lt $parts.Length - 1; $i++) {
+        $id = if ($i -eq $parts.Length - 2) { 'INSTALLFOLDER' } else { 'Parent' + $i }
+        $directoryXml += '<Directory Id="' + $id + '" Name="' + $parts[$i] + '">'
+    }
+    for ($i = 0; $i -lt $parts.Length - 1; $i++) { $directoryXml += '</Directory>' }
+    $text = @"
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="$($Definition.DisplayName)" Manufacturer="Softwarekatalog CI" Version="$Version" ProductCode="$ProductCode" UpgradeCode="$($Definition.UpgradeCode)" Scope="perUserOrMachine" Compressed="yes">
+    <MediaTemplate EmbedCab="yes" />
+    <MajorUpgrade DowngradeErrorMessage="A newer fixture is already installed." />
+    <SetProperty Id="ARPINSTALLLOCATION" Value="[INSTALLFOLDER]" After="CostFinalize" Sequence="execute" />
+    <StandardDirectory Id="ProgramFiles64Folder">$directoryXml</StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder" />
+    <Feature Id="Main" Level="1">
+      <Component Directory="INSTALLFOLDER" Guid="*">
+        <File Source="$exeXml" KeyPath="yes">
+          <Shortcut Id="ArtCraftShortcut" Directory="ProgramMenuFolder" Name="Softwarekatalog CI $($Definition.DisplayName) $suffix" Advertise="yes" />
+        </File>
+      </Component>
+    </Feature>
+  </Package>
+</Wix>
+"@
+    $sourcePath = $OutputPath + '.wxs'
+    [IO.File]::WriteAllText($sourcePath, $text)
+    $p = Start-Process -FilePath $WixPath -ArgumentList ('build -arch {0} -o "{1}" "{2}"' -f $Architecture, $OutputPath, $sourcePath) `
+        -PassThru -RedirectStandardOutput ($OutputPath + '.stdout.log') -RedirectStandardError ($OutputPath + '.stderr.log')
+    $h = $p.Handle
+    if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'ArtCraft fixture MSI build timed out.' }
+    if ($p.ExitCode -ne 0) { throw "ArtCraft fixture build failed: $(Get-Content ($OutputPath + '.stderr.log') -Raw)" }
+    $actualTemplate = [Softwarekatalog.CiMsiSummary]::ReadTemplate($OutputPath)
+    if (($actualTemplate -split ';')[0] -ine $Architecture) { throw "Wrong ArtCraft MSI architecture: $actualTemplate" }
+    $signature = Set-AuthenticodeSignature -LiteralPath $OutputPath -Certificate $certificate -HashAlgorithm SHA256
+    if ($signature.Status -ne 'Valid' -or (Get-AuthenticodeSignature -LiteralPath $OutputPath).Status -ne 'Valid') {
+        throw "Real fixture MSI Authenticode verification failed: $($signature.StatusMessage)"
+    }
+}
+
+foreach ($alias in @('gridcraft', 'pdfcraft', 'wordcraft')) {
+    $definition = Get-ArtCraftDefinitions | Where-Object Alias -eq $alias
+    $machinePath = Join-Path $env:ProgramFiles (Split-Path $definition.ExecutableRelativePath -Parent)
+    if (Test-Path -LiteralPath $machinePath) { throw "Refusing pre-existing ArtCraft path: $machinePath" }
+    $oldCode = '{' + [Guid]::NewGuid().ToString().ToUpperInvariant() + '}'
+    $newCode = '{' + [Guid]::NewGuid().ToString().ToUpperInvariant() + '}'
+    $oldMsi = Join-Path $Root ("$alias-1.0.0-windows-$Architecture.msi")
+    $assetName = "$alias-1.1.0-windows-$Architecture.msi"
+    $newMsi = Join-Path $Root $assetName
+    Build-ArtCraftFixtureMsi $definition '1.0.0' $oldCode $oldMsi
+    Build-ArtCraftFixtureMsi $definition '1.1.0' $newCode $newMsi
+    $artConfig.Packages += [pscustomobject]@{
+        Alias = $alias; PackageId = $definition.PackageId; DisplayName = $definition.DisplayName
+        UpgradeCode = $definition.UpgradeCode; Repository = $definition.Repository; Architecture = $Architecture
+        OldProductCode = $oldCode; ProductCode = $newCode; OldMsi = $oldMsi; Msi = $newMsi
+        Version = '1.1.0'; Tag = 'v1.1.0'; AssetName = $assetName
+        Sha256 = (Get-FileHash -LiteralPath $newMsi -Algorithm SHA256).Hash.ToLowerInvariant()
+        MachineDir = $machinePath; Executable = Join-Path $env:ProgramFiles $definition.ExecutableRelativePath
+        LegacyDir = Join-Path $env:SystemRoot ("System32\config\systemprofile\AppData\Local\Programs\ArtCraftCi-$suffix-$alias")
+        ShortcutName = "Softwarekatalog CI $($definition.DisplayName) $suffix"
+    }
+    $artConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $artConfigPath -Encoding UTF8
+}
+# Seed GridCraft through the same deterministic native CLI adapter used by the
+# pre-existing WinGet integration lane, not by inventing an installed snapshot.
+# Its mutation still runs real msiexec and records an actual old-provider call.
+$gridFixture = $artConfig.Packages | Where-Object Alias -eq gridcraft
+$adapterRoot = Join-Path $Root 'artcraft-old-winget'
+New-Item -Path $adapterRoot -ItemType Directory | Out-Null
+$gridFixture | Add-Member -NotePropertyName LegacyWingetAdapter -NotePropertyValue (Join-Path $adapterRoot 'winget-fixture.exe')
+Copy-Item -LiteralPath (Join-Path $Root 'winget-fixture.exe') -Destination $gridFixture.LegacyWingetAdapter
+@{ Root = $adapterRoot; ProductCode = $gridFixture.OldProductCode; PackageId = $gridFixture.PackageId; Name = $gridFixture.DisplayName
+    MachineDir = $gridFixture.MachineDir; Msi = $gridFixture.OldMsi; LegacyDir = $gridFixture.LegacyDir } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $adapterRoot 'fixture-config.json') -Encoding UTF8
+$artConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $artConfigPath -Encoding UTF8

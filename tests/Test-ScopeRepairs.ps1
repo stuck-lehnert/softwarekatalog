@@ -2,6 +2,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'setup.ps1'
+. ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Split-Path $sourcePath -Parent) 'modules/ArtCraft.Catalog.ps1'), [Text.Encoding]::UTF8)))
+. ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Split-Path $sourcePath -Parent) 'modules/ArtCraft.Provider.ps1'), [Text.Encoding]::UTF8)))
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)
@@ -424,7 +426,7 @@ try {
             }
         } finally { $env:ProgramFiles = $oldProgramFiles }
     }
-    Test 'Upgrade handles GridCraft and PdfCraft with ALLUSERS before generic upgrade --all' {
+    Test 'Legacy WinGet upgrades use individual ALLUSERS commands without a competing blanket upgrade' {
         Set-Content $script:InstalledPackagesPath -Value '{"InstalledPackageIds":["ArtCraft.GridCraft","ArtCraft.PdfCraft"]}'
         $script:machineInstalled = $true
         function Invoke-WingetQuery {
@@ -437,7 +439,8 @@ try {
         Assert ((Invoke-WingetUpgradeAll Fake-Winget) -eq 0)
         Assert ($script:events[0] -match '^upgrade --id ArtCraft.GridCraft .*--custom ALLUSERS=1')
         Assert ($script:events[1] -match '^upgrade --id ArtCraft.PdfCraft .*--custom ALLUSERS=1')
-        Assert ($script:events[2] -match '^upgrade --all')
+        Assert ($script:events.Count -eq 2)
+        Assert (@($script:events | Where-Object { $_ -match '--all' }).Count -eq 0)
         $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
         Assert-Throws { Invoke-WingetUpgradeAll Fake-Winget } 'repairs failed'
     }

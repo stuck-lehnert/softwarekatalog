@@ -1,9 +1,15 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Root, [ValidateSet('Lifecycle','Requests','Cleanup')][string]$Phase, [string]$ExpectedUserSid)
+param([Parameter(Mandatory)][string]$Root,
+    [ValidateSet('Lifecycle','Requests','Cleanup','ArtCraft','ArtCraftInterrupt','ArtCraftResume','ArtCraftCleanup')][string]$Phase,
+    [string]$ExpectedUserSid)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) { throw 'This scenario must really run as SYSTEM.' }
 if (-not (Test-Path -LiteralPath (Join-Path $Root '.disposable-ci-fixture'))) { throw 'Missing disposable fixture marker.' }
+if ($Phase -like 'ArtCraft*') {
+    & (Join-Path $PSScriptRoot 'ArtCraftScenario.ps1') -Root $Root -Phase $Phase
+    return
+}
 $config = Get-Content -LiteralPath (Join-Path $Root 'fixture-config.json') -Raw | ConvertFrom-Json
 $installedScript = Join-Path $env:ProgramData '__Softwarekatalog\SelfServiceWinget.ps1'
 $source = [IO.File]::ReadAllText($installedScript)

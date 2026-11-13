@@ -10,11 +10,13 @@
     </stringTable>
     <presentationTable>
       <presentation id="Softwarekatalog_Settings">
+        <checkBox refId="EnableArtCraft" defaultChecked="false">Offer ArtCraft applications (direct stable vendor releases)</checkBox>
         <checkBox refId="AllowUserInstalls">Allow users to install software</checkBox>
         <checkBox refId="AllowUserUninstall">Allow users to uninstall software</checkBox>
         <checkBox refId="EnforceRequired">Automatically install required software</checkBox>
         <listBox refId="Catalog">Allowed software. Name = alias, value = PackageId|DisplayName|Description.</listBox>
-        <listBox refId="Required">Required software. Name = catalog alias, value = 1.</listBox>
+        <text>ArtCraft needs no individual catalog entries. When enabled, use the short names photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft, designcraft, texturecraft, materialcraft, wordcraft, soundcraft, deckcraft, cadcraft and gridcraft.</text>
+        <listBox refId="Required">Required software. Name = catalog alias or ArtCraft short name (e.g. pdfcraft), value = 1.</listBox>
       </presentation>
     </presentationTable>
   </resources>

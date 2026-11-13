@@ -68,7 +68,7 @@ function Stop-ProductTasks {
     } while ((Get-Date) -lt $deadline)
     throw 'Production tasks did not stop in time.'
 }
-function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
+function Run-SystemPhase([string]$Phase, [string]$Sid = '', [switch]$ExpectInterrupted) {
     $scriptPath = Join-Path $PSScriptRoot 'windows\SystemScenario.ps1'
     $architecturePath = Join-Path $root "$Phase.architecture.json"
     # Architecture assertion and scenario execute in the SAME scheduled process.
@@ -83,10 +83,15 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
     $lastRun = (Get-ScheduledTaskInfo -TaskName $taskName).LastRunTime
     Start-ScheduledTask -TaskName $taskName
     $deadline = (Get-Date).AddMinutes(8)
+    $wasInterrupted = $false
     while (-not (Test-Path -LiteralPath $resultPath)) {
         if ((Get-Date) -gt $deadline) { throw "SYSTEM phase timed out: $Phase" }
         $info = Get-ScheduledTaskInfo -TaskName $taskName
         if ($info.LastRunTime -gt $lastRun -and (Get-ScheduledTask -TaskName $taskName).State -notin @('Running', 'Queued')) {
+            if ($ExpectInterrupted -and $Phase -eq 'ArtCraftInterrupt' -and (Test-Path -LiteralPath (Join-Path $root 'artcraft-interruption.json'))) {
+                $wasInterrupted = $true
+                break
+            }
             throw "SYSTEM phase '$Phase' exited without a result (task code $($info.LastTaskResult))."
         }
         Start-Sleep -Milliseconds 250
@@ -95,11 +100,20 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
         if ((Get-Date) -gt $deadline) { throw "SYSTEM phase did not exit: $Phase" }
         Start-Sleep -Milliseconds 200
     }
-    $result = Get-Content $resultPath -Raw | ConvertFrom-Json
     $systemArchitecture = Get-Content -LiteralPath $architecturePath -Raw | ConvertFrom-Json
     Assert-CiArchitectureRecord $systemArchitecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
     Check ($systemArchitecture.Sid -eq 'S-1-5-18') 'Architecture proof did not come from the actual SYSTEM token.'
     Record "Native $ExpectedArchitecture SYSTEM process ($Phase)"
+    if ($wasInterrupted) {
+        $interruption = Get-Content -LiteralPath (Join-Path $root 'artcraft-interruption.json') -Raw | ConvertFrom-Json
+        $word = $artConfig.Packages | Where-Object Alias -eq wordcraft
+        Check ($interruption.ProcessId -eq $systemArchitecture.ProcessId -and $interruption.ProductCode -eq $word.OldProductCode -and $interruption.ExitCode -in @(0,3010)) 'Interruption was not the bounded successful-removal process boundary.'
+        Check ((Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult -ne 0) 'Interrupted process unexpectedly returned success.'
+        Record 'Real SYSTEM process terminated immediately after successful MSI removal'
+        return
+    }
+    Check (-not $ExpectInterrupted) 'Expected removal-boundary process termination did not happen.'
+    $result = Get-Content $resultPath -Raw | ConvertFrom-Json
     foreach ($case in @($result.Cases)) { $cases.Add($case) }
     Check ($result.Identity -match '(?i)SYSTEM$') 'Scheduled scenario did not run as SYSTEM.'
     $errors = @($result.Cases | Where-Object { -not $_.Success } | ForEach-Object { $_.Error }) -join "`n"
@@ -108,6 +122,7 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
 try {
     & (Join-Path $PSScriptRoot 'windows\New-Fixture.ps1') -Root $root -WixPath $WixPath -Architecture $ExpectedArchitecture
     $config = Get-Content (Join-Path $root 'fixture-config.json') -Raw | ConvertFrom-Json
+    $artConfig = Get-Content (Join-Path $root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json
     Check ($config.Architecture -eq $ExpectedArchitecture -and ($config.MsiTemplate -split ';')[0] -ieq $ExpectedArchitecture) 'Fixture MSI architecture does not match the native lane.'
     Record "Matching native $ExpectedArchitecture MSI package template"
     New-Item -Path "$policy\Catalog" -Force | Out-Null
@@ -135,6 +150,9 @@ try {
     foreach ($path in $shortcuts) { Check (Test-Path $path) "All-users catalog shortcut missing: $path" }
     Record 'Actual distribution deployment, task principals/settings, generated runtime and shortcuts'
     Run-SystemPhase Lifecycle
+    Run-SystemPhase ArtCraft
+    Run-SystemPhase ArtCraftInterrupt -ExpectInterrupted
+    Run-SystemPhase ArtCraftResume
 
     # Create a real non-admin account; never use the runner's elevated token
     # as a substitute for testing NTFS/registry enforcement.
@@ -155,9 +173,34 @@ try {
     $userScript = Join-Path $root 'StandardUserScenario.ps1'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows\StandardUserScenario.ps1') -Destination $userScript
     $userArchitecturePath = Join-Path $userOutput 'architecture.json'
+    $artUserResult = Join-Path $userOutput 'artcraft.json'
+    $artUserScript = Join-Path $root 'StandardUser-ArtCraft.ps1'
+    # Keep the existing real standard-user scenario unchanged. This additional
+    # protected bootstrap verifies all three custom-installed MSI payloads and
+    # their all-users shortcuts using that SAME non-administrator token.
+    $artUserSource = @'
+param([string]$Root, [string]$OutputPath)
+$ErrorActionPreference = 'Stop'
+$config = Get-Content -LiteralPath (Join-Path $Root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json
+$checks = @()
+foreach ($package in @($config.Packages)) {
+    $output = & $package.Executable 2>&1 | Out-String
+    $checks += [pscustomobject]@{ Alias = $package.Alias; ExitCode = $LASTEXITCODE; Output = $output
+        SharedShortcut = Test-Path -LiteralPath (Join-Path ([Environment]::GetFolderPath('CommonPrograms')) ($package.ShortcutName + '.lnk')) }
+}
+$denials = @()
+foreach ($path in @((Join-Path $env:ProgramData '__Softwarekatalog\ArtCraft\State.json'), (Join-Path $env:ProgramData '__Softwarekatalog\ArtCraft\Cache\user-injected.msi'))) {
+    $blocked = $false
+    try { [IO.File]::WriteAllText($path, 'tamper attempt') } catch [UnauthorizedAccessException] { $blocked = $true }
+    $denials += [pscustomobject]@{ Path = $path; Blocked = $blocked }
+}
+[pscustomobject]@{ Checks = $checks; Denials = $denials } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
+'@
+    [IO.File]::WriteAllText($artUserScript, $artUserSource, (New-Object Text.UTF8Encoding($true)))
     # PS5.1 Add-Type uses CodeDOM temporary files. Do not rely on an inherited
     # runner-admin TEMP directory being writable by this real standard user.
     $command = "Write-Output 'Standard-user process started'; `$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; Write-Output 'Native architecture verified'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
+    $command += "; & '$($artUserScript.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -OutputPath '$($artUserResult.Replace("'", "''"))'"
     $userLog = Join-Path $userOutput 'console.log'
     $command = "& { `$ErrorActionPreference = 'Stop'; $command } *> '$($userLog.Replace("'", "''"))'"
     # CreateProcessWithLogonW limits the entire command line to 1024 characters.
@@ -190,6 +233,12 @@ try {
     Check ($result.SharedShortcut -and $result.LaunchExitCode -eq 0 -and $result.LaunchOutput -match 'fixture OK') 'Machine MSI was not accessible to the second standard user.'
     Check ($result.LaunchOutput -match "process=$ExpectedArchitecture; os=$ExpectedArchitecture; native=True") 'The installed MSI executable did not prove native execution under the standard-user token.'
     Record 'Real standard-user ACL enforcement, policy protection and all-users executable/shortcut access'
+    $artUser = Get-Content -LiteralPath $artUserResult -Raw | ConvertFrom-Json
+    Check (@($artUser.Checks).Count -eq 3 -and @($artUser.Denials | Where-Object { -not $_.Blocked }).Count -eq 0) 'ArtCraft protected state/cache was writable by standard user.'
+    foreach ($check in @($artUser.Checks)) {
+        Check ($check.ExitCode -eq 0 -and $check.SharedShortcut -and $check.Output -match "process=$ExpectedArchitecture; os=$ExpectedArchitecture; native=True") "Custom MSI/shortcut was not accessible and native for standard user: $($check.Alias)"
+    }
+    Record 'Real standard-user native ArtCraft launches/all-users shortcuts and custom state/cache ACL enforcement'
     Run-SystemPhase Requests $user.Sid.Value
 }
 catch {
@@ -203,7 +252,28 @@ catch {
 }
 finally {
     if ($createdDeployment) {
+        if (Test-Path -LiteralPath (Join-Path $root 'artcraft-fixture-config.json')) {
+            try { Stop-ProductTasks; Run-SystemPhase ArtCraftCleanup } catch { $failed = $true; Write-Warning "ArtCraft fixture cleanup failed: $_" }
+        }
         try { Stop-ProductTasks; Run-SystemPhase Cleanup } catch { $failed = $true; Write-Warning "Fixture cleanup failed: $_" }
+    }
+    # Revoke the fixture trust before any artifact/user/task operation that
+    # might itself throw. Native fixture removals above are individually caught.
+    if (Test-Path -LiteralPath (Join-Path $root 'artcraft-fixture-config.json')) {
+        $ownedCertificate = (Get-Content -LiteralPath (Join-Path $root 'artcraft-fixture-config.json') -Raw | ConvertFrom-Json).CertificateThumbprint
+        if ($ownedCertificate -match '^[A-Fa-f0-9]{40}$') {
+            foreach ($store in @('Root','TrustedPublisher','My')) {
+                try {
+                    $certificatePath = "Cert:\LocalMachine\$store\$ownedCertificate"
+                    if (Test-Path -LiteralPath $certificatePath) {
+                        if ($store -eq 'My') { Remove-Item -LiteralPath $certificatePath -DeleteKey -Force -ErrorAction Stop }
+                        else { Remove-Item -LiteralPath $certificatePath -Force -ErrorAction Stop }
+                    }
+                    Check (-not (Test-Path -LiteralPath $certificatePath)) 'Disposable fixture publisher remained trusted after cleanup.'
+                }
+                catch { $failed = $true; Write-Warning "Could not remove disposable fixture certificate/key from ${store}: $_" }
+            }
+        }
     }
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { Stop-ScheduledTask $taskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask $taskName -Confirm:$false }
     if ($createdDeployment) {

@@ -4,6 +4,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $sourcePath = Join-Path (Split-Path $PSScriptRoot -Parent) 'setup.ps1'
+. ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Split-Path $sourcePath -Parent) 'modules/ArtCraft.Catalog.ps1'), [Text.Encoding]::UTF8)))
+. ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Split-Path $sourcePath -Parent) 'modules/ArtCraft.Provider.ps1'), [Text.Encoding]::UTF8)))
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$parseErrors)

@@ -10,11 +10,13 @@
     </stringTable>
     <presentationTable>
       <presentation id="Softwarekatalog_Settings">
+        <checkBox refId="EnableArtCraft" defaultChecked="false">ArtCraft-Anwendungen anbieten (direkte stabile Hersteller-Releases)</checkBox>
         <checkBox refId="AllowUserInstalls">Benutzer duerfen Software installieren</checkBox>
         <checkBox refId="AllowUserUninstall">Benutzer duerfen Software deinstallieren</checkBox>
         <checkBox refId="EnforceRequired">Pflichtsoftware automatisch installieren</checkBox>
         <listBox refId="Catalog">Freigegebene Software. Name = Alias, Wert = PackageId|DisplayName|Description.</listBox>
-        <listBox refId="Required">Pflichtsoftware. Name = Alias aus Katalog, Wert = 1.</listBox>
+        <text>ArtCraft benötigt keine einzelnen Katalog-Einträge. Bei aktivierter Checkbox sind die Kurznamen photocraft, vectorcraft, filmcraft, lightcraft, pdfcraft, effectcraft, designcraft, texturecraft, materialcraft, wordcraft, soundcraft, deckcraft, cadcraft und gridcraft verfügbar.</text>
+        <listBox refId="Required">Pflichtsoftware. Name = Katalog-Alias oder ArtCraft-Kurzname (z.B. pdfcraft), Wert = 1.</listBox>
       </presentation>
     </presentationTable>
   </resources>

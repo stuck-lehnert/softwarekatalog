@@ -21,6 +21,9 @@ does not request larger or paid custom runner sizes.
 | Scope regression | Same engine matrix | Detection, identity correlation, MSI switch profiles, guarded uninstall/reinstall, recovery journal, PS5.1 JSON behavior, false-success rejection, snapshot filtering, upgrade ordering, native-before-emulated WinGet selection and numerical package-version ordering, the native NULL-SID bridge contract and a real read-only MSI lookup of a random unknown product (must return UNKNOWN_PRODUCT, not INVALID_PARAMETER) |
 | SYSTEM integration | Server 2022/2025 x64 and Windows 11 ARM64, native PS5.1 and actual SYSTEM scheduled tasks | Deploy the real built bootstrap, compare the installed payload byte-for-byte, inspect task principals/settings and generated files/shortcuts; matching x64/ARM64 MSI with per-user defaults in SYSTEM AppData, inspecting its actual ARP scope; native cache/component lookups; migrate to Program Files and remove the old executable; second-pass idempotence; actual queued uninstall/reinstall; required-software restoration |
 | Standard-user integration | New local non-admin token on the same disposable VM | Create requests using the generated helper; spoofed requester metadata cannot replace the real NTFS owner; tampering with privileged script/queue/journal/another owner's request and HKLM policy is denied; unapproved/oversized/array-root/required-uninstall requests are quarantined; the machine MSI executable and shared shortcut are accessible |
+| ArtCraft regression | Same seven native/intentional-x86 unit lanes | Exact built-in catalog and aliases, Required protection, provider dispatch without WinGet, atomic merged inventory, ownership after opt-out, release/redirect/download bounds, SHA256/publisher/MSI identity, cache failure classification, migration state/recovery and legacy repair intents |
+| ArtCraft SYSTEM migration | Same three native SYSTEM platforms | Signed native fixture MSIs, healthy WinGet-to-custom adoption without reinstall/network, normal MSI upgrade, SYSTEM-AppData repair, Required shortnames without per-app GPO, WinGet exclusion after opt-out; kill the real SYSTEM worker immediately after successful uninstall and recover in a new SYSTEM process with the checkbox off |
+| Real ArtCraft vendor trust | Native Server 2025 x64 and Windows 11 ARM64, actual SYSTEM | Read-only official stable download, release SHA256, Windows Authenticode Valid, exact approved publisher DN, pinned UpgradeCode and native MSI architecture/version; no fixture transport/signature override, MSI execution or vendor installation |
 
 `fail-fast: false` keeps other matrix jobs running after a failure so their
 diagnostics are not lost. The stable **`CI passed`** check only succeeds when
@@ -87,7 +90,23 @@ Template** to require `x64`/`Arm64`, respectively. The managed AnyCPU payload
 uses the native .NET Framework CLR and refuses successful emulated execution;
 this is not an x64 MSI relabeled as ARM64. Fixture configuration and architecture
 evidence are retained with diagnostics.
-No ArtCraft application, vendor account or paid installer is downloaded.
+The deterministic MSI fixture does not download or install ArtCraft applications.
+The separate vendor-trust lanes download real installers but **never execute**
+them. Every push/PR checks MaterialCraft (small stable package); weekly scheduled
+runs and manual `all_artcraft=true` dispatches verify all 14 applications on both
+native architectures. This separates reproducible migration correctness from
+upstream availability and real Windows certificate-chain validation. The
+`CI passed` gate includes vendor trust; network/publisher failures are not
+silently accepted. Only small reports/logs, not vendor installers, are uploaded.
+
+ArtCraft migration fixtures additionally use the production GridCraft/PdfCraft/
+WordCraft family GUIDs and expected native install paths, with six small signed
+MSIs for versions 1.0.0/1.1.0. The harness refuses pre-existing matching products
+or directories. It trusts a disposable test certificate only on the throwaway
+runner and removes it in cleanup. Only HTTP transport and the explicitly approved
+fixture signer are substituted; production hash/AuthentiCode/MSI validation,
+registry readers and MSI execution remain real. These fixture results are not
+claims that all vendor applications have been installed or launched successfully.
 Under SYSTEM, Windows Installer can register this per-user-default installation
 in machine ARP despite its SYSTEM AppData payload. The test deliberately follows
 the observed registration scope; install path alone is not a scope assertion.

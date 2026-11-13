@@ -19,6 +19,10 @@
         <decimal value="0" />
       </disabledValue>
       <elements>
+        <boolean id="EnableArtCraft" valueName="EnableArtCraft">
+          <trueValue><decimal value="1" /></trueValue>
+          <falseValue><decimal value="0" /></falseValue>
+        </boolean>
         <boolean id="AllowUserInstalls" valueName="AllowUserInstalls">
           <trueValue>
             <decimal value="1" />

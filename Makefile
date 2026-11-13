@@ -4,7 +4,7 @@ POWERSHELL ?= pwsh
 
 dist: dist/setup.ps1
 
-dist/setup.ps1: setup.ps1 scripts/build-dist.sh
+dist/setup.ps1: setup.ps1 scripts/build-dist.sh scripts/bundle-source.py $(wildcard modules/*.ps1)
 	./scripts/build-dist.sh setup.ps1 dist/setup.ps1
 
 test:

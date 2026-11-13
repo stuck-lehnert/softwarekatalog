@@ -1,8 +1,8 @@
 # Softwarekatalog
 
-Windows self-service software catalog backed by `winget`.
+Windows self-service software catalog with WinGet and direct ArtCraft providers.
 
-Users install approved software through a small GUI or request helper. User tools write request files to a controlled drop directory. A SYSTEM scheduled task validates those requests against Group Policy, queues approved work, then runs a SYSTEM `winget` worker.
+Users install approved software through a small GUI or request helper. User tools write request files to a controlled drop directory. A SYSTEM scheduled task validates those requests against Group Policy, queues approved work, then runs the appropriate SYSTEM provider.
 
 ## What It Does
 
@@ -12,8 +12,8 @@ Users install approved software through a small GUI or request helper. User tool
 - Blocks user removal of required software.
 - Queues install, uninstall, and upgrade actions.
 - Shows current queue task and progress in the GUI.
-- Runs `winget upgrade --all` every 2 hours.
-- Tracks installed state from `winget export`, not from request history.
+- Checks software updates every 2 hours, separately for each provider.
+- Tracks installed state from WinGet export and verified ArtCraft MSI inventory, not request history.
 - Detects registered applications installed into SYSTEM's AppData and repairs
   unambiguously identified, policy-approved packages by uninstalling/reinstalling.
 - Polls user request files every minute; no long-lived user-facing daemon is required.
@@ -51,6 +51,63 @@ alias = 1
 ```
 
 The client reads up to 500 catalog entries and 500 required entries.
+
+## ArtCraft: current vendor releases and migration
+
+Enable **ArtCraft-Anwendungen anbieten** in the Softwarekatalog GPO
+(`EnableArtCraft` DWORD = `1` at the policy root; default off). Global `Enabled`
+must also be on. This offers all 14 applications with the supplied German
+descriptions, without individual `Catalog` registry entries. Enabling the
+checkbox does **not** install all applications.
+
+Use these existing **Required software / Verpflichtende Programme** aliases:
+
+```text
+photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft designcraft
+texturecraft materialcraft wordcraft soundcraft deckcraft cadcraft gridcraft
+```
+
+For example, `Required\gridcraft = 1` installs GridCraft automatically when
+required-software enforcement is enabled. The full application table and
+security/migration design are in [the provider design](docs/artcraft-provider-plan.md).
+
+The provider resolves the latest stable release in each official `storytold/*`
+repository; it does not wait for WinGet manifests. It selects the **native x64
+or ARM64 MSI**, requires the release SHA256, Windows Authenticode `Valid`, the
+approved full publisher identity, the pinned MSI UpgradeCode and matching MSI
+version/architecture. Missing or invalid releases fail closed, without silently
+using emulation or an untrusted installer. Dual-context installers receive
+`ALLUSERS=1`; TextureCraft and MaterialCraft use their per-machine profiles.
+
+**Existing WinGet-managed installations migrate automatically on the next
+SYSTEM queue pass after opt-in:**
+
+- A verified healthy machine installation is adopted without network access or
+  unnecessary uninstall/reinstall. Subsequent updates use the direct provider.
+- A proven SYSTEM-AppData or wrong-architecture copy is removed using its exact
+  registered MSI identity only **after** the new installer has been downloaded
+  and completely verified. A machine install is then verified against the real
+  registry/MSI scope, native architecture and expected Program Files executable.
+- Ownership and recovery stages are atomically retained under
+  `C:\ProgramData\__Softwarekatalog\ArtCraft\State.json`. The next SYSTEM worker
+  resumes an interrupted migration, even if the old product is already gone.
+  Earlier `Scope-Repairs.json` intents are bridged into this migration as well.
+- WinGet upgrades run per package, never `upgrade --all`, and skip custom-owned
+  ArtCraft IDs. Old policy aliases still resolve to the same application.
+
+Disabling the checkbox removes built-in offers and stops new installs/updates;
+it does not uninstall applications, discard ownership or let WinGet take them
+back. Already-destructive recovery is still completed safely. Explicit old
+WinGet policy entries that have never been adopted remain compatible.
+
+Verified cached installers support transport-outage recovery; hash, signer,
+identity or missing-native-asset errors never become a cache bypass. The GUI
+shows provider, installed/target version, last check, stale metadata/error and
+restart status. No downgrade, forced reboot, arbitrary registry uninstall
+command, directory deletion or migration of ordinary users' installations is
+performed. Do not delete either recovery journal after a failed migration.
+Pilot production rollout: the CI exercises real Windows/MSI/security boundaries
+with signed small fixtures, while real vendor downloads are verified read-only.
 
 ## Install
 
@@ -92,7 +149,10 @@ For `ArtCraft.GridCraft` and `ArtCraft.PdfCraft`, the vendor's dual-context MSI 
 The client therefore **appends** `--custom "ALLUSERS=1"` to its machine install
 and upgrade commands. It does not use `--override`, change WinGet settings,
 or send MSI properties to unrelated EXE installers. These verified MSI packages
-are upgraded individually with that property before the general `upgrade --all` pass.
+are upgraded individually with that property. All remaining WinGet packages
+are also upgraded individually, excluding IDs owned by the ArtCraft provider.
+This legacy WinGet path applies only where the direct provider has not adopted
+the package; the opt-in ArtCraft provider above is preferred for current releases.
 
 References checked for GridCraft 0.16.0 and PDFCraft 0.18.1:
 
@@ -211,7 +271,8 @@ harness on a normal workstation.
 
 ## Notes
 
-- Requires Windows, Desktop App Installer, and `winget`.
+- Requires Windows. WinGet packages additionally require Desktop App Installer
+  and `winget`; direct ArtCraft operations can continue if WinGet is unavailable.
 - Catalog installs, uninstalls, exports, and automatic upgrades explicitly target
   the `winget` community source, so an unavailable Microsoft Store source does not block them.
 - SYSTEM scheduled tasks validate and execute requests; keep catalog policy restricted to trusted admins.

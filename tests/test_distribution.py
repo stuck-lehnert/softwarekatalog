@@ -23,8 +23,16 @@ class DistributionTests(unittest.TestCase):
             match = re.search(rb"\$Payload = @'\r?\n([^\r\n]+)\r?\n'@", wrapper)
             self.assertIsNotNone(match)
             payload = base64.b64decode(match[1], validate=True)
+            source = (ROOT / "setup.ps1").read_text(encoding="utf-8-sig")
+            modules = "\n\n".join((ROOT / "modules" / n).read_text(encoding="utf-8-sig").rstrip("\r\n")
+                                  for n in ("ArtCraft.Catalog.ps1", "ArtCraft.Provider.ps1")) + "\n"
+            expected = re.sub(r"(?ms)^# <SoftwarekatalogModules>\n.*?^# </SoftwarekatalogModules>\n",
+                              lambda _: modules, source)
             self.assertEqual(payload, b"# Softwarekatalog build commit: ci-build-marker\n" +
-                             (ROOT / "setup.ps1").read_bytes())
+                             expected.encode("utf-8"))
+            self.assertIsNone(re.search(rb"(?m)^# <SoftwarekatalogModules>", payload))
+            self.assertIn(b"function Get-ArtCraftDefinitions", payload)
+            self.assertIn(b"function Invoke-ArtCraftInstall", payload)
             for parameter in ("Mode", "RequestAction", "AppAlias", "RequestedBy", "RequestedBySid"):
                 self.assertIn(("-" + parameter + " $" + parameter).encode(), wrapper)
             self.assertIn(b"finally", wrapper)

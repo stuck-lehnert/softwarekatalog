@@ -83,6 +83,14 @@ $script:SoftwarekatalogBuildCommit = $null
 $script:ScopeRepairFailures = @()
 $script:MsiInspectionFailures = @()
 
+# <SoftwarekatalogModules>
+# The distribution builder replaces this source-only loader with both modules.
+foreach ($module in @('ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
+    $modulePath = Join-Path (Join-Path $PSScriptRoot 'modules') $module
+    . ([scriptblock]::Create([IO.File]::ReadAllText($modulePath, [Text.Encoding]::UTF8)))
+}
+# </SoftwarekatalogModules>
+
 # ----------------------------
 # Utility functions
 # ----------------------------
@@ -328,7 +336,7 @@ function Get-PolicyStringValues {
     }
 }
 
-function Get-AppCatalogObjects {
+function Get-PolicyCatalogObjects {
     if (-not (Test-SoftwareCatalogPolicyEnabled)) {
         return @()
     }
@@ -375,6 +383,11 @@ function Get-AppCatalogObjects {
             PackageId   = $packageId
         }
     }
+}
+
+function Get-AppCatalogObjects {
+    if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
+    Merge-ArtCraftCatalog -PolicyApps @(Get-PolicyCatalogObjects)
 }
 
 function Get-RequiredAliases {
@@ -1055,7 +1068,9 @@ function Update-QueueItemProgress {
 
 function Get-RequiredAliasSet {
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($alias in @(Get-RequiredAliases)) {
+    $aliases = @(Get-RequiredAliases)
+    if ($aliases.Count -eq 0) { return ,$set }
+    foreach ($alias in @(Expand-RequiredCatalogAliases -Aliases $aliases -Catalog @(Get-AppCatalogObjects))) {
         if (-not [string]::IsNullOrWhiteSpace($alias)) {
             [void]$set.Add([string]$alias)
         }
@@ -1461,11 +1476,34 @@ function Ensure-WingetAvailable {
     return $null
 }
 
+function Get-ArtCraftClientFunctionText {
+    # Render the actual shared functions, not another hand-maintained product list.
+    $names = @('Get-ArtCraftDefinitions', 'Test-ArtCraftEnabled', 'Write-CatalogPolicyWarning',
+        'Merge-ArtCraftCatalog', 'Expand-RequiredCatalogAliases', 'Test-SoftwareCatalogPolicyEnabled', 'Get-AppCatalogObjects')
+    return (($names | ForEach-Object {
+        "function $_ {`n$((Get-Command $_ -CommandType Function).ScriptBlock.ToString())`n}"
+    }) -join "`n`n")
+}
+
+function Get-BundledSoftwarekatalogSource {
+    param([Parameter(Mandatory)][string]$Path)
+    $source = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    $pattern = '(?ms)^# <SoftwarekatalogModules>\r?\n.*?^# </SoftwarekatalogModules>\r?\n'
+    $match = [regex]::Match($source, $pattern)
+    if (-not $match.Success) { return $source } # already bundled deployment
+    $root = Split-Path $Path -Parent
+    $modules = foreach ($name in @('ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
+        [IO.File]::ReadAllText((Join-Path (Join-Path $root 'modules') $name), [Text.Encoding]::UTF8).TrimEnd([char[]]"`r`n")
+    }
+    return $source.Substring(0, $match.Index) + ($modules -join "`n`n") + "`n" + $source.Substring($match.Index + $match.Length)
+}
+
 function New-UserRequestTool {
     $requestsLiteral = $RequestsDir.Replace("'", "''")
     $policyRootLiteral = $PolicyRoot.Replace("'", "''")
     $policyCatalogLiteral = $PolicyCatalogRoot.Replace("'", "''")
     $policyMaxEntriesLiteral = $PolicyMaxEntries
+    $artCraftFunctions = Get-ArtCraftClientFunctionText
 
 $content = @"
 [CmdletBinding()]
@@ -1484,6 +1522,8 @@ Set-StrictMode -Version Latest
 `$PolicyRoot = '$policyRootLiteral'
 `$PolicyCatalogRoot = '$policyCatalogLiteral'
 `$PolicyMaxEntries = $policyMaxEntriesLiteral
+
+$artCraftFunctions
 
 function Get-PolicyDword {
     param([Parameter(Mandatory=`$true)][string]`$Name, [int]`$Default = 0)
@@ -1528,7 +1568,7 @@ function Get-PolicyStringValues {
     }
 }
 
-function Get-AppCatalogObjects {
+function Get-PolicyCatalogObjects {
     if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
 
     foreach (`$row in Get-PolicyStringValues -Path `$PolicyCatalogRoot) {
@@ -1584,7 +1624,7 @@ if (`$Uninstall) {
 
 if (`$List) {
     Write-Host 'Freigegebene Anwendungen:'
-    @(Get-AppCatalogObjects) | Sort-Object DisplayName | ForEach-Object {
+    @(Get-AppCatalogObjects) | Where-Object Visible | Sort-Object DisplayName | ForEach-Object {
         Write-Host (" - {0} [{1}] : {2}" -f `$_.DisplayName, `$_.Alias, `$_.Description)
     }
     exit 0
@@ -1624,6 +1664,7 @@ function New-CatalogGui {
     $policyCatalogLiteral = $PolicyCatalogRoot.Replace("'", "''")
     $policyRequiredLiteral = $PolicyRequiredRoot.Replace("'", "''")
     $policyMaxEntriesLiteral = $PolicyMaxEntries
+    $artCraftFunctions = Get-ArtCraftClientFunctionText
 
 $content = @"
 Add-Type -AssemblyName System.Windows.Forms
@@ -1688,6 +1729,7 @@ Set-StrictMode -Version Latest
 `$PolicyCatalogRoot = '$policyCatalogLiteral'
 `$PolicyRequiredRoot = '$policyRequiredLiteral'
 `$PolicyMaxEntries = $policyMaxEntriesLiteral
+$artCraftFunctions
 `$AllowUserInstalls = `$true
 `$AllowUserUninstall = `$true
 `$RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -1758,8 +1800,8 @@ function Invoke-CatalogLocal {
             return [pscustomobject]@{
                 Success = `$true
                 Command = `$commandName
-                Catalog = @(Get-AppCatalogObjects | Sort-Object DisplayName)
-                RequiredAliases = @(Get-RequiredAliases)
+                Catalog = @(Get-AppCatalogObjects | Where-Object Visible | Sort-Object DisplayName)
+                RequiredAliases = @(Expand-RequiredCatalogAliases -Aliases @(Get-RequiredAliases) -Catalog @(Get-AppCatalogObjects))
                 Queue = @(`$queueState.Queue)
                 Current = `$queueState.Current
                 Version = `$queueState.Version
@@ -1836,7 +1878,7 @@ function Get-PolicyStringValues {
     }
 }
 
-function Get-AppCatalogObjects {
+function Get-PolicyCatalogObjects {
     if (-not (Test-SoftwareCatalogPolicyEnabled)) { return @() }
 
     foreach (`$row in Get-PolicyStringValues -Path `$PolicyCatalogRoot) {
@@ -1960,6 +2002,7 @@ function Get-InstalledPackageState {
     `$state = [ordered]@{
         GeneratedAt = `$null
         PackageSet  = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        Details = @()
     }
 
     if (-not (Test-Path -LiteralPath `$InstalledPackagesPath)) {
@@ -1973,6 +2016,7 @@ function Get-InstalledPackageState {
         }
 
         `$snapshot = `$raw | ConvertFrom-Json
+        if (`$snapshot.PSObject.Properties['Packages']) { `$state.Details = @(`$snapshot.Packages) }
         if (`$snapshot.GeneratedAt) {
             `$state.GeneratedAt = [string]`$snapshot.GeneratedAt
         }
@@ -2133,6 +2177,9 @@ Set-FormIcon -Form `$form
 [void]`$list.Columns.Add('Status', 150)
 [void]`$list.Columns.Add('Alias', 110)
 [void]`$list.Columns.Add('Paket-ID', 100)
+[void]`$list.Columns.Add('Version / Ziel', 150)
+[void]`$list.Columns.Add('Quelle', 90)
+`$list.ShowItemToolTips = `$true
 `$list.BorderStyle = 'None'
 `$list.HeaderStyle = 'Clickable'
 
@@ -2260,6 +2307,22 @@ function Load-AppList {
             [void]`$item.SubItems.Add(`$state)
             [void]`$item.SubItems.Add(`$app.Alias)
             [void]`$item.SubItems.Add(`$app.PackageId)
+            `$detail = @(`$installedState.Details | Where-Object { `$_.PackageId -eq `$app.PackageId } | Select-Object -First 1)
+            `$versionText = ''
+            `$providerText = [string]`$app.Provider
+            if (`$detail.Count) {
+                `$d = `$detail[0]
+                `$versionText = [string]`$d.Version
+                `$providerText = [string]`$d.Provider
+                if (`$d.LatestVersion -and `$d.LatestVersion -ne `$d.Version) { `$versionText += ' / ' + `$d.LatestVersion }
+                `$checked = if (`$d.LastCheckedUtc) { [string]`$d.LastCheckedUtc } else { 'Versionsstand nicht aktuell geprüft' }
+                `$item.ToolTipText = "ArtCraft-Prüfung: `$checked"
+                if (`$d.PSObject.Properties['MetadataStale'] -and `$d.MetadataStale) { `$item.ToolTipText += "`nOffline: letzter geprüfter Versionsstand (veraltet)." }
+                if (`$d.LastError) { `$item.ToolTipText += "`nFehler: `$(`$d.LastError)" }
+                if (`$d.RebootRequired) { `$item.ToolTipText += "`nNeustart erforderlich." }
+            }
+            [void]`$item.SubItems.Add(`$versionText)
+            [void]`$item.SubItems.Add(`$providerText)
             `$item.Tag = `$app
 
             if (`$state -eq 'Installiert') {
@@ -3219,7 +3282,7 @@ function Invoke-SystemProfileRepairs {
     if (-not (Test-RunningAsLocalSystem)) {
         throw 'SYSTEM-profile repair must run as LocalSystem.'
     }
-    $catalog = @(Get-AppCatalogObjects)
+    $catalog = @(Get-AppCatalogObjects | Where-Object { -not (Test-ArtCraftManagedPackage -PackageId $_.PackageId) })
     $journal = @()
     if (Test-Path -LiteralPath $ScopeRepairPath) {
         # A corrupt journal must not be silently discarded after an uninstall.
@@ -3397,62 +3460,40 @@ function Invoke-WingetUpgradeAll {
     if ($script:ScopeRepairFailures.Count -gt 0) {
         throw "Automatic upgrades deferred because SYSTEM-profile repairs failed: $($script:ScopeRepairFailures -join ', ')."
     }
-    # The general --all command cannot append package-specific MSI properties.
-    # Upgrade the dual-context package first; once current it is not selected
-    # by --all. Do not pin packages or change the user's winget settings.
+    # Never follow provider filtering with --all: winget would rediscover the
+    # custom-managed MSI and become a competing updater. No global pins/settings.
+    $failure = 0
     $installedSet = Get-InstalledPackageIdSet
-    foreach ($profile in @(Get-MachineMsiProfiles | Where-Object { $installedSet.Contains($_.PackageId) })) {
-        $packageId = $profile.PackageId
+    foreach ($packageId in @($installedSet | Sort-Object)) {
+        if (Test-ArtCraftManagedPackage -PackageId $packageId) { continue }
+        if ($packageId -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]{1,255}$') {
+            Write-Log "Unsafe exported package identifier ignored: '$packageId'." 'WARN'
+            continue
+        }
+        if ($QueueItemId) {
+            Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText "Updates: $packageId" -IsIndeterminate:$true
+        }
         $result = Invoke-WingetQuery -WingetPath $WingetPath -Arguments (@(
             'upgrade', '--id', $packageId, '--exact', '--source', $WingetSourceName,
             '--scope', 'machine', '--silent', '--accept-package-agreements',
             '--accept-source-agreements', '--disable-interactivity'
         ) + @(Get-MachineInstallerArguments -PackageId $packageId))
-        if ($result.ExitCode -notin @(0, -1978335189)) { # UPDATE_NOT_APPLICABLE
-            throw "$packageId machine upgrade failed ($($result.ExitCode)); upgrade --all deferred."
+        if ($result.ExitCode -notin @(0, -1978335189, -1978335212)) { # current / no machine match
+            Write-Log "$packageId machine upgrade failed ($($result.ExitCode))." 'ERROR'
+            $failure = $result.ExitCode
         }
-        if (-not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $packageId)) {
+        if (@(Get-MachineMsiProfiles | Where-Object { $_.PackageId -eq $packageId }).Count -gt 0 -and
+            -not (Test-WingetMachineInstallation -WingetPath $WingetPath -PackageId $packageId)) {
             throw "$packageId machine installation could not be verified after upgrade."
         }
     }
-
-    $arguments = @(
-        'upgrade'
-        '--all'
-        '--source', $WingetSourceName
-        '--scope', 'machine'
-        '--silent'
-        '--accept-package-agreements'
-        '--accept-source-agreements'
-        '--disable-interactivity'
-    )
-
-    Write-Log "Executing 2-hour upgrade: `"$WingetPath`" $($arguments -join ' ')"
-    if ($QueueItemId) {
-        Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText 'Updates laufen...' -IsIndeterminate:$true
-    }
-
-    Set-WingetOutputEncoding
-    & $WingetPath @arguments 2>&1 | ForEach-Object {
-        $line = [string]$_
-        $displayLine = ConvertTo-WingetOutputLine -Line $line
-        if ($displayLine) { Write-Log "winget upgrade: $displayLine" }
-
-        if ($QueueItemId) {
-            $percent = Get-ProgressPercentFromLine -Line $line
-            if ($null -ne $percent) {
-                Update-QueueItemProgress -Id $QueueItemId -Stage 'Upgrade' -StageText ("Updates laufen... {0}%" -f $percent) -ProgressPercent $percent -IsIndeterminate:$false
-            }
-        }
-    }
-    $exitCode = $LASTEXITCODE
-
-    return $exitCode
+    return $failure
 }
 
-function Update-InstalledPackagesSnapshot {
+function Update-WingetPackagesSnapshot {
     param(
         [Parameter(Mandatory)][string]$WingetPath,
+        [Parameter(Mandatory)][string]$DestinationPath,
         [string]$QueueItemId
     )
 
@@ -3460,7 +3501,7 @@ function Update-InstalledPackagesSnapshot {
 
     $tempRoot = if ($env:TEMP) { $env:TEMP } elseif ($env:TMP) { $env:TMP } else { $BaseDir }
     $tempFile = Join-Path $tempRoot ("selfservice-winget-export-{0}.json" -f [Guid]::NewGuid().ToString('N'))
-    $snapshotTempFile = Join-Path $BaseDir ("Installed-Packages-{0}.json.tmp" -f [Guid]::NewGuid().ToString('N'))
+    $snapshotTempFile = "$DestinationPath.tmp"
 
     $arguments = @(
         'export'
@@ -3539,8 +3580,8 @@ function Update-InstalledPackagesSnapshot {
         }
 
         $snapshot | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $snapshotTempFile -Encoding UTF8
-        Move-Item -LiteralPath $snapshotTempFile -Destination $InstalledPackagesPath -Force
-        Write-Log "Installed package snapshot written to '$InstalledPackagesPath' (count=$(@($packageIds).Count))."
+        Move-Item -LiteralPath $snapshotTempFile -Destination $DestinationPath -Force
+        Write-Log "WinGet inventory staging written to '$DestinationPath' (count=$(@($packageIds).Count))."
         return $true
     }
     catch {
@@ -3555,6 +3596,76 @@ function Update-InstalledPackagesSnapshot {
             Remove-Item -LiteralPath $snapshotTempFile -Force -ErrorAction SilentlyContinue
         }
     }
+}
+
+function Update-InstalledPackagesSnapshot {
+    param([AllowEmptyString()][string]$WingetPath, [string]$QueueItemId)
+
+    # Validate ownership/inventory before changing the published snapshot.
+    $ownership = @(Get-ArtCraftOwnership)
+    $inventory = if ((Test-ArtCraftEnabled) -or $ownership.Count -gt 0) { @(Get-ArtCraftInventory) } else { @() }
+    $previous = @()
+    if (Test-Path -LiteralPath $InstalledPackagesPath) {
+        try {
+            $raw = Get-Content -LiteralPath $InstalledPackagesPath -Raw -Encoding UTF8
+            if (-not $raw.TrimStart().StartsWith('{')) { throw 'Snapshot root must be an object.' }
+            $loaded = $raw | ConvertFrom-Json
+            if (-not $loaded.PSObject.Properties['InstalledPackageIds']) { throw 'Snapshot ID list is missing.' }
+            $previous = @($loaded.InstalledPackageIds)
+        }
+        catch {
+            $quarantine = Join-Path $BaseDir ('Installed-Packages.corrupt-' + [Guid]::NewGuid().ToString('N') + '.json')
+            Move-Item -LiteralPath $InstalledPackagesPath -Destination $quarantine -ErrorAction Stop
+            Write-Log "Corrupt installed snapshot quarantined to '$quarantine': $($_.Exception.Message)" 'WARN'
+        }
+    }
+    $wingetRefreshed = $false
+    $staging = Join-Path $BaseDir ('winget-snapshot-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    try {
+        if ($WingetPath) {
+            $wingetRefreshed = Update-WingetPackagesSnapshot -WingetPath $WingetPath -DestinationPath $staging -QueueItemId $QueueItemId
+            if ($wingetRefreshed) {
+                $loaded = Get-Content -LiteralPath $staging -Raw -Encoding UTF8 | ConvertFrom-Json
+                $previous = @($loaded.InstalledPackageIds)
+            }
+        }
+        $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($id in $previous) {
+            if ($id -and -not (Test-ArtCraftManagedPackage -PackageId $id) -and $id -notin $script:ScopeRepairFailures) { [void]$ids.Add($id) }
+        }
+        foreach ($record in $inventory) { if ($record.Healthy) { [void]$ids.Add($record.PackageId) } }
+        $packages = foreach ($definition in Get-ArtCraftDefinitions) {
+            $records = @($inventory | Where-Object { $_.PackageId -eq $definition.PackageId })
+            $owner = @($ownership | Where-Object { $_.PackageId -eq $definition.PackageId } | Select-Object -First 1)
+            if ($records.Count -eq 0 -and $owner.Count -eq 0) { continue }
+            $record = @($records | Sort-Object Healthy -Descending | Select-Object -First 1)
+            [pscustomobject]@{
+                PackageId = $definition.PackageId; Provider = 'ArtCraft'
+                Version = if ($record.Count) { [string]$record[0].Version } else { '' }
+                Architecture = if ($record.Count) { [string]$record[0].Architecture } else { '' }
+                Healthy = ($record.Count -gt 0 -and $record[0].Healthy)
+                LatestVersion = if ($owner.Count) { Get-QueueObjectValue $owner[0] 'LatestVersion' '' } else { '' }
+                LastCheckedUtc = if ($owner.Count) { Get-QueueObjectValue $owner[0] 'LastCheckedUtc' '' } else { '' }
+                LastError = if ($owner.Count) { Get-QueueObjectValue $owner[0] 'LastError' '' } else { '' }
+                MetadataStale = if ($owner.Count) { [bool](Get-QueueObjectValue $owner[0] 'MetadataStale' $false) } else { $false }
+                RebootRequired = if ($owner.Count) { [bool](Get-QueueObjectValue $owner[0] 'RebootRequired' $false) } else { $false }
+            }
+        }
+        $snapshot = [ordered]@{ GeneratedAt = (Get-Date).ToString('o'); InstalledPackageIds = @($ids | Sort-Object)
+            WingetRefreshed = $wingetRefreshed; Packages = @($packages) }
+        $temp = "$InstalledPackagesPath.$([Guid]::NewGuid().ToString('N')).tmp"
+        try {
+            $snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding UTF8
+            if (Test-Path -LiteralPath $InstalledPackagesPath) {
+                [IO.File]::Replace($temp, $InstalledPackagesPath, [System.Management.Automation.Language.NullString]::Value)
+            }
+            else { [IO.File]::Move($temp, $InstalledPackagesPath) }
+        }
+        finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
+        Write-Log "Installed package snapshot written to '$InstalledPackagesPath' (count=$($ids.Count), ArtCraft=$(@($inventory | Where-Object Healthy).Count), wingetRefreshed=$wingetRefreshed)."
+        return $true
+    }
+    finally { if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force } }
 }
 
 function Get-InstalledPackageIdSet {
@@ -3603,7 +3714,7 @@ function Invoke-RequiredSoftwarePolicy {
         return [pscustomobject]@{ Installed = 0; Failed = 0; Skipped = 0 }
     }
 
-    if ($WingetPath) {
+    if ($WingetPath -or (Test-ArtCraftEnabled) -or @(Get-ArtCraftOwnership).Count -gt 0) {
         try {
             Invoke-WithWingetLock -TimeoutSeconds 2 -ScriptBlock {
                 $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath
@@ -3748,14 +3859,19 @@ function Complete-QueueItem {
 function Invoke-QueuedItem {
     param(
         [Parameter(Mandatory)]$Item,
-        [Parameter(Mandatory)][string]$WingetPath
+        [AllowEmptyString()][string]$WingetPath
     )
 
     if ($Item.Action -eq 'UpgradeAll') {
-        $exitCode = Invoke-WingetUpgradeAll -WingetPath $WingetPath -QueueItemId $Item.Id
+        $exitCode = Invoke-ArtCraftUpdates
+        if ($WingetPath) {
+            $wingetCode = Invoke-WingetUpgradeAll -WingetPath $WingetPath -QueueItemId $Item.Id
+            if ($wingetCode -ne 0) { $exitCode = $wingetCode }
+        }
         $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath -QueueItemId $Item.Id
-        if ($exitCode -eq 0) {
-            Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message 'Updates abgeschlossen.'
+        if ($exitCode -in @(0, 3010)) {
+            $message = if ($exitCode -eq 3010) { 'Updates abgeschlossen. Neustart erforderlich.' } else { 'Updates abgeschlossen.' }
+            Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message $message
         }
         else {
             Complete-QueueItem -Id $Item.Id -State Failed -ExitCode $exitCode -Message "Updates fehlgeschlagen (Code $exitCode)."
@@ -3779,13 +3895,21 @@ function Invoke-QueuedItem {
         throw "SYSTEM-profile repair of '$($app.PackageId)' failed; see service.log."
     }
 
+    $custom = Test-ArtCraftManagedPackage -PackageId $app.PackageId
     $installedSet = Get-InstalledPackageIdSet
-    if ($Item.Action -eq 'Install' -and $installedSet.Contains([string]$app.PackageId)) {
+    if (-not $custom -and $Item.Action -eq 'Install' -and $installedSet.Contains([string]$app.PackageId)) {
         Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode 0 -Message 'Bereits installiert.'
         return
     }
 
-    if ($Item.Action -eq 'Install') {
+    if ($custom) {
+        if ($Item.Action -eq 'Install') { $exitCode = Invoke-ArtCraftInstall -PackageId $app.PackageId -QueueItemId $Item.Id }
+        else { $exitCode = Invoke-ArtCraftUninstall -PackageId $app.PackageId -QueueItemId $Item.Id }
+    }
+    elseif (-not $WingetPath) {
+        throw 'WinGet ist für dieses Paket nicht verfügbar; ArtCraft bleibt unabhängig nutzbar.'
+    }
+    elseif ($Item.Action -eq 'Install') {
         $exitCode = Invoke-WingetInstall -WingetPath $WingetPath -PackageId ([string]$app.PackageId) -QueueItemId $Item.Id
     }
     else {
@@ -3793,11 +3917,34 @@ function Invoke-QueuedItem {
     }
 
     $null = Update-InstalledPackagesSnapshot -WingetPath $WingetPath -QueueItemId $Item.Id
-    if ($exitCode -eq 0) {
-        Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message 'Abgeschlossen.'
+    if ($exitCode -in @(0, 3010)) {
+        $message = if ($exitCode -eq 3010) { 'Abgeschlossen. Neustart erforderlich.' } else { 'Abgeschlossen.' }
+        Complete-QueueItem -Id $Item.Id -State Succeeded -ExitCode $exitCode -Message $message
     }
     else {
         Complete-QueueItem -Id $Item.Id -State Failed -ExitCode $exitCode -Message "Fehlgeschlagen (Code $exitCode)."
+    }
+}
+
+function Invoke-ArtCraftLegacyRepairMigration {
+    # A previous deployment may have removed a package under the old WinGet
+    # repair journal already. Carry that intent into the direct provider too.
+    if (-not (Test-Path -LiteralPath $ScopeRepairPath)) { return }
+    $raw = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8
+    if (-not $raw.TrimStart().StartsWith('[')) { throw 'Invalid legacy scope repair journal root.' }
+    $parsed = $raw | ConvertFrom-Json
+    $journal = @($parsed)
+    foreach ($entry in @($journal)) {
+        if (-not (Test-ArtCraftManagedPackage -PackageId $entry.PackageId)) { continue }
+        $code = Invoke-ArtCraftInstall -PackageId $entry.PackageId
+        if ($code -notin @(0, 3010)) {
+            Write-Log "Legacy WinGet repair intent retained for custom provider '$($entry.PackageId)' (code=$code)." 'ERROR'
+            $script:ScopeRepairFailures += $entry.PackageId
+            continue
+        }
+        $journal = @($journal | Where-Object { $_.PackageId -ne $entry.PackageId })
+        Write-ScopeRepairJournal -Entries $journal
+        Write-Log "Legacy WinGet repair intent migrated to ArtCraft provider: '$($entry.PackageId)'."
     }
 }
 
@@ -3808,15 +3955,17 @@ function Invoke-ProcessQueueMode {
 
     $wingetPath = Ensure-WingetAvailable
     if (-not $wingetPath) {
-        Write-Log 'Aborting queue processing because winget is unavailable.' 'ERROR'
-        return
+        Write-Log 'WinGet unavailable; direct ArtCraft inventory/requests remain enabled.' 'WARN'
     }
 
     Invoke-WithWingetLock -ScriptBlock {
         [void](Reset-RunningQueueItems)
         # Run before the installed-state shortcut and before upgrade --all.
         # Also resumes durable reinstall intents after an interrupted repair.
-        Invoke-SystemProfileRepairs -WingetPath $wingetPath
+        $providerCode = Initialize-ArtCraftProvider
+        if ($providerCode -notin @(0, 3010)) { Write-Log "ArtCraft adoption/recovery reported code $providerCode; inspect provider state and service.log." 'ERROR' }
+        if ($wingetPath) { Invoke-SystemProfileRepairs -WingetPath $wingetPath }
+        Invoke-ArtCraftLegacyRepairMigration
         $null = Update-InstalledPackagesSnapshot -WingetPath $wingetPath
         $null = Ensure-RequiredSoftwareQueued
 
@@ -3842,7 +3991,7 @@ function Invoke-UpgradeAllMode {
     Ensure-Directory -Path $BaseDir
     Ensure-Directory -Path $LogDir
 
-    $item = New-QueueItem -Action UpgradeAll -DisplayName 'winget upgrade --all' -Source System -RequestedBy 'System' -RequestedBySid 'System'
+    $item = New-QueueItem -Action UpgradeAll -DisplayName 'Softwareupdates (WinGet + ArtCraft)' -Source System -RequestedBy 'System' -RequestedBySid 'System'
     $result = Add-QueueItem -Item $item -TimeoutSeconds 5
 
     if ($result.Added) {
@@ -4202,6 +4351,9 @@ function Install-Service {
     Publish-QueueStateSnapshot
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
+    $artCraftRoot = Join-Path $BaseDir 'ArtCraft'
+    Ensure-Directory -Path $artCraftRoot
+    Set-DirectoryAcl -Path $artCraftRoot -UsersCanModify:$false
     Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $QueueRootDir -UsersCanModify:$false
     Set-DirectoryAcl -Path $QueuePendingDir -UsersCanModify:$false
@@ -4216,7 +4368,7 @@ function Install-Service {
         throw 'PSCommandPath is empty; cannot determine the source script path.'
     }
 
-    Copy-Item -LiteralPath $PSCommandPath -Destination $LocalScriptPath -Force
+    Write-TextFile -Path $LocalScriptPath -Content (Get-BundledSoftwarekatalogSource -Path $PSCommandPath) -Encoding Utf8Bom
     Set-FileAclAdminsOnly -Path $LocalScriptPath
 
     New-UserRequestTool
