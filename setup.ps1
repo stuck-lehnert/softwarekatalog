@@ -2946,14 +2946,14 @@ namespace Softwarekatalog {
         $installer = New-Object -ComObject WindowsInstaller.Installer
         $database = $installer.OpenDatabase($cache, 0) # Read-only, never install/repair.
         $view = $database.OpenView('SELECT `Value` FROM `Property` WHERE `Property` = ''UpgradeCode''')
-        $view.Execute()
+        [void]$view.Execute()
         $record = $view.Fetch()
         $upgradeCode = if ($record) { [string]$record.StringData(1) } else { '' }
         if ($record) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) }
-        $view.Close()
+        [void]$view.Close()
         [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view)
         $view = $database.OpenView('SELECT `ComponentId` FROM `Component`')
-        $view.Execute()
+        [void]$view.Execute()
         $paths = @()
         while ($null -ne ($record = $view.Fetch())) {
             try {
@@ -2978,7 +2978,7 @@ namespace Softwarekatalog {
         Write-Log "Cannot inspect MSI '$($Registration.ProductCode)' '$($Registration.DisplayName)' scope='$($Registration.Scope)' lookup='$($lookupResults -join '; ')': $($_.Exception.Message)" 'WARN'
     }
     finally {
-        if ($view) { $view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
+        if ($view) { [void]$view.Close(); [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) }
         if ($database) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($database) }
         if ($installer) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) }
     }

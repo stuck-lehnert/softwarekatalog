@@ -27,7 +27,7 @@ function Case([string]$Name, [scriptblock]$Body) {
         $script:cases += [pscustomobject]@{ Name = $Name; Success = $true; Error = '' }
         Write-Output "PASS $Name"
     } catch {
-        $script:cases += [pscustomobject]@{ Name = $Name; Success = $false; Error = $_.ToString() }
+        $script:cases += [pscustomobject]@{ Name = $Name; Success = $false; Error = ($_.ToString() + "`n" + $_.ScriptStackTrace) }
         throw
     }
 }
@@ -62,6 +62,8 @@ try {
             }
             $evidence = Get-MsiRegistrationEvidence -Registration $registration[0]
             Check ($null -ne $evidence) 'Native MSI lookup failed (NULL SID regression).'
+            $types = @($evidence | ForEach-Object { $_.GetType().FullName }) -join ', '
+            Check (@($evidence).Count -eq 1 -and $evidence -is [pscustomobject]) "MSI evidence must be one record without COM return values (got $types)."
             Check ($evidence.UpgradeCode -eq $config.UpgradeCode) 'Wrong cached MSI identity.'
             Check (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -gt 0) 'Native component lookup did not find the SYSTEM-profile payload.'
         }

@@ -32,6 +32,7 @@ function Assert-Throws([scriptblock]$Body, [string]$Pattern) {
 }
 function Test([string]$Name, [scriptblock]$Body) {
     $script:events = @()
+    $script:diagnosticLog = @()
     $script:registrations = @()
     $script:machineInstalled = $false
     $script:installCode = 0
@@ -43,7 +44,14 @@ function Test([string]$Name, [scriptblock]$Body) {
     $script:InstalledPackagesPath = Join-Path $script:BaseDir 'Installed-Packages.json'
     $script:WingetSourceName = 'winget'
     $script:catalog = @([pscustomobject]@{ PackageId = 'ArtCraft.GridCraft'; Alias = 'grid'; DisplayName = 'Custom catalog label' })
-    & $Body
+    try { & $Body }
+    catch {
+        Write-Output "FAIL $Name"
+        Write-Output $_.ScriptStackTrace
+        Write-Output "Events: $($script:events -join '; ')"
+        $script:diagnosticLog | Select-Object -Last 15 | Write-Output
+        throw
+    }
     $script:passed++
     Write-Output "PASS $Name"
 }
@@ -54,7 +62,7 @@ function New-Registration([string]$Location = 'C:\Windows\System32\config\system
         WindowsInstaller = $true; Scope = 'user'; RegistryView = 'Registry64'
     }
 }
-function Write-Log { param($Message, $Level) }
+function Write-Log { param($Message, $Level) $script:diagnosticLog += [string]$Message }
 function Test-SoftwareCatalogPolicyEnabled { return $true }
 function Test-RunningAsLocalSystem { return $true }
 function Get-AppCatalogObjects { $script:catalog }
