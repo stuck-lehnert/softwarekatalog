@@ -65,7 +65,8 @@ try {
             $types = @($evidence | ForEach-Object { $_.GetType().FullName }) -join ', '
             Check (@($evidence).Count -eq 1 -and $evidence -is [pscustomobject]) "MSI evidence must be one record without COM return values (got $types)."
             Check ($evidence.UpgradeCode -eq $config.UpgradeCode) 'Wrong cached MSI identity.'
-            Check (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -gt 0) 'Native component lookup did not find the SYSTEM-profile payload.'
+            $detail = $evidence | ConvertTo-Json -Depth 5 -Compress
+            Check (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -gt 0) "Native component lookup did not find the SYSTEM-profile payload: $detail"
         }
         Case 'Production repair loop migrates real MSI to Program Files' {
             Invoke-ProcessQueueMode
@@ -74,7 +75,9 @@ try {
             Check (@(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'user' }).Count -eq 0) 'Old user registration remains.'
             Check (@(Get-RegisteredApplications | Where-Object { $_.ProductCode -eq $config.ProductCode -and $_.Scope -eq 'machine' }).Count -gt 0) 'Machine MSI registration is missing.'
             Check ((Get-InstalledPackageIdSet).Contains($config.PackageId)) 'Installed snapshot not updated.'
-            Check ((Get-Content -LiteralPath $ScopeRepairPath -Raw).Trim() -eq '[]') 'Repair journal was not completed.'
+            $rawJournal = Get-Content -LiteralPath $ScopeRepairPath -Raw
+            $journal = $rawJournal | ConvertFrom-Json
+            Check ($rawJournal.TrimStart().StartsWith('[') -and @($journal).Count -eq 0) 'Repair journal was not completed.'
         }
         Case 'Second worker pass is idempotent, including empty PS5.1 repair journal' {
             $before = @(Get-Content (Join-Path $Root 'winget-invocations.jsonl') | Where-Object { $_ -match '"uninstall"' }).Count

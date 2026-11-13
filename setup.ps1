@@ -2955,7 +2955,9 @@ namespace Softwarekatalog {
         $view = $database.OpenView('SELECT `ComponentId` FROM `Component`')
         [void]$view.Execute()
         $paths = @()
-        while ($null -ne ($record = $view.Fetch())) {
+        $componentDiagnostics = @()
+        $record = $view.Fetch()
+        while ($null -ne $record) {
             try {
                 $componentId = [string]$record.StringData(1)
                 if ($componentId) {
@@ -2964,14 +2966,18 @@ namespace Softwarekatalog {
                     $state = [Softwarekatalog.NativeMsi]::GetComponentPath(
                         $Registration.ProductCode, $componentId, [uint32]$msiContext, $buffer, [ref]$length)
                     $pathValue = $buffer.ToString()
+                    if ($componentDiagnostics.Count -lt 5) {
+                        $componentDiagnostics += [pscustomobject]@{ ComponentId = $componentId; Context = $msiContext; State = $state; Path = $pathValue }
+                    }
                     # Settings in AppData are normal; only executable payloads
                     # are evidence when ARP has no InstallLocation (e.g. WiX).
                     if ($state -eq 3 -and $pathValue -match '(?i)\.exe$') { $paths += $pathValue }
                 }
             }
             finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($record) }
+            $record = $view.Fetch()
         }
-        return [pscustomobject]@{ UpgradeCode = $upgradeCode; ExecutablePaths = $paths }
+        return [pscustomobject]@{ UpgradeCode = $upgradeCode; ExecutablePaths = $paths; ComponentDiagnostics = $componentDiagnostics }
     }
     catch {
         $script:MsiInspectionFailures += $Registration.ProductCode

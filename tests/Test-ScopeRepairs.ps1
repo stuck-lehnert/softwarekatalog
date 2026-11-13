@@ -30,6 +30,12 @@ function Assert-Throws([scriptblock]$Body, [string]$Pattern) {
     }
     throw "Expected exception matching '$Pattern'."
 }
+function Assert-EmptyRepairJournal {
+    $raw = Get-Content -LiteralPath $script:ScopeRepairPath -Raw
+    Assert ($raw.TrimStart().StartsWith('[')) 'Repair journal must remain a JSON array'
+    $parsed = $raw | ConvertFrom-Json
+    Assert (@($parsed).Count -eq 0) 'Repair journal must contain no pending intents'
+}
 function Test([string]$Name, [scriptblock]$Body) {
     $script:events = @()
     $script:diagnosticLog = @()
@@ -202,7 +208,7 @@ try {
         Assert ($script:events[0] -match '^download .*--scope machine')
         Assert ($script:events[1] -match '^uninstall .*--product-code .*--scope user')
         Assert ($script:events[2] -eq 'machine-install')
-        Assert ((Get-Content $script:ScopeRepairPath -Raw).Trim() -eq '[]')
+        Assert-EmptyRepairJournal
         Assert ($script:ScopeRepairFailures.Count -eq 0)
         $script:events = @()
         Invoke-SystemProfileRepairs fake
@@ -236,7 +242,7 @@ try {
         $script:events = @()
         Invoke-SystemProfileRepairs fake
         Assert ($script:events.Count -eq 2) 'Resume: download and install, no second uninstall'
-        Assert ((Get-Content $script:ScopeRepairPath -Raw).Trim() -eq '[]')
+        Assert-EmptyRepairJournal
     }
     Test 'Retained uninstall registration blocks reinstall and leaves repair intent' {
         $script:registrations = @(New-Registration)
