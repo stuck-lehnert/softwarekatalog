@@ -67,8 +67,27 @@ try {
             Check ($evidence.UpgradeCode -eq $config.UpgradeCode) 'Wrong cached MSI identity.'
             $detail = $evidence | ConvertTo-Json -Depth 5 -Compress
             if (@($evidence.ExecutablePaths | Where-Object { Test-SystemProfileAppDataPath $_ }).Count -eq 0) {
+                Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class FixtureMsiProbe {
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern int MsiGetComponentPath(string product, string component, StringBuilder path, ref uint length);
+    public static string Classic(string product, string component) {
+        var path = new StringBuilder(32768); uint length = 32768;
+        int state = MsiGetComponentPath(product, component, path, ref length);
+        return "classic state=" + state + " path=" + path;
+    }
+}
+'@
                 $probes = @()
                 foreach ($sample in @($evidence.ComponentDiagnostics)) {
+                    $probes += "product=$($config.ProductCode) component=$($sample.ComponentId)"
+                    $probes += [FixtureMsiProbe]::Classic($config.ProductCode, $sample.ComponentId)
+                    $com = New-Object -ComObject WindowsInstaller.Installer
+                    try { $probes += "COM path=$($com.ComponentPath($config.ProductCode, $sample.ComponentId))" }
+                    finally { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($com) }
                     foreach ($context in @(4, 2, 1)) {
                         $buffer = New-Object Text.StringBuilder 32768
                         $length = [uint32]32768
