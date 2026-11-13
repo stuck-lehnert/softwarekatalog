@@ -2,6 +2,7 @@
 param(
     [Parameter(Mandatory)][switch]$AllowDisposableMachine,
     [Parameter(Mandatory)][string]$WixPath,
+    [Parameter(Mandatory)][ValidateSet('x64','arm64')][string]$ExpectedArchitecture,
     [string]$ResultsDirectory
 )
 Set-StrictMode -Version Latest
@@ -12,8 +13,12 @@ if (-not $ResultsDirectory) { $ResultsDirectory = Join-Path (Split-Path $PSScrip
 if (-not $AllowDisposableMachine -or $env:OS -ne 'Windows_NT' -or
     $env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
     $PSVersionTable.PSEdition -ne 'Desktop' -or -not [Environment]::Is64BitProcess) {
-    throw 'Integration tests require explicit opt-in and a disposable GitHub-hosted Windows x64 PowerShell 5.1 runner.'
+    throw 'Integration tests require explicit opt-in and a disposable GitHub-hosted native Windows x64/ARM64 PowerShell 5.1 runner.'
 }
+. (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1')
+$architecture = Assert-CiWindowsArchitecture -ExpectedArchitecture $ExpectedArchitecture -ExpectedOSArchitecture $ExpectedArchitecture `
+    -RequireNative -OutputPath (Join-Path $ResultsDirectory 'architecture.json')
+Write-Output ('Integration architecture evidence: ' + ($architecture | ConvertTo-Json -Compress))
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Administrator rights required.' }
 $repo = Split-Path $PSScriptRoot -Parent
@@ -38,6 +43,8 @@ New-Item -ItemType Directory -Path $root | Out-Null
 & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
 if ($LASTEXITCODE -ne 0) { throw 'Could not protect disposable fixture root.' }
 Set-Content -LiteralPath (Join-Path $root '.disposable-ci-fixture') -Value 'Owned by Softwarekatalog CI'
+$architectureHelper = Join-Path $root 'WindowsArchitecture.ps1'
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1') -Destination $architectureHelper
 
 function Check($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Record([string]$Name) { $cases.Add([pscustomobject]@{ Name = $Name; Success = $true; Error = '' }); Write-Output "PASS $Name" }
@@ -63,7 +70,10 @@ function Stop-ProductTasks {
 }
 function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
     $scriptPath = Join-Path $PSScriptRoot 'windows\SystemScenario.ps1'
-    $command = "& '$($scriptPath.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -Phase '$Phase' -ExpectedUserSid '$Sid'"
+    $architecturePath = Join-Path $root "$Phase.architecture.json"
+    # Architecture assertion and scenario execute in the SAME scheduled process.
+    # No fallback to an emulated x64 PowerShell is permitted on the ARM64 lane.
+    $command = ". '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($architecturePath.Replace("'", "''"))'; & '$($scriptPath.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -Phase '$Phase' -ExpectedUserSid '$Sid'"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $taskPrincipal = New-ScheduledTaskPrincipal -UserId SYSTEM -LogonType ServiceAccount -RunLevel Highest
@@ -86,14 +96,20 @@ function Run-SystemPhase([string]$Phase, [string]$Sid = '') {
         Start-Sleep -Milliseconds 200
     }
     $result = Get-Content $resultPath -Raw | ConvertFrom-Json
+    $systemArchitecture = Get-Content -LiteralPath $architecturePath -Raw | ConvertFrom-Json
+    Assert-CiArchitectureRecord $systemArchitecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
+    Check ($systemArchitecture.Sid -eq 'S-1-5-18') 'Architecture proof did not come from the actual SYSTEM token.'
+    Record "Native $ExpectedArchitecture SYSTEM process ($Phase)"
     foreach ($case in @($result.Cases)) { $cases.Add($case) }
     Check ($result.Identity -match '(?i)SYSTEM$') 'Scheduled scenario did not run as SYSTEM.'
     $errors = @($result.Cases | Where-Object { -not $_.Success } | ForEach-Object { $_.Error }) -join "`n"
     Check ($result.Success -and (Get-ScheduledTaskInfo -TaskName $taskName).LastTaskResult -eq 0) "SYSTEM phase failed: $Phase. $errors (see transcript artifact)."
 }
 try {
-    & (Join-Path $PSScriptRoot 'windows\New-Fixture.ps1') -Root $root -WixPath $WixPath
+    & (Join-Path $PSScriptRoot 'windows\New-Fixture.ps1') -Root $root -WixPath $WixPath -Architecture $ExpectedArchitecture
     $config = Get-Content (Join-Path $root 'fixture-config.json') -Raw | ConvertFrom-Json
+    Check ($config.Architecture -eq $ExpectedArchitecture -and ($config.MsiTemplate -split ';')[0] -ieq $ExpectedArchitecture) 'Fixture MSI architecture does not match the native lane.'
+    Record "Matching native $ExpectedArchitecture MSI package template"
     New-Item -Path "$policy\Catalog" -Force | Out-Null
     New-ItemProperty -Path $policy -Name Enabled -PropertyType DWord -Value 1 -Force | Out-Null
     New-ItemProperty -Path $policy -Name EnforceRequired -PropertyType DWord -Value 0 -Force | Out-Null
@@ -138,16 +154,25 @@ try {
     $userResult = Join-Path $userOutput 'result.json'
     $userScript = Join-Path $root 'StandardUserScenario.ps1'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows\StandardUserScenario.ps1') -Destination $userScript
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -OutputPath "{1}"' -f $userScript, $userResult
+    $userArchitecturePath = Join-Path $userOutput 'architecture.json'
+    # PS5.1 Add-Type uses CodeDOM temporary files. Do not rely on an inherited
+    # runner-admin TEMP directory being writable by this real standard user.
+    $command = "`$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -EncodedCommand ' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $userOutput -PassThru -RedirectStandardOutput (Join-Path $userOutput 'stdout.log') -RedirectStandardError (Join-Path $userOutput 'stderr.log')
     $handle = $process.Handle
     if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'Standard-user scenario timed out.' }
     Check ($process.ExitCode -eq 0 -and (Test-Path $userResult)) 'Standard-user scenario failed (see stdout/stderr artifacts).'
     $result = Get-Content $userResult -Raw | ConvertFrom-Json
+    $userArchitecture = Get-Content -LiteralPath $userArchitecturePath -Raw | ConvertFrom-Json
+    Assert-CiArchitectureRecord $userArchitecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
+    Check ($userArchitecture.Sid -eq $user.Sid.Value) 'Architecture proof did not come from the actual standard-user token.'
+    Record "Native $ExpectedArchitecture standard-user PowerShell process"
     Check (-not $result.IsAdmin -and $result.Sid -eq $user.Sid.Value) 'Test used the wrong user token.'
     Check (@($result.TamperAttempts | Where-Object { -not $_.Blocked }).Count -eq 0) 'Standard user could modify privileged runtime/queue/journal/another owner request.'
     Check $result.PolicyWriteBlocked 'Standard user could rewrite catalog policy.'
     Check ($result.SharedShortcut -and $result.LaunchExitCode -eq 0 -and $result.LaunchOutput -match 'fixture OK') 'Machine MSI was not accessible to the second standard user.'
+    Check ($result.LaunchOutput -match "process=$ExpectedArchitecture; os=$ExpectedArchitecture; native=True") 'The installed MSI executable did not prove native execution under the standard-user token.'
     Record 'Real standard-user ACL enforcement, policy protection and all-users executable/shortcut access'
     Run-SystemPhase Requests $user.Sid.Value
 }
@@ -175,7 +200,7 @@ finally {
     if ($createdUser) { Remove-LocalUser -Name $userName }
     Copy-Item -LiteralPath $root -Destination (Join-Path $ResultsDirectory 'fixture-diagnostics') -Recurse -Force
     Remove-Item -LiteralPath $root -Recurse -Force
-    [pscustomobject]@{ Success = (-not $failed); OS = [Environment]::OSVersion.VersionString; Cases = @($cases.ToArray()) } |
+    [pscustomobject]@{ Success = (-not $failed); OS = [Environment]::OSVersion.VersionString; Architecture = $architecture; Cases = @($cases.ToArray()) } |
         ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $ResultsDirectory 'summary.json') -Encoding UTF8
 }
 if ($failed) { throw 'Windows SYSTEM integration failed; inspect uploaded test-results artifacts.' }

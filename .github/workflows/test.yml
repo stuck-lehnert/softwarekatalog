@@ -23,7 +23,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Validate workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -color
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
       - name: Build, encoding, payload and policy resource tests
         run: |
           python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -38,17 +38,41 @@ jobs:
           retention-days: 7
 
   unit:
-    name: Unit / ${{ matrix.os }} / ${{ matrix.engine }}
+    name: Unit / ${{ matrix.os }} / ${{ matrix.engine }} / ${{ matrix.architecture }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
-        engine: [powershell, pwsh]
         include:
           - os: windows-2022
+            engine: powershell
+            architecture: x64
+            os_architecture: x64
+          - os: windows-2022
+            engine: pwsh
+            architecture: x64
+            os_architecture: x64
+          - os: windows-2025
+            engine: powershell
+            architecture: x64
+            os_architecture: x64
+          - os: windows-2025
+            engine: pwsh
+            architecture: x64
+            os_architecture: x64
+          - os: windows-2022
             engine: powershell-x86
+            architecture: x86
+            os_architecture: x64
+          - os: windows-11-arm
+            engine: powershell
+            architecture: arm64
+            os_architecture: arm64
+          - os: windows-11-arm
+            engine: pwsh
+            architecture: arm64
+            os_architecture: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,16 +81,24 @@ jobs:
         shell: powershell
         env:
           TEST_ENGINE: ${{ matrix.engine }}
+          TEST_ARCH: ${{ matrix.architecture }}
+          TEST_OS_ARCH: ${{ matrix.os_architecture }}
         run: |
-          $engine = $env:TEST_ENGINE
-          if ($engine -eq 'powershell-x86') { $engine = "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" }
+          $engine = switch ($env:TEST_ENGINE) {
+            'powershell-x86' { "$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe" }
+            'powershell' { "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
+            'pwsh' { "$env:ProgramFiles\PowerShell\7\pwsh.exe" }
+          }
+          if (-not (Test-Path -LiteralPath $engine)) { throw "Required test engine is unavailable: $engine" }
+          $testArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'tests/Invoke-Tests.ps1', '-ExpectedArchitecture', $env:TEST_ARCH, '-ExpectedOSArchitecture', $env:TEST_OS_ARCH)
+          if ($env:TEST_ENGINE -ne 'powershell-x86') { $testArguments += '-RequireNative' }
           New-Item -ItemType Directory -Path test-results -Force | Out-Null
           $exitCode = 1
           try {
             # PS5 otherwise throws on native stderr and discards earlier stdout,
             # including the suite's actionable GitHub error annotations.
             $ErrorActionPreference = 'Continue'
-            $output = & $engine -NoProfile -ExecutionPolicy Bypass -File tests/Invoke-Tests.ps1 2>&1 | Out-String
+            $output = & $engine @testArguments 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
           } catch { $output = $_ | Out-String } finally { $ErrorActionPreference = 'Stop' }
           $output | Set-Content test-results/engine-launch.log -Encoding UTF8
@@ -86,14 +118,20 @@ jobs:
           retention-days: 14
 
   system:
-    name: SYSTEM integration / ${{ matrix.os }}
+    name: SYSTEM integration / ${{ matrix.os }} / ${{ matrix.architecture }}
     needs: build
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-2022, windows-2025]
+        include:
+          - os: windows-2022
+            architecture: x64
+          - os: windows-2025
+            architecture: x64
+          - os: windows-11-arm
+            architecture: arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -104,12 +142,16 @@ jobs:
           path: dist
       - name: Install pinned fixture-building tool
         shell: powershell
+        env:
+          TEST_ARCH: ${{ matrix.architecture }}
         run: |
-          dotnet tool install --tool-path "$env:RUNNER_TEMP\softkat-wix" wix --version 5.0.2
+          dotnet tool install --tool-path "$env:RUNNER_TEMP\softkat-wix" --arch $env:TEST_ARCH wix --version 5.0.2
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real deployment, SYSTEM MSI migration and standard-user security checks
         shell: powershell
-        run: ./tests/Test-WindowsIntegration.ps1 -AllowDisposableMachine -WixPath "$env:RUNNER_TEMP\softkat-wix\wix.exe"
+        env:
+          TEST_ARCH: ${{ matrix.architecture }}
+        run: ./tests/Test-WindowsIntegration.ps1 -AllowDisposableMachine -WixPath "$env:RUNNER_TEMP\softkat-wix\wix.exe" -ExpectedArchitecture $env:TEST_ARCH
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

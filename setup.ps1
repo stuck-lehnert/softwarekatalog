@@ -3046,9 +3046,17 @@ namespace Softwarekatalog {
                     $length = [uint32]32768
                     $state = [Softwarekatalog.NativeMsi]::GetComponentPath(
                         $Registration.ProductCode, $componentId, [uint32]$msiContext, $buffer, [ref]$length)
+                    $pathLookup = 'context'
                     if ($state -eq -1 -and (Test-RunningAsLocalSystem)) {
-                        if ($null -eq $allowClassicLookup) { $allowClassicLookup = Test-MsiClassicLookupSafe -Registration $Registration }
+                        if ($null -eq $allowClassicLookup) {
+                            $allowClassicLookup = Test-MsiClassicLookupSafe -Registration $Registration
+                            if (-not $allowClassicLookup) {
+                                $script:MsiInspectionFailures += $Registration.ProductCode
+                                Write-Log "Cannot safely resolve legacy MSI '$($Registration.ProductCode)': conflicting or missing registered scopes; classic lookup refused." 'WARN'
+                            }
+                        }
                         if ($allowClassicLookup) {
+                            $pathLookup = 'classic-system-single-scope'
                             [void]$buffer.Clear()
                             $length = [uint32]32768
                             $state = [Softwarekatalog.NativeMsi]::MsiGetComponentPath(
@@ -3057,7 +3065,7 @@ namespace Softwarekatalog {
                     }
                     $pathValue = $buffer.ToString()
                     if ($componentDiagnostics.Count -lt 5) {
-                        $componentDiagnostics += [pscustomobject]@{ ComponentId = $componentId; Context = $msiContext; State = $state; Path = $pathValue }
+                        $componentDiagnostics += [pscustomobject]@{ ComponentId = $componentId; Context = $msiContext; Lookup = $pathLookup; State = $state; Path = $pathValue }
                     }
                     # Settings in AppData are normal; only executable payloads
                     # are evidence when ARP has no InstallLocation (e.g. WiX).

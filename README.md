@@ -115,8 +115,11 @@ The repair pass:
    `HKEY_USERS\S-1-5-18` hive. It checks paths beneath
    `%SystemRoot%\System32\config\systemprofile\AppData` and the WOW64 aliases.
    MSI packages without an ARP install location are checked through executable
-   component paths in the read-only cached MSI, using context-aware MSI APIs
-   to distinguish user/machine copies even with the same product GUID. Cached
+   component paths in the read-only cached MSI, preferring context-aware MSI APIs.
+   Some legacy SYSTEM installations are invisible to extended component APIs;
+   a classic current-user/machine lookup is allowed only for a single registered
+   scope, including hidden/unnamed records. Conflicting user/machine registrations
+   are never disambiguated by guessing. Cached
    icons and ordinary AppData settings are not treated as executable payloads.
    It does not use `Win32_Product`.
 2. Maps a suspect installation to a currently allowed catalog package. GridCraft
@@ -188,8 +191,10 @@ Or run `powershell.exe -NoProfile -File tests\Invoke-Tests.ps1` on Windows.
 Each suite runs in its own child process with a timeout; logs and JUnit XML are
 written to `test-results/`. The ordinary unit tests need no Pester/module install.
 
-The [Windows CI](docs/ci.md) covers Windows Server 2022/2025, Windows PowerShell
-5.1 and PowerShell 7, plus an x86 PowerShell pass. In addition to file-backed
+The [Windows CI](docs/ci.md) covers Windows Server 2022/2025 x64 and native Windows
+11 ARM64, Windows PowerShell 5.1 and PowerShell 7, plus a deliberate x86-on-x64
+PowerShell pass. Process/OS architectures are verified through the Windows API,
+not inferred from runner labels or pointer width. In addition to file-backed
 queue/policy/request and scope-repair regression tests, disposable hosted runners
 test the actual deployment bootstrap, real SYSTEM tasks, MSI migration and a
 real standard user's NTFS/registry permissions and application access. Releases
@@ -197,7 +202,9 @@ are gated on successful CI for their exact commit, including manual releases.
 
 The deterministic integration fixture uses a controlled CLI adapter to isolate
 upstream WinGet/network behavior; the MSI engine and OS security boundaries are
-real. It does not certify arbitrary third-party installers, domain GPO delivery,
+real, and registry inventory is restricted to real registrations of the fixture's
+GUID. Production WinGet discovery prefers the native architecture and orders
+package versions numerically. CI does not certify arbitrary third-party installers, domain GPO delivery,
 or an interactive desktop GUI. See the coverage/limitations and safe invocation
 instructions in [docs/ci.md](docs/ci.md); do not run the destructive integration
 harness on a normal workstation.

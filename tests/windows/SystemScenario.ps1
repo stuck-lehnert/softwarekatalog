@@ -13,9 +13,19 @@ if ($entry -lt 0) { throw 'Production entry point marker missing.' }
 # without invoking its entry point a second time.
 . ([scriptblock]::Create($source.Substring(0, $entry)))
 $script:fixtureWinget = Join-Path $Root 'winget-fixture.exe'
-# Only the external CLI/discovery and asynchronous worker-start boundaries are
-# controlled. Registry, MSI APIs, ACLs, policy, request validation, disk queue,
-# installed snapshots, locks and the complete worker loop are real.
+# Scope inventory to this run's GUID, but use the unchanged real registry reader
+# in both views/scopes (including unnamed entries). Hosted runners contain a
+# large Visual Studio/MSI estate unrelated to the fixture. Never traverse all
+# of those cached component tables for every test worker pass.
+$script:readRegisteredApplications = ${function:Get-RegisteredApplications}
+function Get-RegisteredApplications {
+    param([switch]$IncludeUnnamed)
+    & $script:readRegisteredApplications -IncludeUnnamed:$IncludeUnnamed |
+        Where-Object { $_.ProductCode -eq $config.ProductCode }
+}
+# CLI/discovery and asynchronous worker startup are controlled. Inventory is
+# restricted to real registrations of the fixture; no registry/MSI data is faked.
+# ACLs, policy, request validation, disk queue, snapshots and locks are real.
 function Ensure-WingetAvailable { return $script:fixtureWinget }
 function Start-QueueWorkerIfAvailable { return $true }
 $script:cases = @()
@@ -27,7 +37,8 @@ function Case([string]$Name, [scriptblock]$Body) {
         $script:cases += [pscustomobject]@{ Name = $Name; Success = $true; Error = '' }
         Write-Output "PASS $Name"
     } catch {
-        $script:cases += [pscustomobject]@{ Name = $Name; Success = $false; Error = ($_.ToString() + "`n" + $_.ScriptStackTrace) }
+        $recentLog = if (Test-Path -LiteralPath $LogFile) { (Get-Content -LiteralPath $LogFile -Tail 15) -join "`n" } else { '' }
+        $script:cases += [pscustomobject]@{ Name = $Name; Success = $false; Error = ($_.ToString() + "`n" + $_.ScriptStackTrace + "`nProduction log:`n" + $recentLog) }
         throw
     }
 }
@@ -45,7 +56,7 @@ try {
             Check ((Run-Msi $arguments) -eq 0) 'Could not seed the legacy SYSTEM-profile MSI.'
             Check (Test-Path -LiteralPath (Join-Path $config.LegacyDir 'fixture.exe')) 'Legacy executable is missing.'
         }
-        Case 'Native context-specific MSI cache and component APIs under SYSTEM' {
+        Case 'Read-only native MSI cache and executable evidence under SYSTEM' {
             # SYSTEM's per-user MSI defaults can register in machine ARP even
             # though the payload is in SYSTEM AppData. Inspect the actual scope
             # rather than assuming that install path and registration coincide.

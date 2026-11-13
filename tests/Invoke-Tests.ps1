@@ -1,5 +1,10 @@
 [CmdletBinding()]
-param([string]$ResultsDirectory)
+param(
+    [string]$ResultsDirectory,
+    [ValidateSet('x86','x64','arm64')][string]$ExpectedArchitecture,
+    [ValidateSet('x64','arm64')][string]$ExpectedOSArchitecture,
+    [switch]$RequireNative
+)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # PS5.1 can bind -File parameter defaults before initializing PSScriptRoot.
@@ -7,8 +12,18 @@ if (-not $ResultsDirectory) { $ResultsDirectory = Join-Path (Split-Path $PSScrip
 $executable = if ($PSVersionTable.PSEdition -eq 'Desktop') { 'powershell.exe' } elseif ($env:OS -eq 'Windows_NT') { 'pwsh.exe' } else { 'pwsh' }
 $engine = Join-Path $PSHOME $executable
 New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
+$env:SOFTKAT_EXPECTED_PROCESS_ARCH = $ExpectedArchitecture
+$env:SOFTKAT_EXPECTED_OS_ARCH = $ExpectedOSArchitecture
+$env:SOFTKAT_REQUIRE_NATIVE = ([bool]$RequireNative).ToString().ToLowerInvariant()
+if ($ExpectedArchitecture -or $ExpectedOSArchitecture -or $RequireNative) {
+    if (-not $ExpectedArchitecture -or -not $ExpectedOSArchitecture) { throw 'Both expected process and OS architectures are required.' }
+    . (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1')
+    $evidence = Assert-CiWindowsArchitecture -ExpectedArchitecture $ExpectedArchitecture -ExpectedOSArchitecture $ExpectedOSArchitecture `
+        -RequireNative:$RequireNative -OutputPath (Join-Path $ResultsDirectory 'architecture.json')
+    Write-Output ('Runtime architecture evidence: ' + ($evidence | ConvertTo-Json -Compress))
+}
 $failed = $false
-foreach ($suite in @('Test-GeneratedScripts.ps1', 'Test-Core.ps1', 'Test-ScopeRepairs.ps1')) {
+foreach ($suite in @('Test-Architecture.ps1', 'Test-GeneratedScripts.ps1', 'Test-Core.ps1', 'Test-ScopeRepairs.ps1')) {
     $name = [IO.Path]::GetFileNameWithoutExtension($suite)
     $stdout = Join-Path $ResultsDirectory "$name.stdout.log"
     $stderr = Join-Path $ResultsDirectory "$name.stderr.log"
