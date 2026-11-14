@@ -85,9 +85,12 @@ if ($AccountKind -eq 'Standard') {
         $owner = (Get-Acl -LiteralPath $writableRequest).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -ne 'S-1-5-32-544') { throw 'Writable privileged-owner attack fixture did not preserve its genuine BA owner.' }
         Write-Output 'Removing the standard account ACE while preserving the privileged file owner'
-        $forgedAcl = Get-Acl -LiteralPath $writableRequest
-        $forgedAcl.PurgeAccessRules([Security.Principal.WindowsIdentity]::GetCurrent().User)
-        Set-Acl -LiteralPath $writableRequest -AclObject $forgedAcl
+        # PS5.1 Set-Acl also attempts privileged security sections and requires
+        # SeSecurityPrivilege. This attack needs only the genuinely granted
+        # WRITE_DAC right: remove our explicit grant without changing owner/SACL.
+        $attackerSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        & icacls.exe $writableRequest /remove:g "*$attackerSid" | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Standard-token DACL-only grant removal failed.' }
     }
     Write-Output 'Writing owned raw requests that forge SYSTEM/admin identity and Required/System source'
     @{ Command = 'Install'; AppAlias = 'ci'; RequestedBySid = $SpoofedIdentitySid; RequestedBy = 'Forged administrator' } |
