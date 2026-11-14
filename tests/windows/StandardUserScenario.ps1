@@ -58,6 +58,7 @@ Write-Output 'Invoking the generated request helper'
 $helperBlocked = $false; $helperError = ''
 try { & (Join-Path $base 'Request-App.ps1') -AppAlias ci } catch { $helperBlocked = $true; $helperError = $_ | Out-String }
 $created = @(Get-ChildItem -LiteralPath $requestDirectory -Filter '*.json' -File)
+Write-Output "Generated helper outcome: blocked=$helperBlocked; expected=$expectHelperBlocked; requests=$($created.Count)"
 if ($expectHelperBlocked) {
     if (-not $helperBlocked -or $created.Count -ne 0) { throw 'Server unelevated-user helper must reject Install without creating a request.' }
 }
@@ -73,6 +74,7 @@ else {
 }
 if ($AccountKind -eq 'Standard') {
     if ($isServer) {
+        Write-Output 'Moving the privileged-owner attack fixture through the real standard token'
         # Same-volume move preserves the real BA owner. An attacker who initially
         # has FullControl can supply content AND then hide its own writable ACE.
         # Even a final BA/SYSTEM-only file DACL is not authenticated provenance.
@@ -82,6 +84,7 @@ if ($AccountKind -eq 'Standard') {
             ConvertTo-Json | Set-Content -LiteralPath $writableRequest -Encoding UTF8
         $owner = (Get-Acl -LiteralPath $writableRequest).GetOwner([Security.Principal.SecurityIdentifier]).Value
         if ($owner -ne 'S-1-5-32-544') { throw 'Writable privileged-owner attack fixture did not preserve its genuine BA owner.' }
+        Write-Output 'Removing the standard account ACE while preserving the privileged file owner'
         $forgedAcl = Get-Acl -LiteralPath $writableRequest
         $forgedAcl.PurgeAccessRules([Security.Principal.WindowsIdentity]::GetCurrent().User)
         Set-Acl -LiteralPath $writableRequest -AclObject $forgedAcl

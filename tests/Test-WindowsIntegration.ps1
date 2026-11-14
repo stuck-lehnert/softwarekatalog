@@ -66,7 +66,10 @@ function Invoke-CiAccountScenario {
     $command = "`$env:TEMP = '$($OutputDirectory.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($architecturePath.Replace("'", "''"))'; & '$($ScenarioScript.Replace("'", "''"))' -OutputPath '$($outputPath.Replace("'", "''"))' -AccountKind '$AccountKind' -SpoofedIdentitySid '$SpoofedIdentitySid' -FixtureRoot '$($root.Replace("'", "''"))'"
     if ($AfterScript) { $command += "; & '$($AfterScript.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -OutputPath '$($AfterOutputPath.Replace("'", "''"))'" }
     $bootstrap = Join-Path $root ("Run-$AccountKind.ps1")
-    [IO.File]::WriteAllText($bootstrap, ("& { `$ErrorActionPreference = 'Stop'; $command } *> '$($consolePath.Replace("'", "''"))'"), (New-Object Text.UTF8Encoding($true)))
+    # Preserve terminating errors before they escape the block's redirection;
+    # credential processes cannot redirect native stderr through Start-Process.
+    $bootstrapSource = "& { `$ErrorActionPreference = 'Stop'; try { $command } catch { Write-Output (`$_ | Out-String); Write-Output `$_.ScriptStackTrace; throw } } *> '$($consolePath.Replace("'", "''"))'"
+    [IO.File]::WriteAllText($bootstrap, $bootstrapSource, (New-Object Text.UTF8Encoding($true)))
     $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $bootstrap + '"'
     $engine = Join-Path $PSHOME 'powershell.exe'
     Check (($engine.Length + $arguments.Length + 4) -lt 1024) 'Credential process command line exceeds the Windows logon API limit.'
