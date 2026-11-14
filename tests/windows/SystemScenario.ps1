@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$Root,
-    [ValidateSet('Lifecycle','Requests','Cleanup','ArtCraft','ArtCraftInterrupt','ArtCraftResume','ArtCraftCleanup')][string]$Phase,
+    [ValidateSet('Lifecycle','Requests','AdministratorRequests','Cleanup','ArtCraft','ArtCraftInterrupt','ArtCraftResume','ArtCraftCleanup')][string]$Phase,
     [string]$ExpectedUserSid)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -53,6 +53,11 @@ function Run-Msi([string]$Arguments) {
     $handle = $p.Handle
     if (-not $p.WaitForExit(120000)) { $p.Kill(); throw 'MSI fixture operation timed out.' }
     return $p.ExitCode
+}
+function Get-CiWingetMutationCount {
+    $path = Join-Path $Root 'winget-invocations.jsonl'
+    if (-not (Test-Path -LiteralPath $path)) { return 0 }
+    @(Get-Content -LiteralPath $path | Where-Object { $_ -match '"(?:install|uninstall|upgrade)"' }).Count
 }
 Start-Transcript -Path (Join-Path $Root "$Phase.transcript.txt") | Out-Null
 try {
@@ -158,11 +163,11 @@ public static class FixtureMsiProbe {
             Check ($before -eq $after) 'Healthy machine application was uninstalled again.'
         }
         Case 'Real queued uninstall and reinstall complete successfully' {
-            $request = Add-SoftwareRequestToQueue -Action Uninstall -Alias ci -RequestedBy CI -RequestedBySid CI
+            $request = Add-SoftwareRequestToQueue -Action Uninstall -Alias ci -RequestedBy CI -RequestedBySid 'S-1-5-18'
             Check $request.Added 'Uninstall was not queued.'
             Invoke-ProcessQueueMode
             Check (-not (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe'))) 'Queued uninstall left payload installed.'
-            $request = Add-SoftwareRequestToQueue -Action Install -Alias ci -RequestedBy CI -RequestedBySid CI
+            $request = Add-SoftwareRequestToQueue -Action Install -Alias ci -RequestedBy CI -RequestedBySid 'S-1-5-18'
             Invoke-ProcessQueueMode
             Check (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe')) 'Queued reinstall failed.'
             Check (@(Get-QueueItemsInDirectory -Directory $QueueSucceededDir -DefaultState Succeeded).Count -ge 2) 'Success queue history is missing.'
@@ -176,20 +181,72 @@ public static class FixtureMsiProbe {
             Invoke-ProcessQueueMode
             Check (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe')) 'Required enforcement did not restore MSI.'
             $blocked = $false
-            try { Add-SoftwareRequestToQueue -Action Uninstall -Alias ci -RequestedBy CI -RequestedBySid CI | Out-Null } catch { $blocked = $true }
+            try { Add-SoftwareRequestToQueue -Action Uninstall -Alias ci -RequestedBy CI -RequestedBySid 'S-1-5-18' | Out-Null } catch { $blocked = $true }
             Check $blocked 'Required software accepted a user uninstall.'
         }
         # SYSTEM-owned sentinel: a normal user must not modify/delete it.
         Set-Content -LiteralPath (Join-Path $RequestsDir 'system-owner.tmp') -Value 'protected request'
     }
     elseif ($Phase -eq 'Requests') {
-        Case 'Actual standard-user owner defeats spoofed request identity' {
+        $accounts = Get-Content -LiteralPath (Join-Path $Root 'authorization-accounts.json') -Raw | ConvertFrom-Json
+        $productType = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\ProductOptions' -Name ProductType).ProductType
+        Check ($productType -in @('WinNT','ServerNT','LanmanNT')) 'Unknown actual Windows product type.'
+        $isServer = $productType -ne 'WinNT'
+        Case 'Actual protected ProductType and production native Authz distinguish real standard and administrator accounts' {
+            Check ($ExpectedUserSid -eq $accounts.StandardSid) 'Standard account metadata does not match the real process SID.'
+            Check ((Test-ServerOperatingSystem) -eq $isServer) 'Production server classification disagrees with the real protected ProductType.'
+            if ($isServer) {
+                $adminDrop = Get-AdminRequestsDirectory
+                Check (Test-Path -LiteralPath $adminDrop -PathType Container) 'Protected administrator drop was not deployed.'
+                foreach ($path in @($BaseDir,$adminDrop)) {
+                    Check ((Get-Acl -LiteralPath $path).GetOwner([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-544') 'Admin drop or protected parent lacks genuine BA ownership.'
+                    Check (((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) 'Admin drop or protected parent is a reparse point.'
+                }
+            }
+            $standardIsAdmin = Test-AdministratorSid -Sid $accounts.StandardSid
+            $administratorIsAdmin = Test-AdministratorSid -Sid $accounts.AdministratorSid
+            Check (-not $standardIsAdmin -and $administratorIsAdmin) 'Native Authz did not distinguish actual standard/admin accounts.'
+            Check (Test-AdministratorSid -Sid 'S-1-5-18') 'Authentic SYSTEM ownership must remain privileged.'
+            Check (Test-AdministratorSid -Sid 'S-1-5-32-544') 'Authentic Administrators-group ownership must remain privileged.'
+            Check (-not (Test-AdministratorSid -Sid 'not-a-sid')) 'Invalid owner SID was accepted.'
+            $unknownSid = $accounts.StandardSid -replace '-[0-9]+$', '-2147483000'
+            Check (-not (Test-AdministratorSid -Sid $unknownSid)) 'Unresolvable owner SID was accepted.'
+            [pscustomobject]@{ ProductType = $productType; IsServer = $isServer; StandardSid = $accounts.StandardSid
+                StandardIsAdministrator = $standardIsAdmin; AdministratorSid = $accounts.AdministratorSid
+                AdministratorIsAdministrator = $administratorIsAdmin; Resolver = 'Unmodified production Windows Authz' } |
+                ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Root 'native-authorization.json') -Encoding UTF8
+        }
+        $protectedNames = @('standard-spoof-system.json','standard-spoof-admin.json','standard-spoof-required.json','standard-spoof-authorization.json')
+        Case 'Real standard-user ownership and protected queue metadata cannot be forged in JSON' {
+            foreach ($name in @('standard-spoof-identity.json') + $protectedNames) {
+                $owner = Get-RequestFileOwnerInfo -Path (Join-Path $RequestsDir $name)
+                Check ($owner.Sid -eq $accounts.StandardSid) "Raw request lacks the actual standard-user owner: $name"
+            }
+            if ($isServer) {
+                $owner = Get-RequestFileOwnerInfo -Path (Join-Path $RequestsDir 'standard-admin-owned-writable.json')
+                Check ($owner.Sid -eq 'S-1-5-32-544') 'Writable privileged-owner fixture did not retain actual BA ownership.'
+                Check $owner.SafeForInstall 'Attacker did not finish forging the superficially safe BA/SYSTEM-only file DACL.'
+            }
             Invoke-ProcessRequestsMode
             $items = @(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued)
             $accepted = @($items | Where-Object { $_.Alias -eq 'ci' -and $_.Action -eq 'Install' })
-            Check ($accepted.Count -eq 1) 'Expected one accepted user install.'
-            Check ($accepted[0].RequestedBySid -eq $ExpectedUserSid) 'Caller identity was taken from JSON rather than file ownership.'
-            Check ($accepted[0].RequestedBySid -ne 'S-1-5-18') 'Spoofed SYSTEM SID was trusted.'
+            if ($isServer) {
+                Check ($accepted.Count -eq 0) 'Server standard account bypassed Install authorization through raw JSON.'
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir 'standard-spoof-identity.json')) 'Server forged-admin identity request was not rejected.'
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir 'standard-spoof-identity.json.error.txt')) 'Server owner rejection reason is missing.'
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir 'standard-admin-owned-writable.json')) 'Server accepted attacker-controlled contents solely due to privileged file ownership.'
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir 'standard-admin-owned-writable.json.error.txt')) 'Writable privileged-owner rejection reason is missing.'
+            }
+            else {
+                Check ($accepted.Count -eq 1) 'Client standard-user install must remain accepted and deduplicated.'
+                Check ($accepted[0].RequestedBySid -eq $ExpectedUserSid -and $accepted[0].RequestedBySid -ne 'S-1-5-18') 'Caller identity was taken from JSON rather than file ownership.'
+                Check ($accepted[0].Source -eq 'User' -and $accepted[0].Required) 'Trusted Source/Required metadata did not come from actual policy.'
+                foreach ($name in @('standard-helper.json','standard-spoof-identity.json')) { Check (Test-Path -LiteralPath (Join-Path $ProcessedRequestsDir $name)) "Authorized client request was not processed: $name" }
+            }
+            foreach ($name in $protectedNames) {
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir $name)) "Protected queue metadata claim was not quarantined: $name"
+                Check (Test-Path -LiteralPath (Join-Path $FailedRequestsDir "$name.error.txt")) "Missing protected-metadata rejection reason: $name"
+            }
         }
         Case 'Unapproved, required-uninstall, oversized and root-array requests are quarantined' {
             foreach ($name in @('unapproved.json','required-uninstall.json','oversized.json','array-root.json')) {
@@ -199,6 +256,105 @@ public static class FixtureMsiProbe {
             Check (@(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued | Where-Object { $_.Action -ne 'Install' -or $_.Alias -ne 'ci' }).Count -eq 0) 'Invalid request reached the executable queue.'
             Invoke-ProcessQueueMode
             Check (@(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued).Count -eq 0) 'Accepted user queue did not drain.'
+        }
+        Case 'Actual standard-user non-Required Uninstall retains its existing policy on both server and client' {
+            $deferredPath = Join-Path $RequestsDir 'standard-uninstall.deferred'
+            Check ((Get-RequestFileOwnerInfo -Path $deferredPath).Sid -eq $accounts.StandardSid) 'Deferred Uninstall was not created by the real standard account.'
+            try {
+                Remove-ItemProperty -LiteralPath $PolicyRequiredRoot -Name ci
+                Move-Item -LiteralPath $deferredPath -Destination (Join-Path $RequestsDir 'standard-uninstall.json')
+                Invoke-ProcessRequestsMode
+                $items = @(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued)
+                Check ($items.Count -eq 1 -and $items[0].Action -eq 'Uninstall' -and $items[0].RequestedBySid -eq $accounts.StandardSid) 'Standard-user Uninstall received a new blanket admin restriction.'
+                $uninstallId = $items[0].Id
+                Invoke-ProcessQueueMode
+                $completed = Read-QueueItemFile -Path (Get-QueueItemPath -Directory $QueueSucceededDir -Id $uninstallId)
+                Check ($null -ne $completed -and -not (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe'))) 'Permitted standard-user Uninstall did not complete.'
+            }
+            finally { New-ItemProperty -LiteralPath $PolicyRequiredRoot -Name ci -PropertyType String -Value 1 -Force | Out-Null }
+            Invoke-ProcessQueueMode
+            Check (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe')) 'Required policy did not restore the fixture after permitted Uninstall.'
+        }
+        Case 'Historical protected Source=User queues are reauthorized before the already-installed shortcut' {
+            Check ((Get-InstalledPackageIdSet).Contains($config.PackageId)) 'Stale-queue test requires the actual installed MSI snapshot.'
+            foreach ($version in @(0,1)) {
+                # Seed only the protected old queue as SYSTEM. Version zero
+                # represents old acceptance; version one also proves CURRENT
+                # membership is checked rather than trusting a previous marker.
+                $old = New-QueueItem -Action Install -Alias ci -PackageId $config.PackageId -DisplayName $config.Name -Source User `
+                    -Required $true -RequestedBy 'Historical standard user' -RequestedBySid $accounts.StandardSid
+                $old.UserInstallAuthorizationVersion = $version
+                Check ((Add-QueueItem -Item $old).Added) 'Could not seed protected historical User queue.'
+                $before = Get-CiWingetMutationCount
+                Invoke-ProcessQueueMode
+                $directory = if ($isServer) { $QueueFailedDir } else { $QueueSucceededDir }
+                $completed = Read-QueueItemFile -Path (Get-QueueItemPath -Directory $directory -Id $old.Id)
+                Check ($null -ne $completed) "Historical queue version $version produced the wrong terminal state."
+                Check ($completed.RequestedBySid -eq $accounts.StandardSid -and $completed.Source -eq 'User') 'Historical protected identity/source changed.'
+                Check ((Get-CiWingetMutationCount) -eq $before) 'Historical already-installed item unexpectedly dispatched an installer.'
+                if ($isServer) { Check ($completed.State -eq 'Failed' -and $completed.ExitCode -ne 0) 'Server old user queue bypassed authorization through installed/Required shortcut.' }
+                else { Check ($completed.State -eq 'Succeeded') 'Client historical standard-user queue was incorrectly denied.' }
+            }
+        }
+        Case 'Missing-MSI historical standard-user dispatch is denied on Server and remains allowed on client' {
+            $enforceBefore = (Get-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired).EnforceRequired
+            try {
+                New-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired -PropertyType DWord -Value 0 -Force | Out-Null
+                Check ((Run-Msi ("/x {0} ALLUSERS=1 /qn /norestart" -f $config.ProductCode)) -eq 0) 'Could not remove fixture for dispatch authorization proof.'
+                $old = New-QueueItem -Action Install -Alias ci -PackageId $config.PackageId -DisplayName $config.Name -Source User `
+                    -Required $true -RequestedBy 'Historical standard user' -RequestedBySid $accounts.StandardSid
+                $old.UserInstallAuthorizationVersion = 1
+                Check ((Add-QueueItem -Item $old).Added) 'Could not seed missing-package historical queue.'
+                $before = Get-CiWingetMutationCount
+                Invoke-ProcessQueueMode
+                $directory = if ($isServer) { $QueueFailedDir } else { $QueueSucceededDir }
+                $completed = Read-QueueItemFile -Path (Get-QueueItemPath -Directory $directory -Id $old.Id)
+                Check ($null -ne $completed -and $completed.Source -eq 'User' -and $completed.RequestedBySid -eq $accounts.StandardSid) 'Historical queue identity or expected terminal state was lost.'
+                if ($isServer) {
+                    Check ($completed.State -eq 'Failed') 'Unauthorized old queue installed missing MSI.'
+                    Check ((Get-CiWingetMutationCount) -eq $before -and -not (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe'))) 'Unauthorized old queue dispatched an installer.'
+                }
+                else {
+                    Check ($completed.State -eq 'Succeeded') 'Client standard-user MSI installation was newly restricted.'
+                    Check ((Get-CiWingetMutationCount) -gt $before -and (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe'))) 'Client standard-user queue did not dispatch and install the actual MSI.'
+                }
+            }
+            finally { New-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired -PropertyType DWord -Value $enforceBefore -Force | Out-Null }
+            Invoke-ProcessQueueMode
+            Check (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe')) 'Authentic Required/System policy did not restore or preserve the MSI.'
+            Check (@(Get-QueueItemsInDirectory -Directory $QueueSucceededDir -DefaultState Succeeded | Where-Object { $_.Source -eq 'Required' -and $_.PackageId -eq $config.PackageId }).Count -gt 0) 'Required policy queue did not complete.'
+        }
+        Case 'Authentic protected System update queue remains permitted' {
+            $systemItem = New-QueueItem -Action UpgradeAll -Source System -RequestedBy SYSTEM -RequestedBySid 'S-1-5-18'
+            Check ((Add-QueueItem -Item $systemItem).Added) 'System update was not queued.'
+            Invoke-ProcessQueueMode
+            $completed = Read-QueueItemFile -Path (Get-QueueItemPath -Directory $QueueSucceededDir -Id $systemItem.Id)
+            Check ($null -ne $completed -and $completed.Source -eq 'System') 'Authentic System update was denied.'
+        }
+    }
+    elseif ($Phase -eq 'AdministratorRequests') {
+        $accounts = Get-Content -LiteralPath (Join-Path $Root 'authorization-accounts.json') -Raw | ConvertFrom-Json
+        Case 'Actual administrator-account file owner is allowed despite forged non-admin JSON identity' {
+            Check (Test-AdministratorSid -Sid $accounts.AdministratorSid) 'Real administrator account failed fresh production Authz resolution.'
+            $requestDirectory = if (Test-ServerOperatingSystem) { Get-AdminRequestsDirectory } else { $RequestsDir }
+            $owner = Get-RequestFileOwnerInfo -Path (Join-Path $requestDirectory 'admin-install.json')
+            Check ($owner.Sid -eq $accounts.AdministratorSid) 'Admin helper did not explicitly retain its actual individual account owner.'
+            Invoke-ProcessRequestsMode
+            $accepted = @(Get-QueueItemsInDirectory -Directory $QueuePendingDir -DefaultState Queued)
+            Check ($accepted.Count -eq 1 -and $accepted[0].Action -eq 'Install' -and $accepted[0].Source -eq 'User') 'Real admin Install was not queued as User.'
+            Check ($accepted[0].RequestedBySid -eq $owner.Sid -and $accepted[0].RequestedBySid -ne $accounts.StandardSid) 'Admin request used spoofed JSON identity rather than its real file owner.'
+            $adminItem = $accepted[0]
+            $enforceBefore = (Get-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired).EnforceRequired
+            try {
+                New-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired -PropertyType DWord -Value 0 -Force | Out-Null
+                Check ((Run-Msi ("/x {0} ALLUSERS=1 /qn /norestart" -f $config.ProductCode)) -eq 0) 'Could not remove fixture for actual admin Install dispatch.'
+                $before = Get-CiWingetMutationCount
+                Invoke-ProcessQueueMode
+                $completed = Read-QueueItemFile -Path (Get-QueueItemPath -Directory $QueueSucceededDir -Id $adminItem.Id)
+                Check ($null -ne $completed -and $completed.Source -eq 'User' -and $completed.RequestedBySid -eq $owner.Sid) 'Admin account request did not complete through the User authorization path.'
+                Check ((Get-CiWingetMutationCount) -gt $before -and (Test-Path -LiteralPath (Join-Path $config.MachineDir 'fixture.exe'))) 'Real admin request did not dispatch and complete the native MSI installation.'
+            }
+            finally { New-ItemProperty -LiteralPath $PolicyRoot -Name EnforceRequired -PropertyType DWord -Value $enforceBefore -Force | Out-Null }
         }
     }
     else {

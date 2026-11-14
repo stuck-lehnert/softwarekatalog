@@ -135,9 +135,34 @@ Runtime request files are written below:
 
 ```text
 C:\ProgramData\__Softwarekatalog\Requests\
+C:\ProgramData\__Softwarekatalog\AdminRequests\
 C:\ProgramData\__Softwarekatalog\Processed\
 C:\ProgramData\__Softwarekatalog\Failed\
 ```
+
+### Additional installations on Windows Server
+
+On Windows Server (including domain controllers), only administrators may
+request additional package installations. **Start the catalog or
+`Request-App.ps1` as administrator**: a UAC-filtered administrator session is
+not sufficient. The existing `AllowUserInstalls` policy remains an upper bound;
+disabling it also blocks these administrator requests.
+
+Elevated server clients submit installations through `AdminRequests`, a
+SYSTEM/Administrators-writable directory. The SYSTEM worker additionally checks
+the actual NTFS file owner and current administrator membership, rather than
+trusting requester names/SIDs or privileged queue metadata from request JSON.
+All server installations submitted through the ordinary `Requests` directory or
+legacy `-Mode ProcessRequest` CLI are rejected, even with a claimed admin/SYSTEM
+identity. Existing user-install queue entries without the new authorization
+provenance must be requested again as administrator. Membership is rechecked
+before execution, including when a package appears already installed.
+
+Deploy the updated setup with `-Mode Install` to create/protect the new input
+directory and regenerate both clients. Required-software enforcement and
+automatic SYSTEM updates remain operational; required aliases are checked
+against current policy. Windows client editions retain ordinary-user self
+service. Status requests and the existing uninstall policy are unchanged.
 
 ## Machine Scope and Existing SYSTEM-profile Installations
 

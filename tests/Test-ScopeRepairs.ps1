@@ -473,6 +473,8 @@ try {
     Test 'Failed repair bypasses the installed shortcut with a failure, not already installed' {
         $script:ScopeRepairFailures = @('ArtCraft.GridCraft')
         function Get-RequiredAliases { return @() }
+        function Test-UserInstallsAllowed { return $true }
+        function Test-ServerOperatingSystem { return $false } # OS boundary; authorization has its own suite.
         $item = [pscustomobject]@{ Action = 'Install'; Alias = 'grid'; Id = 'test' }
         Assert-Throws { Invoke-QueuedItem -Item $item -WingetPath fake } 'repair.*failed'
         Assert ($script:events.Count -eq 0)

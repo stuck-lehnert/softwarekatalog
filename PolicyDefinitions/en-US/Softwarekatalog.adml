@@ -12,6 +12,7 @@
       <presentation id="Softwarekatalog_Settings">
         <checkBox refId="EnableArtCraft" defaultChecked="false">Offer ArtCraft applications (direct stable vendor releases)</checkBox>
         <checkBox refId="AllowUserInstalls">Allow users to install software</checkBox>
+        <text>On Windows Server, additional installations require an administrator running the catalog or Request-App.ps1 as administrator. This checkbox must also be enabled for those requests. Required software and automatic SYSTEM updates are independent.</text>
         <checkBox refId="AllowUserUninstall">Allow users to uninstall software</checkBox>
         <checkBox refId="EnforceRequired">Automatically install required software</checkBox>
         <listBox refId="Catalog">Allowed software. Name = alias, value = PackageId|DisplayName|Description.</listBox>

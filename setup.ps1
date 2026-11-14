@@ -176,6 +176,7 @@ function Set-DirectoryAcl {
     $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
     $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
 
+    $acl.SetOwner($sidAdmins)
     $ruleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $sidSystem, 'FullControl', $inheritance, $propagation, 'Allow'
     )
@@ -217,6 +218,7 @@ function Set-RequestDirectoryAcl {
     $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
     $sidCreatorOwner = New-Object System.Security.Principal.SecurityIdentifier('S-1-3-0')
 
+    $acl.SetOwner($sidAdmins)
     $ruleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $sidSystem, 'FullControl', $inheritance, $noPropagation, 'Allow'
     )
@@ -248,6 +250,7 @@ function Set-FileAclAdminsOnly {
     $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
     $sidUsers = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
 
+    $acl.SetOwner($sidAdmins)
     $ruleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule(
         $sidSystem, 'FullControl', 'Allow'
     )
@@ -304,6 +307,175 @@ function Test-UserUninstallAllowed {
 
 function Test-RequiredEnforcementEnabled {
     (Get-PolicyDword -Name 'EnforceRequired' -Default 1) -eq 1
+}
+
+function Test-ServerOperatingSystem {
+    # HKLM\SYSTEM is not subject to WOW64 registry redirection. Do not guess
+    # from a display name, environment variable or a failed WMI query.
+    $product = (Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\ProductOptions' -ErrorAction Stop).ProductType
+    switch ($product) {
+        'WinNT' { return $false }
+        'ServerNT' { return $true }
+        'LanmanNT' { return $true } # Domain controller
+        default { throw 'Windows-Produkttyp konnte nicht sicher bestimmt werden; Installation verweigert.' }
+    }
+}
+
+function Get-CurrentUserAccount {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $sid = $identity.User.Value
+        # Groups includes the deny-only Administrators SID of a UAC-filtered
+        # administrator. This is a UX hint, not the SYSTEM worker's authority.
+        [pscustomobject]@{
+            Sid = $sid; Name = $identity.Name
+            Administrator = ($sid -eq 'S-1-5-18' -or @($identity.Groups | Where-Object Value -eq 'S-1-5-32-544').Count -gt 0)
+            ElevatedAdministrator = (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        }
+    }
+    finally { $identity.Dispose() }
+}
+
+function Get-CurrentUserInstallAuthorization {
+    if (-not (Test-UserInstallsAllowed)) {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Benutzerinstallationen sind per Richtlinie deaktiviert.' }
+    }
+    try {
+        if (Test-ServerOperatingSystem) {
+            $account = Get-CurrentUserAccount
+            if (-not $account.Administrator) {
+                return [pscustomobject]@{ Allowed = $false; Reason = 'Auf Windows-Servern dürfen nur Administratoren zusätzliche Pakete installieren.' }
+            }
+            if (-not $account.ElevatedAdministrator) {
+                return [pscustomobject]@{ Allowed = $false; Reason = 'Auf Windows-Servern den Katalog bzw. Request-App.ps1 als Administrator starten.' }
+            }
+        }
+        return [pscustomobject]@{ Allowed = $true; Reason = '' }
+    }
+    catch {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Installationsberechtigung konnte nicht sicher geprüft werden.' }
+    }
+}
+
+function Initialize-AuthorizationNativeApi {
+    if ('Softwarekatalog.AuthorizationNative' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
+
+namespace Softwarekatalog {
+    public static class AuthorizationNative {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Luid { public uint Low; public int High; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SidAndAttributes { public IntPtr Sid; public uint Attributes; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct TokenGroups { public uint Count; public SidAndAttributes First; }
+
+        [DllImport("authz.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AuthzInitializeResourceManager(uint flags, IntPtr check, IntPtr groups, IntPtr freeGroups, string name, out IntPtr manager);
+        [DllImport("authz.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AuthzInitializeContextFromSid(uint flags, byte[] sid, IntPtr manager, IntPtr expiration, Luid identifier, IntPtr args, out IntPtr context);
+        [DllImport("authz.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AuthzGetInformationFromContext(IntPtr context, int infoClass, uint size, out uint required, IntPtr buffer);
+        [DllImport("authz.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AuthzFreeContext(IntPtr context);
+        [DllImport("authz.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AuthzFreeResourceManager(IntPtr manager);
+        [DllImport("advapi32.dll")]
+        private static extern uint GetSecurityInfo(SafeFileHandle file, int objectType, uint info, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+        [DllImport("advapi32.dll")]
+        private static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr LocalFree(IntPtr memory);
+
+        public static bool IsAdministrator(string value) {
+            var sid = new SecurityIdentifier(value);
+            byte[] bytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(bytes, 0);
+            IntPtr manager = IntPtr.Zero, context = IntPtr.Zero, buffer = IntPtr.Zero;
+            try {
+                // No positive membership cache and no caller-supplied groups.
+                // Authz obtains current local/domain groups via S4U/account lookup.
+                if (!AuthzInitializeResourceManager(1, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, "Softwarekatalog", out manager)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (!AuthzInitializeContextFromSid(0, bytes, manager, IntPtr.Zero, new Luid(), IntPtr.Zero, out context)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint required;
+                bool sized = AuthzGetInformationFromContext(context, 2, 0, out required, IntPtr.Zero); // GroupsSids
+                int error = Marshal.GetLastWin32Error();
+                if (!sized && error != 122) throw new Win32Exception(error);
+                int offset = Marshal.OffsetOf(typeof(TokenGroups), "First").ToInt32();
+                if (required < offset || required > 1048576) throw new InvalidOperationException("Invalid Authz groups size.");
+                buffer = Marshal.AllocHGlobal((int)required);
+                if (!AuthzGetInformationFromContext(context, 2, required, out required, buffer)) throw new Win32Exception(Marshal.GetLastWin32Error());
+                uint count = unchecked((uint)Marshal.ReadInt32(buffer));
+                int stride = Marshal.SizeOf(typeof(SidAndAttributes));
+                if (offset + (long)count * stride > required) throw new InvalidOperationException("Invalid Authz groups count.");
+                for (uint i = 0; i < count; i++) {
+                    IntPtr group = Marshal.ReadIntPtr(buffer, checked(offset + (int)i * stride));
+                    // Account membership is intended, including UAC deny-only
+                    // groups, not whether an interactive token is elevated.
+                    if (new SecurityIdentifier(group).IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)) return true;
+                }
+                return false;
+            }
+            finally {
+                if (buffer != IntPtr.Zero) Marshal.FreeHGlobal(buffer);
+                if (context != IntPtr.Zero) AuthzFreeContext(context);
+                if (manager != IntPtr.Zero) AuthzFreeResourceManager(manager);
+            }
+        }
+
+        public static FileSecurity ReadFileSecurity(SafeFileHandle file) {
+            IntPtr owner, group, dacl, sacl, descriptor;
+            uint error = GetSecurityInfo(file, 1, 5, out owner, out group, out dacl, out sacl, out descriptor); // FILE, OWNER|DACL
+            if (error != 0) throw new Win32Exception((int)error);
+            try {
+                uint size = GetSecurityDescriptorLength(descriptor);
+                if (size == 0 || size > 1048576) throw new InvalidOperationException("Invalid file security descriptor.");
+                byte[] bytes = new byte[size];
+                Marshal.Copy(descriptor, bytes, 0, bytes.Length);
+                var security = new FileSecurity();
+                security.SetSecurityDescriptorBinaryForm(bytes, AccessControlSections.Owner | AccessControlSections.Access);
+                return security;
+            }
+            finally { if (descriptor != IntPtr.Zero) LocalFree(descriptor); }
+        }
+    }
+}
+'@
+}
+
+function Test-AdministratorSid {
+    param([AllowNull()][AllowEmptyString()][string]$Sid)
+    if ([string]::IsNullOrWhiteSpace($Sid)) { return $false }
+    # Actual file ownership by these privileged principals is also legitimate.
+    # Request JSON and CLI display-name claims never supply this evidence.
+    if ($Sid -in @('S-1-5-18','S-1-5-32-544')) { return $true }
+    try {
+        Initialize-AuthorizationNativeApi
+        return [Softwarekatalog.AuthorizationNative]::IsAdministrator($Sid)
+    }
+    catch {
+        Write-Log "Cannot verify administrator membership for SID '$Sid': $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Assert-UserInstallAuthorized {
+    param([AllowNull()][AllowEmptyString()][string]$RequestedBySid)
+    if (-not (Test-UserInstallsAllowed)) { throw 'Benutzerinstallationen sind per Richtlinie deaktiviert.' }
+    if ((Test-ServerOperatingSystem) -and -not (Test-AdministratorSid -Sid $RequestedBySid)) {
+        throw 'Auf Windows-Servern dürfen nur Administratoren zusätzliche Pakete installieren; Kontoberechtigung nicht nachgewiesen.'
+    }
 }
 
 function Get-PolicyStringValues {
@@ -589,6 +761,7 @@ function ConvertTo-QueueItemRecord {
         Required = ConvertTo-QueueBool -Value (Get-QueueObjectValue -Object $Item -Name 'Required' -Default $false)
         RequestedBy = [string](Get-QueueObjectValue -Object $Item -Name 'RequestedBy' -Default '')
         RequestedBySid = [string](Get-QueueObjectValue -Object $Item -Name 'RequestedBySid' -Default '')
+        UserInstallAuthorizationVersion = [int](Get-QueueObjectValue -Object $Item -Name 'UserInstallAuthorizationVersion' -Default 0)
         State = $state
         Stage = [string](Get-QueueObjectValue -Object $Item -Name 'Stage' -Default $state)
         StageText = [string](Get-QueueObjectValue -Object $Item -Name 'StageText' -Default '')
@@ -929,6 +1102,7 @@ function New-QueueItem {
         Required = [bool]$Required
         RequestedBy = $RequestedBy
         RequestedBySid = $RequestedBySid
+        UserInstallAuthorizationVersion = 0
         State = 'Queued'
         Stage = 'Queued'
         StageText = 'In Warteschlange'
@@ -1135,6 +1309,8 @@ function Add-SoftwareRequestToQueue {
 
     $requiredSet = Get-RequiredAliasSet
     $isRequired = $requiredSet.Contains($normalizedAlias)
+    if ($Source -eq 'Required' -and -not $isRequired) { throw 'Pflichtauftrag ist nicht mehr durch die aktuelle Richtlinie gedeckt.' }
+    if ($Action -eq 'Install' -and $Source -eq 'User') { Assert-UserInstallAuthorized -RequestedBySid $RequestedBySid }
     if ($Action -eq 'Uninstall' -and $isRequired) {
         throw 'Pflichtsoftware kann nicht zur Deinstallation angefragt werden.'
     }
@@ -1149,6 +1325,7 @@ function Add-SoftwareRequestToQueue {
         -RequestedBy $RequestedBy `
         -RequestedBySid $RequestedBySid
 
+    if ($Action -eq 'Install' -and $Source -eq 'User' -and (Test-ServerOperatingSystem)) { $item.UserInstallAuthorizationVersion = 1 }
     return Add-QueueItem -Item $item -TimeoutSeconds $TimeoutSeconds
 }
 
@@ -1485,6 +1662,72 @@ function Get-ArtCraftClientFunctionText {
     }) -join "`n`n")
 }
 
+function Get-AdminRequestsDirectory {
+    Join-Path (Split-Path $RequestsDir -Parent) 'AdminRequests'
+}
+
+function Assert-AdminRequestsDirectory {
+    $path = Get-AdminRequestsDirectory
+    $directory = Get-Item -LiteralPath $path -ErrorAction Stop
+    if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Unsicheres Administrator-Anfrageverzeichnis.' }
+    $acl = Get-Acl -LiteralPath $path -ErrorAction Stop
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'Anfrageverzeichnis hat keinen privilegierten Eigentümer.' }
+    $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorBinaryForm(), 0)
+    if ($null -eq $descriptor.DiscretionaryAcl) { throw 'Anfrageverzeichnis hat keine sichere DACL.' }
+    $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            -not ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) -and
+            ($rule.FileSystemRights -band $writeMask) -and $rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544')) {
+            throw 'Anfrageverzeichnis ist durch nicht privilegierte Benutzer beschreibbar.'
+        }
+    }
+}
+
+function New-CatalogRequestFile {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Install','Uninstall','RefreshStatus')][string]$Command,
+        [string]$Alias
+    )
+    $directory = $RequestsDir
+    if ($Command -eq 'Install') {
+        $authorization = Get-CurrentUserInstallAuthorization
+        if (-not $authorization.Allowed) { throw $authorization.Reason }
+        if (Test-ServerOperatingSystem) { $directory = Get-AdminRequestsDirectory }
+    }
+    if (-not (Test-Path -LiteralPath $directory)) { throw "Anfrageverzeichnis '$directory' fehlt. Bitte Setup erneut ausführen." }
+    $id = [Guid]::NewGuid().ToString('N')
+    $tempPath = Join-Path $directory "$id.tmp"
+    $finalPath = Join-Path $directory "$id.json"
+    try {
+        [ordered]@{ Id=$id; Command=$Command; AppAlias=$Alias; CreatedAt=(Get-Date).ToString('o') } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        # Elevated tokens may default to the Administrators GROUP as owner.
+        # Bind the request to the actual account for later membership rechecks.
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            $acl = Get-Acl -LiteralPath $tempPath -ErrorAction Stop
+            if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $identity.User.Value) {
+                $acl.SetOwner($identity.User)
+                Set-Acl -LiteralPath $tempPath -AclObject $acl -ErrorAction Stop
+            }
+        }
+        finally { $identity.Dispose() }
+        Move-Item -LiteralPath $tempPath -Destination $finalPath -ErrorAction Stop
+    }
+    finally { if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force } }
+}
+
+function Get-ClientAuthorizationFunctionText {
+    $names = @('Test-UserInstallsAllowed','Test-ServerOperatingSystem','Get-CurrentUserAccount',
+        'Get-CurrentUserInstallAuthorization','Get-AdminRequestsDirectory','New-CatalogRequestFile')
+    return (($names | ForEach-Object {
+        "function $_ {`n$((Get-Command $_ -CommandType Function).ScriptBlock.ToString())`n}"
+    }) -join "`n`n")
+}
+
 function Get-BundledSoftwarekatalogSource {
     param([Parameter(Mandatory)][string]$Path)
     $source = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
@@ -1504,6 +1747,7 @@ function New-UserRequestTool {
     $policyCatalogLiteral = $PolicyCatalogRoot.Replace("'", "''")
     $policyMaxEntriesLiteral = $PolicyMaxEntries
     $artCraftFunctions = Get-ArtCraftClientFunctionText
+    $authorizationFunctions = Get-ClientAuthorizationFunctionText
 
 $content = @"
 [CmdletBinding()]
@@ -1524,6 +1768,7 @@ Set-StrictMode -Version Latest
 `$PolicyMaxEntries = $policyMaxEntriesLiteral
 
 $artCraftFunctions
+$authorizationFunctions
 
 function Get-PolicyDword {
     param([Parameter(Mandatory=`$true)][string]`$Name, [int]`$Default = 0)
@@ -1594,30 +1839,6 @@ function Get-PolicyCatalogObjects {
     }
 }
 
-function New-CatalogRequestFile {
-    param(
-        [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall','RefreshStatus')][string]`$Command,
-        [string]`$Alias
-    )
-
-    if (-not (Test-Path -LiteralPath `$RequestsDir)) {
-        throw "Request directory '`$RequestsDir' does not exist. Run setup first."
-    }
-
-    `$id = [Guid]::NewGuid().ToString('N')
-    `$payload = [ordered]@{
-        Id = `$id
-        Command = `$Command
-        AppAlias = `$Alias
-        CreatedAt = (Get-Date).ToString('o')
-    }
-
-    `$tempPath = Join-Path `$RequestsDir ("`$id.tmp")
-    `$finalPath = Join-Path `$RequestsDir ("`$id.json")
-    `$payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `$tempPath -Encoding UTF8
-    Move-Item -LiteralPath `$tempPath -Destination `$finalPath -Force
-}
-
 if (`$Uninstall) {
     `$Action = 'Uninstall'
 }
@@ -1665,6 +1886,7 @@ function New-CatalogGui {
     $policyRequiredLiteral = $PolicyRequiredRoot.Replace("'", "''")
     $policyMaxEntriesLiteral = $PolicyMaxEntries
     $artCraftFunctions = Get-ArtCraftClientFunctionText
+    $authorizationFunctions = Get-ClientAuthorizationFunctionText
 
 $content = @"
 Add-Type -AssemblyName System.Windows.Forms
@@ -1786,7 +2008,9 @@ Set-StrictMode -Version Latest
 `$PolicyRequiredRoot = '$policyRequiredLiteral'
 `$PolicyMaxEntries = $policyMaxEntriesLiteral
 $artCraftFunctions
+$authorizationFunctions
 `$AllowUserInstalls = `$true
+`$InstallRestrictionMessage = ''
 `$AllowUserUninstall = `$true
 `$RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 `$LastStateVersion = -1
@@ -1853,6 +2077,7 @@ function Invoke-CatalogLocal {
     switch (`$commandName) {
         { `$_ -in @('getcatalog','getstate') } {
             `$queueState = Get-QueueStateSnapshot
+            `$installAuthorization = Get-CurrentUserInstallAuthorization
             return [pscustomobject]@{
                 Success = `$true
                 Command = `$commandName
@@ -1862,7 +2087,8 @@ function Invoke-CatalogLocal {
                 Current = `$queueState.Current
                 Version = `$queueState.Version
                 InstalledPackageIds = @(Get-InstalledPackageIds)
-                AllowUserInstalls = (Test-UserInstallsAllowed)
+                AllowUserInstalls = `$installAuthorization.Allowed
+                InstallRestrictionMessage = `$installAuthorization.Reason
                 AllowUserUninstall = (Test-UserUninstallAllowed)
                 EnforceRequired = (Test-RequiredEnforcementEnabled)
                 Message = 'Katalog geladen.'
@@ -1906,7 +2132,6 @@ function Get-PolicyDword {
 }
 
 function Test-SoftwareCatalogPolicyEnabled { (Get-PolicyDword -Name 'Enabled' -Default 0) -eq 1 }
-function Test-UserInstallsAllowed { (Get-PolicyDword -Name 'AllowUserInstalls' -Default 1) -eq 1 }
 function Test-UserUninstallAllowed { (Get-PolicyDword -Name 'AllowUserUninstall' -Default 1) -eq 1 }
 function Test-RequiredEnforcementEnabled { (Get-PolicyDword -Name 'EnforceRequired' -Default 1) -eq 1 }
 
@@ -2004,30 +2229,6 @@ function Get-InstalledPackageIds {
     }
 }
 
-function New-CatalogRequestFile {
-    param(
-        [Parameter(Mandatory=`$true)][ValidateSet('Install','Uninstall','RefreshStatus')][string]`$Command,
-        [string]`$Alias
-    )
-
-    if (-not (Test-Path -LiteralPath `$RequestsDir)) {
-        throw "Anfrageverzeichnis '`$RequestsDir' fehlt. Bitte Setup erneut ausführen."
-    }
-
-    `$id = [Guid]::NewGuid().ToString('N')
-    `$payload = [ordered]@{
-        Id = `$id
-        Command = `$Command
-        AppAlias = `$Alias
-        CreatedAt = (Get-Date).ToString('o')
-    }
-
-    `$tempPath = Join-Path `$RequestsDir ("`$id.tmp")
-    `$finalPath = Join-Path `$RequestsDir ("`$id.json")
-    `$payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath `$tempPath -Encoding UTF8
-    Move-Item -LiteralPath `$tempPath -Destination `$finalPath -Force
-}
-
 function New-AppRequest {
     param(
         [Parameter(Mandatory=`$true)][string]`$Alias,
@@ -2040,6 +2241,7 @@ function New-AppRequest {
 function Get-CatalogApps {
     `$response = Invoke-CatalogLocal -Command 'GetState'
     `$script:AllowUserInstalls = [bool]`$response.AllowUserInstalls
+    `$script:InstallRestrictionMessage = [string]`$response.InstallRestrictionMessage
     `$script:AllowUserUninstall = [bool]`$response.AllowUserUninstall
     `$script:RequiredAliasSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach (`$alias in @(`$response.RequiredAliases)) {
@@ -2287,6 +2489,8 @@ function Sort-ListByColumn {
 `$infoPanel.Controls.Add(`$installedLabel)
 
 function Update-InstallButtonState {
+    `$listCaption.Text = 'Freigegebene Anwendungen'
+    if (`$script:InstallRestrictionMessage) { `$listCaption.Text += ' – ' + `$script:InstallRestrictionMessage }
     if (`$list.SelectedItems.Count -lt 1) {
         `$btnInstall.Enabled = `$false
         `$btnUninstall.Enabled = `$false
@@ -3936,6 +4140,18 @@ function Invoke-QueuedItem {
         return
     }
 
+    if ($Item.Action -eq 'Install') {
+        if ((Get-QueueObjectValue $Item 'Source' 'User') -eq 'Required' -and $requiredSet.Contains([string]$Item.Alias)) {
+            # This source is only created in the protected SYSTEM queue.
+        }
+        else {
+            Assert-UserInstallAuthorized -RequestedBySid ([string](Get-QueueObjectValue $Item 'RequestedBySid' ''))
+            if ((Test-ServerOperatingSystem) -and (Get-QueueObjectValue $Item 'UserInstallAuthorizationVersion' 0) -ne 1) {
+                throw 'Alter Installationsauftrag ohne überprüfbare Server-Autorisierung; bitte als Administrator erneut anfordern.'
+            }
+        }
+    }
+
     if ($Item.Action -eq 'Install' -and [string]$app.PackageId -in $script:ScopeRepairFailures) {
         throw "SYSTEM-profile repair of '$($app.PackageId)' failed; see service.log."
     }
@@ -4066,6 +4282,12 @@ function Invoke-ProcessRequestMode {
         throw 'AppAlias is required for ProcessRequest mode.'
     }
 
+    if ($RequestAction -eq 'Install' -and (Test-ServerOperatingSystem)) {
+        # No authenticated file exists on this legacy CLI route. A SYSTEM
+        # wrapper cannot vouch for an arbitrary RequestedBySid argument either.
+        throw 'Installationen auf Servern benötigen eine authentifizierte Dateianfrage über Request-App.ps1 oder den Katalog.'
+    }
+
     $alias = $AppAlias.Trim().ToLowerInvariant()
     $app = Get-AppCatalogObjectByAlias -Alias $alias
     if (-not $app) {
@@ -4090,30 +4312,46 @@ function Invoke-ProcessRequestMode {
 }
 
 function Get-RequestFileOwnerInfo {
-    param([Parameter(Mandatory)][string]$Path)
-
+    param([Parameter(Mandatory)][string]$Path, [IO.FileStream]$Stream)
+    # Keep standalone ownership inspections compatible. The request processor
+    # passes its existing read handle so bytes and security stay inseparable.
+    if (-not $Stream) {
+        $opened = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try { return Get-RequestFileOwnerInfo -Path $Path -Stream $opened }
+        finally { $opened.Dispose() }
+    }
     $ownerName = 'Unknown'
     $ownerSid = $null
+    $safeForInstall = $false
 
     try {
-        $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-        if ($acl.Owner) {
-            $ownerName = [string]$acl.Owner
-            try {
-                $account = New-Object System.Security.Principal.NTAccount($ownerName)
-                $ownerSid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
-            }
-            catch {
+        Initialize-AuthorizationNativeApi
+        $acl = [Softwarekatalog.AuthorizationNative]::ReadFileSecurity($Stream.SafeFileHandle)
+        $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier])
+        $ownerSid = $owner.Value
+        $ownerName = $ownerSid
+        try { $ownerName = $owner.Translate([Security.Principal.NTAccount]).Value } catch {}
+        $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($acl.GetSecurityDescriptorBinaryForm(), 0)
+        $safeForInstall = ($null -ne $descriptor.DiscretionaryAcl)
+        $writeMask = [Security.AccessControl.FileSystemRights]::Write -bor
+            [Security.AccessControl.FileSystemRights]::ChangePermissions -bor [Security.AccessControl.FileSystemRights]::TakeOwnership
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                ($rule.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+            if (($rule.FileSystemRights -band $writeMask) -and $rule.IdentityReference.Value -notin @($ownerSid,'S-1-5-18','S-1-5-32-544')) {
+                $safeForInstall = $false
             }
         }
     }
     catch {
         Write-Log "Could not read request file owner '$Path': $($_.Exception.Message)" 'WARN'
+        $safeForInstall = $false
     }
 
     [pscustomobject]@{
         Name = $ownerName
         Sid  = $ownerSid
+        SafeForInstall = $safeForInstall
     }
 }
 
@@ -4289,7 +4527,16 @@ function Invoke-ProcessRequestsMode {
     Ensure-Directory -Path $FailedRequestsDir
 
     $shouldStartQueue = $false
-    $files = @(Get-ChildItem -LiteralPath $RequestsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc | Select-Object -First 200)
+    $server = Test-ServerOperatingSystem
+    $adminDirectory = Get-AdminRequestsDirectory
+    $files = @(
+        # A flood in the public drop must not starve administrator requests.
+        if ($server) {
+            Assert-AdminRequestsDirectory
+            Get-ChildItem -LiteralPath $adminDirectory -Filter '*.json' -File -ErrorAction Stop | Sort-Object CreationTimeUtc | Select-Object -First 200
+        }
+        Get-ChildItem -LiteralPath $RequestsDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object CreationTimeUtc | Select-Object -First 200
+    ) | Select-Object -First 200
 
     foreach ($file in $files) {
         try {
@@ -4301,7 +4548,15 @@ function Invoke-ProcessRequestsMode {
                 throw "Request file is too large ($($file.Length) bytes)."
             }
 
-            $raw = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8
+            # No concurrent writers/deleters while binding bytes, owner and DACL.
+            $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+                if ($stream.Length -gt 32768) { throw 'Request file is too large.' }
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 1024, $true)
+                try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+                $owner = Get-RequestFileOwnerInfo -Path $file.FullName -Stream $stream
+            }
+            finally { $stream.Dispose() }
             if ([string]::IsNullOrWhiteSpace($raw)) {
                 throw 'Request file is empty.'
             }
@@ -4312,11 +4567,13 @@ function Invoke-ProcessRequestsMode {
             if ($request -is [System.Array] -or $request -isnot [pscustomobject]) {
                 throw 'Request JSON must be an object.'
             }
+            foreach ($protectedName in @('Source','Required','UserInstallAuthorizationVersion')) {
+                if ($request.PSObject.Properties[$protectedName]) { throw "Request must not specify protected queue metadata '$protectedName'." }
+            }
 
             $commandValue = Get-RequestScalarValue -Request $request -Names @('Command','Action') -DisplayName 'Command' -MaxLength 32
             $command = $commandValue.Trim().ToLowerInvariant()
             if ($command -in @('refreshstatus','getstatus')) {
-                $owner = Get-RequestFileOwnerInfo -Path $file.FullName
                 Write-Log "Accepted status refresh request file '$($file.Name)' owner='$($owner.Name)' sid='$($owner.Sid)'."
                 Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
                 $shouldStartQueue = $true
@@ -4341,7 +4598,12 @@ function Invoke-ProcessRequestsMode {
 
             $aliasValue = Get-RequestScalarValue -Request $request -Names @('AppAlias','Alias') -DisplayName 'AppAlias' -MaxLength 128
             $alias = $aliasValue.Trim().ToLowerInvariant()
-            $owner = Get-RequestFileOwnerInfo -Path $file.FullName
+            if ($action -eq 'Install' -and $server) {
+                if (-not [string]::Equals($file.DirectoryName, $adminDirectory, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw 'Server-Installationen benötigen den geschützten Administrator-Anfrageweg; normalen Eingang verweigert.'
+                }
+                if (-not $owner.SafeForInstall) { throw 'Installationsanfrage ist nicht gegen Änderungen durch andere Benutzer geschützt.' }
+            }
             $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User -TimeoutSeconds 5
             Write-Log "Accepted request file '$($file.Name)' action=$action alias='$alias' added=$($result.Added) owner='$($owner.Name)' sid='$($owner.Sid)'."
             Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
@@ -4349,6 +4611,13 @@ function Invoke-ProcessRequestsMode {
         }
         catch {
             $message = $_.Exception.Message
+            if ($server -and [string]::Equals($file.DirectoryName, $adminDirectory, [StringComparison]::OrdinalIgnoreCase) -and
+                (Test-IsTransientRequestFailureMessage -Message $message)) {
+                # Retain provenance across retries instead of restoring this
+                # privileged request into the public drop after an update.
+                Write-Log "Administrator request '$($file.Name)' deferred: $message" 'WARN'
+                continue
+            }
             Write-Log "Rejected request file '$($file.Name)': $message" 'WARN'
             try {
                 Move-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -ErrorMessage $message
@@ -4396,6 +4665,12 @@ function Install-Service {
     Publish-QueueStateSnapshot
 
     Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
+    $adminDirectory = Get-AdminRequestsDirectory
+    if ((Test-Path -LiteralPath $adminDirectory) -and ((Get-Item -LiteralPath $adminDirectory).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'Administrator-Anfrageverzeichnis darf kein Reparse Point sein.'
+    }
+    Ensure-Directory -Path $adminDirectory
+    Set-DirectoryAcl -Path $adminDirectory -UsersCanModify:$false
     $artCraftRoot = Join-Path $BaseDir 'ArtCraft'
     Ensure-Directory -Path $artCraftRoot
     Set-DirectoryAcl -Path $artCraftRoot -UsersCanModify:$false

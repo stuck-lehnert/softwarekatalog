@@ -84,11 +84,12 @@ function Set-FileAclAdminsOnly {
     $script:aclPaths += $Path
 }
 function Get-RequestFileOwnerInfo {
-    param([string]$Path)
+    param([string]$Path, [IO.FileStream]$Stream)
     Assert (Test-Path -LiteralPath $Path) 'Owner lookup must use an existing request'
     $script:ownerPaths += $Path
-    [pscustomobject]@{ Name = 'DOMAIN\ActualOwner'; Sid = 'S-1-5-21-123-456-789-1001' }
+    [pscustomobject]@{ Name = 'DOMAIN\ActualOwner'; Sid = 'S-1-5-21-123-456-789-1001'; SafeForInstall = $true }
 }
+function Test-ServerOperatingSystem { return $false } # OS boundary; covered separately by server authorization tests.
 function Start-QueueWorkerIfAvailable { $script:workerStarts++; return $true }
 
 function Test([string]$Name, [scriptblock]$Body) {

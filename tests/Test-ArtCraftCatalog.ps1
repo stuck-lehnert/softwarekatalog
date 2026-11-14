@@ -18,6 +18,7 @@ $passed=0
 function Assert($Condition,[string]$Message='Assertion failed') { if (-not $Condition) { throw $Message } }
 function Write-Log { param($Message,$Level); $script:log+=@([string]$Message) }
 function Get-PolicyDword { param($Name,$Default=0); if ($script:policy.ContainsKey($Name)) { $script:policy[$Name] } else { $Default } }
+function Test-ServerOperatingSystem { return $false } # These are provider contracts, not OS authorization tests.
 function Get-PolicyStringValues { param($Path); if ($Path -eq $PolicyCatalogRoot) { $script:rows }; if ($Path -eq $PolicyRequiredRoot) { $script:required } }
 function Get-ArtCraftOwnership { $script:owners }
 function Get-ArtCraftInventory { $script:inventory }

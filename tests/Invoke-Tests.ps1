@@ -23,7 +23,7 @@ if ($ExpectedArchitecture -or $ExpectedOSArchitecture -or $RequireNative) {
     Write-Output ('Runtime architecture evidence: ' + ($evidence | ConvertTo-Json -Compress))
 }
 $failed = $false
-foreach ($suite in @('Test-Architecture.ps1', 'Test-GeneratedScripts.ps1', 'Test-Core.ps1', 'Test-ScopeRepairs.ps1', 'Test-ArtCraftCatalog.ps1', 'Test-ArtCraftProvider.ps1')) {
+foreach ($suite in @('Test-Architecture.ps1', 'Test-GeneratedScripts.ps1', 'Test-Core.ps1', 'Test-ServerAuthorization.ps1', 'Test-ScopeRepairs.ps1', 'Test-ArtCraftCatalog.ps1', 'Test-ArtCraftProvider.ps1')) {
     $name = [IO.Path]::GetFileNameWithoutExtension($suite)
     $stdout = Join-Path $ResultsDirectory "$name.stdout.log"
     $stderr = Join-Path $ResultsDirectory "$name.stderr.log"

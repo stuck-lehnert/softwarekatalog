@@ -34,8 +34,10 @@ if ((Test-Path $base) -or (Test-Path $policy) -or @($tasks | Where-Object { Get-
 $root = Join-Path $env:PUBLIC ('Softwarekatalog-CI-' + [Guid]::NewGuid().ToString('N'))
 $taskName = 'Softwarekatalog CI ' + [Guid]::NewGuid().ToString('N')
 $userName = 'SoftkatCi' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+$adminName = 'SoftkatAdm' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
 $createdDeployment = $false
 $createdUser = $false
+$createdAdmin = $false
 $failed = $false
 $cases = New-Object 'System.Collections.Generic.List[object]'
 New-Item -ItemType Directory -Path $ResultsDirectory -Force | Out-Null
@@ -48,6 +50,79 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1
 
 function Check($Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Record([string]$Name) { $cases.Add([pscustomobject]@{ Name = $Name; Success = $true; Error = '' }); Write-Output "PASS $Name" }
+function Invoke-CiAccountScenario {
+    param($Account, [securestring]$Password, [ValidateSet('Standard','Administrator','AdministratorFiltered')][string]$AccountKind,
+        [string]$ScenarioScript, [string]$OutputDirectory, [string]$SpoofedIdentitySid,
+        [string]$AfterScript = '', [string]$AfterOutputPath = '')
+    New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
+    $acl = Get-Acl -LiteralPath $OutputDirectory
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($Account.Sid, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    Set-Acl -LiteralPath $OutputDirectory -AclObject $acl
+    $outputPath = Join-Path $OutputDirectory 'result.json'
+    $architecturePath = Join-Path $OutputDirectory 'architecture.json'
+    $consolePath = Join-Path $OutputDirectory 'console.log'
+    # Each real account gets writable CodeDOM TEMP, a native architecture proof,
+    # and a short protected bootstrap (CreateProcessWithLogonW's 1024-char limit).
+    $command = "`$env:TEMP = '$($OutputDirectory.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($architecturePath.Replace("'", "''"))'; & '$($ScenarioScript.Replace("'", "''"))' -OutputPath '$($outputPath.Replace("'", "''"))' -AccountKind '$AccountKind' -SpoofedIdentitySid '$SpoofedIdentitySid' -FixtureRoot '$($root.Replace("'", "''"))'"
+    if ($AfterScript) { $command += "; & '$($AfterScript.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -OutputPath '$($AfterOutputPath.Replace("'", "''"))'" }
+    $bootstrap = Join-Path $root ("Run-$AccountKind.ps1")
+    [IO.File]::WriteAllText($bootstrap, ("& { `$ErrorActionPreference = 'Stop'; $command } *> '$($consolePath.Replace("'", "''"))'"), (New-Object Text.UTF8Encoding($true)))
+    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $bootstrap + '"'
+    $engine = Join-Path $PSHOME 'powershell.exe'
+    Check (($engine.Length + $arguments.Length + 4) -lt 1024) 'Credential process command line exceeds the Windows logon API limit.'
+    $qualifiedName = "$env:COMPUTERNAME\$($Account.Name)"
+    if ($AccountKind -eq 'Administrator') {
+        # The server's protected admin drop intentionally requires elevation.
+        # Password logon runs the REAL disposable admin account, not SYSTEM.
+        $accountTaskName = "$taskName Administrator"
+        $registered = $false
+        try {
+            $action = New-ScheduledTaskAction -Execute $engine -Argument $arguments -WorkingDirectory $OutputDirectory
+            $principal = New-ScheduledTaskPrincipal -UserId $qualifiedName -LogonType Password -RunLevel Highest
+            $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+            $definition = New-ScheduledTask -Action $action -Principal $principal -Settings $settings
+            # ScheduledTasks requires a string password; keep it only in memory
+            # for registration and never put it in scripts, arguments or logs.
+            $secret = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+            try {
+                $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($secret)
+                Register-ScheduledTask -TaskName $accountTaskName -InputObject $definition -User $qualifiedName -Password $plainPassword | Out-Null
+                $registered = $true
+            }
+            finally { $plainPassword = $null; [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($secret) }
+            Start-ScheduledTask -TaskName $accountTaskName
+            $deadline = (Get-Date).AddSeconds(120)
+            do {
+                $state = (Get-ScheduledTask -TaskName $accountTaskName).State
+                $info = Get-ScheduledTaskInfo -TaskName $accountTaskName
+                if ($state -ne 'Running' -and $info.LastTaskResult -eq 0 -and (Test-Path -LiteralPath $outputPath)) { break }
+                Start-Sleep -Milliseconds 250
+            } while ((Get-Date) -lt $deadline)
+            $detail = if (Test-Path -LiteralPath $consolePath) { (Get-Content -LiteralPath $consolePath -Tail 40) -join "`n" } else { 'No account console log.' }
+            Check ($state -ne 'Running' -and $info.LastTaskResult -eq 0 -and (Test-Path -LiteralPath $outputPath)) "Elevated real administrator scenario did not complete (state=$state; result=$($info.LastTaskResult)): $detail"
+            $exitCode = $info.LastTaskResult
+        }
+        finally {
+            if ($registered) {
+                Stop-ScheduledTask -TaskName $accountTaskName -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName $accountTaskName -Confirm:$false
+            }
+        }
+    }
+    else {
+        $credential = New-Object Management.Automation.PSCredential($qualifiedName, $Password)
+        $process = Start-Process -FilePath $engine -ArgumentList $arguments -Credential $credential -LoadUserProfile -WorkingDirectory $OutputDirectory -PassThru
+        $handle = $process.Handle
+        if (-not $process.WaitForExit(120000)) { $process.Kill(); throw "$AccountKind account scenario timed out; see $consolePath" }
+        $exitCode = $process.ExitCode
+    }
+    $detail = if (Test-Path -LiteralPath $consolePath) { (Get-Content -LiteralPath $consolePath -Tail 40) -join "`n" } else { 'No account console log.' }
+    Check ($exitCode -eq 0 -and (Test-Path -LiteralPath $outputPath)) "$AccountKind account scenario failed (exit=$exitCode): $detail"
+    $evidence = Get-Content -LiteralPath $architecturePath -Raw | ConvertFrom-Json
+    Assert-CiArchitectureRecord $evidence $ExpectedArchitecture $ExpectedArchitecture -RequireNative
+    Check ($evidence.Sid -eq $Account.Sid.Value -and $evidence.Sid -ne 'S-1-5-18') 'Account process used a different identity or SYSTEM substitute.'
+    [pscustomobject]@{ Result = (Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json); Architecture = $evidence }
+}
 function Write-CiError([string]$Detail) {
     if ($Detail.Length -gt 12000) { $Detail = $Detail.Substring(0, 12000) }
     $Detail = $Detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
@@ -254,22 +329,34 @@ try {
     $createdUser = $true
     $usersGroup = Get-LocalGroup -SID 'S-1-5-32-545'
     Add-LocalGroupMember -Group $usersGroup -Member $user
+    $adminPassword = ConvertTo-SecureString ('Ci!' + [Guid]::NewGuid().ToString('N') + '9aZ') -AsPlainText -Force
+    $admin = New-LocalUser -Name $adminName -Password $adminPassword -PasswordNeverExpires
+    $createdAdmin = $true
+    Add-LocalGroupMember -Group $usersGroup -Member $admin
+    Add-LocalGroupMember -Group (Get-LocalGroup -SID 'S-1-5-32-544') -Member $admin
+    [pscustomobject]@{ StandardSid = $user.Sid.Value; AdministratorSid = $admin.Sid.Value
+        StandardName = $user.Name; AdministratorName = $admin.Name } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'authorization-accounts.json') -Encoding UTF8
+    # A genuine privileged owner alone must not authorize attacker-controlled
+    # content. The standard account will move/modify this CI-only file on Server.
+    $writableTemplate = Join-Path $root 'admin-owned-writable-template.json'
+    Set-Content -LiteralPath $writableTemplate -Value '{"Command":"Install","AppAlias":"ci"}' -Encoding UTF8
+    $templateAcl = New-Object Security.AccessControl.FileSecurity
+    $administratorsSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $templateAcl.SetOwner($administratorsSid)
+    $templateAcl.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @($administratorsSid, (New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))) {
+        $templateAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'Allow')))
+    }
+    $templateAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($user.Sid, 'FullControl', 'Allow')))
+    Set-Acl -LiteralPath $writableTemplate -AclObject $templateAcl
     $userOutput = Join-Path $root 'user-output'
-    New-Item -ItemType Directory -Path $userOutput | Out-Null
-    $acl = Get-Acl $userOutput
-    $rule = New-Object Security.AccessControl.FileSystemAccessRule($user.Sid, 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
-    $acl.AddAccessRule($rule)
-    Set-Acl $userOutput $acl
     Start-Service -Name seclogon
-    $credential = New-Object Management.Automation.PSCredential("$env:COMPUTERNAME\$userName", $password)
-    $userResult = Join-Path $userOutput 'result.json'
     $userScript = Join-Path $root 'StandardUserScenario.ps1'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows\StandardUserScenario.ps1') -Destination $userScript
-    $userArchitecturePath = Join-Path $userOutput 'architecture.json'
     $artUserResult = Join-Path $userOutput 'artcraft.json'
     $artUserScript = Join-Path $root 'StandardUser-ArtCraft.ps1'
-    # Keep the existing real standard-user scenario unchanged. This additional
-    # protected bootstrap verifies all three custom-installed MSI payloads and
+    # This additional protected bootstrap verifies all three custom-installed MSI payloads and
     # their all-users shortcuts using that SAME non-administrator token.
     $artUserSource = @'
 param([string]$Root, [string]$OutputPath)
@@ -290,39 +377,19 @@ foreach ($path in @((Join-Path $env:ProgramData '__Softwarekatalog\ArtCraft\Stat
 [pscustomobject]@{ Checks = $checks; Denials = $denials } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
 '@
     [IO.File]::WriteAllText($artUserScript, $artUserSource, (New-Object Text.UTF8Encoding($true)))
-    # PS5.1 Add-Type uses CodeDOM temporary files. Do not rely on an inherited
-    # runner-admin TEMP directory being writable by this real standard user.
-    $command = "Write-Output 'Standard-user process started'; `$env:TEMP = '$($userOutput.Replace("'", "''"))'; `$env:TMP = `$env:TEMP; . '$($architectureHelper.Replace("'", "''"))'; `$null = Assert-CiWindowsArchitecture -ExpectedArchitecture '$ExpectedArchitecture' -ExpectedOSArchitecture '$ExpectedArchitecture' -RequireNative -OutputPath '$($userArchitecturePath.Replace("'", "''"))'; Write-Output 'Native architecture verified'; & '$($userScript.Replace("'", "''"))' -OutputPath '$($userResult.Replace("'", "''"))'"
-    $command += "; & '$($artUserScript.Replace("'", "''"))' -Root '$($root.Replace("'", "''"))' -OutputPath '$($artUserResult.Replace("'", "''"))'"
-    $userLog = Join-Path $userOutput 'console.log'
-    $command = "& { `$ErrorActionPreference = 'Stop'; $command } *> '$($userLog.Replace("'", "''"))'"
-    # CreateProcessWithLogonW limits the entire command line to 1024 characters.
-    # An encoded inline bootstrap exceeds that limit (Win32 error 87). Keep the
-    # bootstrap in the protected root, not the user-writable output directory.
-    $userBootstrap = Join-Path $root 'Run-StandardUser.ps1'
-    [IO.File]::WriteAllText($userBootstrap, $command, (New-Object Text.UTF8Encoding($true)))
-    $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $userBootstrap + '"'
-    $userEngine = Join-Path $PSHOME 'powershell.exe'
-    Check (($userEngine.Length + $arguments.Length + 4) -lt 1024) 'Credential process command line exceeds the Windows logon API limit.'
-    # Redirect PowerShell streams inside the child; do not inherit runner log handles.
-    $process = Start-Process -FilePath $userEngine -ArgumentList $arguments `
-        -Credential $credential -LoadUserProfile -WorkingDirectory $userOutput -PassThru
-    $handle = $process.Handle
-    if (-not $process.WaitForExit(120000)) {
-        $process.Kill()
-        $userDetail = if (Test-Path $userLog) { (Get-Content $userLog -Tail 40) -join "`n" } else { 'No console log.' }
-        throw "Standard-user scenario timed out: $userDetail"
-    }
-    $userDetail = if (Test-Path $userLog) { (Get-Content $userLog -Tail 40) -join "`n" } else { 'No standard-user console log was written.' }
-    Check ($process.ExitCode -eq 0 -and (Test-Path $userResult)) "Standard-user scenario failed (exit code $($process.ExitCode)): $userDetail"
-    $result = Get-Content $userResult -Raw | ConvertFrom-Json
-    $userArchitecture = Get-Content -LiteralPath $userArchitecturePath -Raw | ConvertFrom-Json
-    Assert-CiArchitectureRecord $userArchitecture $ExpectedArchitecture $ExpectedArchitecture -RequireNative
-    Check ($userArchitecture.Sid -eq $user.Sid.Value) 'Architecture proof did not come from the actual standard-user token.'
+    $standardRun = Invoke-CiAccountScenario -Account $user -Password $password -AccountKind Standard -ScenarioScript $userScript `
+        -OutputDirectory $userOutput -SpoofedIdentitySid $admin.Sid.Value -AfterScript $artUserScript -AfterOutputPath $artUserResult
+    $result = $standardRun.Result
     Record "Native $ExpectedArchitecture standard-user PowerShell process"
     Check (-not $result.IsAdmin -and $result.Sid -eq $user.Sid.Value) 'Test used the wrong user token.'
     Check (@($result.TamperAttempts | Where-Object { -not $_.Blocked }).Count -eq 0) 'Standard user could modify privileged runtime/queue/journal/another owner request.'
     Check $result.PolicyWriteBlocked 'Standard user could rewrite catalog policy.'
+    Check ($result.HelperBlocked -eq $result.IsServer) 'Actual server standard user was not blocked, or client standard user was incorrectly blocked.'
+    if ($result.IsServer) {
+        Check (@($result.AdminDropTamperAttempts).Count -eq 3 -and @($result.AdminDropTamperAttempts | Where-Object { -not $_.Blocked }).Count -eq 0) 'Standard account could create/move/hardlink into the protected administrator request drop.'
+        Record 'Real server standard account cannot write, move or hardlink into AdminRequests'
+    }
+    Record $(if ($result.IsServer) { 'Real Windows Server standard-user helper rejects Install' } else { 'Real client Windows standard-user helper still accepts Install' })
     Check ($result.SharedShortcut -and $result.LaunchExitCode -eq 0 -and $result.LaunchOutput -match 'fixture OK') 'Machine MSI was not accessible to the second standard user.'
     Check ($result.LaunchOutput -match "process=$ExpectedArchitecture; os=$ExpectedArchitecture; native=True") 'The installed MSI executable did not prove native execution under the standard-user token.'
     Record 'Real standard-user ACL enforcement, policy protection and all-users executable/shortcut access'
@@ -333,6 +400,19 @@ foreach ($path in @((Join-Path $env:ProgramData '__Softwarekatalog\ArtCraft\Stat
     }
     Record 'Real standard-user native ArtCraft launches/all-users shortcuts and custom state/cache ACL enforcement'
     Run-SystemPhase Requests $user.Sid.Value
+    if ($result.IsServer) {
+        $filteredRun = Invoke-CiAccountScenario -Account $admin -Password $adminPassword -AccountKind AdministratorFiltered -ScenarioScript $userScript `
+            -OutputDirectory (Join-Path $root 'admin-filtered-output') -SpoofedIdentitySid $user.Sid.Value
+        Check ($filteredRun.Result.Sid -eq $admin.Sid.Value -and -not $filteredRun.Result.IsAdmin -and $filteredRun.Result.HelperBlocked) 'Server accepted the actual administrator account without an elevated token.'
+        Record 'Real unelevated administrator-account process is denied server Install; no implicit UAC bypass'
+    }
+    $adminRun = Invoke-CiAccountScenario -Account $admin -Password $adminPassword -AccountKind Administrator -ScenarioScript $userScript `
+        -OutputDirectory (Join-Path $root 'admin-output') -SpoofedIdentitySid $user.Sid.Value
+    Check ($adminRun.Result.Sid -eq $admin.Sid.Value -and $adminRun.Result.IsAdmin -and -not $adminRun.Result.HelperBlocked) 'Real elevated administrator account could not use the generated request helper.'
+    $expectedDrop = if ($adminRun.Result.IsServer) { Join-Path $base 'AdminRequests' } else { Join-Path $base 'Requests' }
+    Check ($adminRun.Result.RequestDirectory -eq $expectedDrop) 'Administrator helper chose the wrong server/client request directory.'
+    Record "Native $ExpectedArchitecture elevated real administrator-account request process (not SYSTEM; enabled BA token)"
+    Run-SystemPhase AdministratorRequests $user.Sid.Value
 }
 catch {
     $failed = $true
@@ -390,7 +470,12 @@ finally {
         Remove-Item -LiteralPath $policy -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue
     }
-    if ($createdUser) { Remove-LocalUser -Name $userName }
+    foreach ($account in @(@{ Created = $createdUser; Name = $userName }, @{ Created = $createdAdmin; Name = $adminName })) {
+        if ($account.Created) {
+            try { Remove-LocalUser -Name $account.Name -ErrorAction Stop }
+            catch { $failed = $true; Write-Warning "Could not remove disposable CI account '$($account.Name)': $_" }
+        }
+    }
     Copy-Item -LiteralPath $root -Destination (Join-Path $ResultsDirectory 'fixture-diagnostics') -Recurse -Force
     Remove-Item -LiteralPath $root -Recurse -Force
     [pscustomobject]@{ Success = (-not $failed); OS = [Environment]::OSVersion.VersionString; Architecture = $architecture; Cases = @($cases.ToArray()) } |
