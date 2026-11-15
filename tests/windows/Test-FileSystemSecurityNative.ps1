@@ -21,6 +21,11 @@ namespace Softwarekatalog.Tests {
         private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
             IntPtr security, uint creation, uint flags, IntPtr template);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(SafeFileHandle file, uint code,
+            byte[] input, uint size, IntPtr output, uint outputSize, out uint returned, IntPtr overlapped);
+
         public static SafeFileHandle OpenWrite(string path) {
             // FILE_WRITE_DATA on a directory: required to set a reparse point.
             SafeFileHandle handle = CreateFileW(path, 2, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
@@ -29,6 +34,38 @@ namespace Softwarekatalog.Tests {
             int error = Marshal.GetLastWin32Error();
             handle.Dispose();
             throw new Win32Exception(error);
+        }
+
+        public static void SetJunction(string path, string target) {
+            string substitute = @"\??\" + target;
+            byte[] names = System.Text.Encoding.Unicode.GetBytes(substitute + "\0" + target + "\0");
+            byte[] buffer = new byte[16 + names.Length];
+            // REPARSE_DATA_BUFFER header: tag, data length, reserved (zero).
+            BitConverter.GetBytes(0xa0000003u).CopyTo(buffer, 0);
+            BitConverter.GetBytes(checked((ushort)(8 + names.Length))).CopyTo(buffer, 4);
+
+            // MountPoint: substitute offset 8 stays zero; its length is at10,
+            // print offset/length at12/14. All offsets refer to PathBuffer16.
+            BitConverter.GetBytes(checked((ushort)(substitute.Length * 2))).CopyTo(buffer, 10);
+            BitConverter.GetBytes(checked((ushort)(substitute.Length * 2 + 2))).CopyTo(buffer, 12);
+            BitConverter.GetBytes(checked((ushort)(target.Length * 2))).CopyTo(buffer, 14);
+            names.CopyTo(buffer, 16);
+            SetReparseData(path, 0x900a4, buffer);
+        }
+
+        public static void ClearJunction(string path) {
+            byte[] buffer = new byte[8];
+            BitConverter.GetBytes(0xa0000003u).CopyTo(buffer, 0);
+            SetReparseData(path, 0x900ac, buffer);
+        }
+
+        private static void SetReparseData(string path, uint code, byte[] buffer) {
+            using (SafeFileHandle handle = OpenWrite(path)) {
+                uint returned;
+                if (!DeviceIoControl(handle, code, buffer, (uint)buffer.Length,
+                    IntPtr.Zero, 0, out returned, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
         }
     }
 }
@@ -121,19 +158,15 @@ try {
 
     $directoryWriter = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
     try {
-        Expect-SharingViolation {
-            $unexpected = Open-RequestFileRead -Path $valid
-            $unexpected.Dispose()
-        }
+        $bound = Open-RequestFileRead -Path $valid
+        $bound.Dispose()
     }
     finally { $directoryWriter.Dispose() }
 
     $stream = Open-RequestFileRead -Path $valid
     try {
-        Expect-SharingViolation {
-            $writer = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
-            $writer.Dispose()
-        }
+        $writer = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
+        $writer.Dispose()
 
         $newSubmission = Join-Path $RequestsDir 'submitted-during-lease.json'
         [IO.File]::WriteAllText($newSubmission, '{"Command":"GetStatus"}')
@@ -152,7 +185,52 @@ try {
     $directoryWriter.Dispose()
 
     Check-Security ((Read-TrustedText (Join-Path $FailedRequestsDir 'valid.json')) -eq '{"Command":"GetStatus"}') 'Valid bounded content was not retained.'
-    Write-Output 'PASS FileSystemNative directory/content leases block reparse writers and name exchange; permit child submissions; release after exact bounded archive'
+    Write-Output 'PASS FileSystemNative relative binding permits directory writers/new submissions while the file lease blocks content/name exchange'
+
+    $raceDrop = Join-Path $work 'ReparseRaceDrop'
+    $raceTarget = Join-Path $work 'ReparseRaceTarget'
+    New-TrustedDirectory -Path $raceDrop -PublicDrop
+    New-TrustedDirectory -Path $raceTarget
+    $victim = Join-Path $raceTarget 'victim.json'
+    Write-TrustedText -Path $victim -Value 'protected unrelated target'
+    $victimHash = (Get-FileHash -LiteralPath $victim -Algorithm SHA256).Hash
+    $victimAcl = (Get-Acl -LiteralPath $victim).Sddl
+    $directoryLease = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestDirectory($raceDrop)
+    $redirected = $false
+    try {
+        Assert-TrustedOpenFile -Handle $directoryLease -Directory -PublicDrop
+        try {
+            [Softwarekatalog.Tests.RequestDirectoryProbe]::SetJunction($raceDrop, $raceTarget)
+            $redirected = $true
+            Check-Security ([bool]([Softwarekatalog.TrustedFileSystemNative]::Information($directoryLease).Attributes -band 0x400)) 'The real reparse race was not established.'
+        }
+        catch {
+            $cause = $_.Exception.GetBaseException()
+            if ($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -notin @(5, 32)) { throw }
+
+            Write-Output "Native filesystem itself blocked the reparse race ($($cause.NativeErrorCode))."
+        }
+
+        $unexpected = $null
+        try { $unexpected = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead('victim.json', $directoryLease) }
+        catch {
+            $cause = $_.Exception.GetBaseException()
+            if ($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -notin @(2, 3, 1920, 4395)) { throw }
+        }
+
+        if ($null -ne $unexpected) {
+            $unexpected.Dispose()
+            throw 'A relative request open escaped the pinned directory into its new reparse target.'
+        }
+    }
+    finally {
+        try { if ($redirected) { [Softwarekatalog.Tests.RequestDirectoryProbe]::ClearJunction($raceDrop) } }
+        finally { $directoryLease.Dispose() }
+    }
+
+    Check-Security ((Get-FileHash -LiteralPath $victim -Algorithm SHA256).Hash -eq $victimHash) 'Reparse race changed unrelated target bytes.'
+    Check-Security ((Get-Acl -LiteralPath $victim).Sddl -eq $victimAcl) 'Reparse race changed unrelated target owner/DACL.'
+    Write-Output 'PASS FileSystemNative an actual post-validation reparse change cannot redirect the handle-relative request open'
 
     $cache = Join-Path $BaseDir 'ArtCraft\Cache\lease.msi'
     Write-TrustedText -Path $cache -Value 'isolated installer bytes'

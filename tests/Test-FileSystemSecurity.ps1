@@ -104,6 +104,14 @@ Test-Security 'Native filesystem structure sizes match BOOLEAN, DWORD and pointe
     if ($dispositionSize -ne 1 -or $attributesSize -ne $expectedAttributes -or $informationSize -ne 52) {
         throw 'Filesystem native interop structure sizes disagree with the Windows ABI.'
     }
+
+    foreach ($layout in @(@('UnicodeName',16,8), @('ObjectAttributes',48,24), @('IoStatusBlock',16,8))) {
+        $structure = $type.GetNestedType($layout[0], [Reflection.BindingFlags]::NonPublic)
+        $expected = if ([IntPtr]::Size -eq 8) { $layout[1] } else { $layout[2] }
+        if ([Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($structure)) -ne $expected) {
+            throw "Incorrect relative-open ABI layout for $($layout[0])."
+        }
+    }
 }
 
 if ($env:OS -eq 'Windows_NT') {

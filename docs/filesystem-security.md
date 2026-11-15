@@ -8,11 +8,12 @@ evidence that its contents or owner are trustworthy.
 - The worker opens input without following the final reparse point. One native
   handle binds size/link checks, owner/DACL inspection, bounded parsing and
   cleanup. Write and delete sharing are denied while the handle is held.
-- A retained no-follow directory handle also denies write/delete sharing on
-  the public input directory. An existing directory writer blocks binding;
-  the directory cannot become a reparse point between validation and opening
-  the input, or while that input is processed. New child submissions remain
-  possible. Both leases are released when the request stream is disposed.
+- A retained no-follow directory handle binds the actual public input directory.
+  Input is opened relative to that object with `NtCreateFile`/`OBJ_DONT_REPARSE`,
+  not by looking up the absolute directory path again. NTFS directory write
+  sharing is not a dependable reparse lock: redirection must not affect the
+  bound open even if a directory writer exists. New child submissions remain
+  possible. Both handles are released when the request stream is disposed.
 - Reparse objects, multiple hardlinks and files larger than 32 KiB are rejected
   before payload parsing. The original input is **never** moved into a trusted
   archive or given a privileged owner/DACL.

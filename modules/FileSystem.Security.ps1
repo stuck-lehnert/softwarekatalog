@@ -38,6 +38,34 @@ namespace Softwarekatalog {
             public byte Delete;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UnicodeName {
+            public ushort Length, MaximumLength;
+            public IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ObjectAttributes {
+            public uint Length;
+            public IntPtr RootDirectory, ObjectName;
+            public uint Attributes;
+            public IntPtr SecurityDescriptor, SecurityQualityOfService;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoStatusBlock {
+            public IntPtr Status;
+            public UIntPtr Information;
+        }
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtCreateFile(out SafeFileHandle file, uint access,
+            ref ObjectAttributes attributes, out IoStatusBlock status, IntPtr allocationSize,
+            uint fileAttributes, uint share, uint disposition, uint options, IntPtr ea, uint eaLength);
+
+        [DllImport("ntdll.dll")]
+        private static extern uint RtlNtStatusToDosError(int status);
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
             IntPtr security, uint creation, uint flags, IntPtr template);
@@ -104,9 +132,9 @@ namespace Softwarekatalog {
         }
 
         public static SafeFileHandle OpenRequestDirectory(string path) {
-            // Deny directory write/delete sharing throughout request handling.
-            // In particular, FSCTL_SET_REPARSE_POINT needs FILE_WRITE_DATA.
-            return CheckHandle(CreateFileW(path, 0x00020080u, 1, IntPtr.Zero,
+            // Pin the actual no-follow directory object. Directory write
+            // sharing is not a reliable lock against reparse changes on NTFS.
+            return CheckHandle(CreateFileW(path, 0x000200a1u, 1, IntPtr.Zero,
                 3, 0x02200000u, IntPtr.Zero));
         }
 
@@ -124,8 +152,57 @@ namespace Softwarekatalog {
             }
         }
 
-        public static FileStream OpenRequestRead(string path, SafeFileHandle directoryLease) {
-            SafeFileHandle file = OpenReadHandle(path, true);
+        private static SafeFileHandle OpenRelativeRequest(string name, SafeFileHandle directory) {
+            if (String.IsNullOrEmpty(name) || name == "." || name == ".." ||
+                name.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0)
+                throw new ArgumentException("A request must be a single relative filename.");
+
+            IntPtr characters = IntPtr.Zero;
+            IntPtr nativeName = IntPtr.Zero;
+            bool retainedDirectory = false;
+            try {
+                UnicodeName unicode = new UnicodeName();
+                unicode.Length = checked((ushort)(name.Length * 2));
+                unicode.MaximumLength = checked((ushort)(unicode.Length + 2));
+                characters = Marshal.StringToHGlobalUni(name);
+                unicode.Buffer = characters;
+                nativeName = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeName)));
+                Marshal.StructureToPtr(unicode, nativeName, false);
+
+                directory.DangerousAddRef(ref retainedDirectory);
+                ObjectAttributes attributes = new ObjectAttributes();
+                attributes.Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes));
+                attributes.RootDirectory = directory.DangerousGetHandle();
+                attributes.ObjectName = nativeName;
+                attributes.Attributes = 0x1040; // OBJ_DONT_REPARSE | OBJ_CASE_INSENSITIVE
+
+                SafeFileHandle file;
+                IoStatusBlock io;
+                // FILE_OPEN; synchronous, no-follow leaf; read/delete access,
+                // Read sharing only. No absolute path is looked up again.
+                int status = NtCreateFile(out file, 0x80030080u, ref attributes, out io,
+                    IntPtr.Zero, 0, 1, 1, 0x00200020, IntPtr.Zero, 0);
+                if (status < 0) {
+                    if (file != null) file.Dispose();
+                    throw new Win32Exception((int)RtlNtStatusToDosError(status));
+                }
+
+                if (file == null || file.IsInvalid) {
+                    if (file != null) file.Dispose();
+                    throw new InvalidOperationException("Native relative request open returned no handle.");
+                }
+
+                return file;
+            }
+            finally {
+                if (retainedDirectory) directory.DangerousRelease();
+                if (nativeName != IntPtr.Zero) Marshal.FreeHGlobal(nativeName);
+                if (characters != IntPtr.Zero) Marshal.FreeHGlobal(characters);
+            }
+        }
+
+        public static FileStream OpenRequestRead(string name, SafeFileHandle directoryLease) {
+            SafeFileHandle file = OpenRelativeRequest(name, directoryLease);
             try { return new RequestReadStream(file, directoryLease); }
             catch { file.Dispose(); throw; }
         }
@@ -475,7 +552,7 @@ function Open-RequestFileRead {
 
         # Transfer ownership only after success. The actual FileStream retains
         # this directory lease through parsing, archiving and handle deletion.
-        $stream = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead($canonical, $directoryLease)
+        $stream = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead([IO.Path]::GetFileName($canonical), $directoryLease)
         $directoryLease = $null
         return $stream
     }
