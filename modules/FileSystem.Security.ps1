@@ -180,11 +180,17 @@ namespace Softwarekatalog {
                 IoStatusBlock io;
                 // FILE_OPEN; synchronous, no-follow leaf; read/delete access,
                 // Read sharing only. No absolute path is looked up again.
-                int status = NtCreateFile(out file, 0x80030080u, ref attributes, out io,
+                // Native synchronous IO requires explicit SYNCHRONIZE. Use
+                // mapped FILE_GENERIC_READ | DELETE, not generic access bits.
+                int status = NtCreateFile(out file, 0x00130089u, ref attributes, out io,
                     IntPtr.Zero, 0, 1, 1, 0x00200020, IntPtr.Zero, 0);
                 if (status < 0) {
                     if (file != null) file.Dispose();
-                    throw new Win32Exception((int)RtlNtStatusToDosError(status));
+
+                    int error = (int)RtlNtStatusToDosError(status);
+                    string nativeStatus = unchecked((uint)status).ToString("X8");
+                    throw new Win32Exception(error, "Relative NtCreateFile failed (NTSTATUS=0x" +
+                        nativeStatus + "): " + new Win32Exception(error).Message);
                 }
 
                 if (file == null || file.IsInvalid) {
