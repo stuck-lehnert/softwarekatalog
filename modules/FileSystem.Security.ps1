@@ -224,15 +224,18 @@ function Assert-TrustedSecuritySummary {
         throw 'Untrusted filesystem owner or null DACL; administrative inspection is required.'
     }
 
-    # Ancestors may allow creation of new subdirectories (e.g. ProgramData),
-    # never mutation/replacement of an already trusted child or the ancestor.
+    # Directory ancestors may allow child creation. Windows ProgramData also
+    # grants Users the standard creation/EA/attribute subset 0x116. This does
+    # not grant deletion, replacement, ownership or DACL access to an existing
+    # protected child. Its actual owner/DACL and every reparse boundary are
+    # checked separately. Never apply this exception to private leaf storage.
     $writeMask = if ($Ancestor) { 0x500D0152 } else { 0x500D0156 }
     foreach ($rule in $Security.Rules) {
         if (-not $rule.Allow -or $rule.InheritOnly -or $rule.Sid -in $trusted) { continue }
         if ($rule.Sid -eq 'S-1-3-4') { continue } # OWNER RIGHTS; the owner was checked.
 
         $writes = $rule.Mask -band $writeMask
-        if ($PublicDrop -and $rule.Sid -eq 'S-1-5-32-545') {
+        if (($PublicDrop -or $Ancestor) -and $rule.Sid -eq 'S-1-5-32-545') {
             $writes = $writes -band (-bnot 0x00000116)
         }
 
@@ -246,6 +249,10 @@ function Assert-TrustedSecuritySummary {
 
 function Assert-TrustedOpenFile {
     param([Parameter(Mandatory)]$Handle, [switch]$Directory, [switch]$Ancestor, [switch]$PublicDrop)
+
+    if (($Ancestor -or $PublicDrop) -and -not $Directory) {
+        throw 'Ancestor/public-drop exceptions apply only to directory objects.'
+    }
 
     $information = [Softwarekatalog.TrustedFileSystemNative]::Information($Handle)
     if ($information.Attributes -band 0x400) { throw 'Reparse points are forbidden in privileged storage.' }

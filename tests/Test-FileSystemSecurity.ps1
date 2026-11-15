@@ -47,6 +47,9 @@ foreach ($mask in @(2, 4, 16, 64, 256, 65536, 262144, 524288, 0x10000000, 0x4000
 
 Test-Security 'Ancestor allows new subdirectories, never deletion/replacement of existing children' {
     Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-11' 4))) -Ancestor
+    Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-32-545' 0x116))) -Ancestor
+    Reject { Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-32-545' 0x116))) }
+    Reject { Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-11' 0x116))) -Ancestor }
     Reject { Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-11' 64))) -Ancestor }
 }
 

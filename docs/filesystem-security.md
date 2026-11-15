@@ -29,9 +29,12 @@ queue migration or recovery, not made trustworthy by applying new ACLs.
 
 Only SYSTEM, built-in Administrators and TrustedInstaller may own trusted
 objects. Effective untrusted write/delete/ACL/owner grants, null DACLs and
-reparse points are rejected. Ancestor checks allow new child-directory creation
-such as the normal ProgramData policy, but not replacement of existing trusted
-children. Explicit/protected child DACLs and foreign owners are checked as well.
+reparse points are rejected. Directory ancestor checks allow new child creation
+and the standard ProgramData Users creation/EA/attribute subset (`0x116`), but
+never deletion/replacement or owner/DACL changes of existing trusted children.
+This exception does not apply to private leaf directories, files, executable
+parents, state or cache storage. Explicit/protected child DACLs and foreign
+owners are checked as well.
 Request payloads themselves remain untrusted and are excluded from this private
 data scan.
 
