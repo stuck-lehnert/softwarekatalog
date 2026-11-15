@@ -5,6 +5,7 @@ $ErrorActionPreference = 'Stop'
 $repository = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repository 'modules/ArtCraft.Catalog.ps1')
 . (Join-Path $repository 'modules/ArtCraft.Provider.ps1')
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
 # Import this existing pure path classifier only, never setup's entry point.
 $tokens=$null; $parseErrors=$null
 $setupAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'setup.ps1'),[ref]$tokens,[ref]$parseErrors)
@@ -63,6 +64,11 @@ function Reset {
         param($Definition,$Target)
         $script:verifyCalls++; Assert-ArtCraftTarget $Definition $Target
         Get-ArtCraftTargetPath $Definition $Target
+    }
+    Mock Open-ArtCraftInstallerLease {
+        param($Definition, $Target)
+        $path = Save-ArtCraftInstaller -Definition $Definition -Target $Target
+        [pscustomobject]@{ Path = $path; Stream = (New-Object IO.MemoryStream) }
     }
     Mock Invoke-ArtCraftMsi {
         param($Arguments)
@@ -401,6 +407,43 @@ try {
             Throws { Assert-ArtCraftInstaller $definition $target $file } 'identity'
             $script:msiMetadata.$field=$saved
         }
+    }
+    Test 'Installer is reverified after locking and its lease spans dispatch including failure cleanup' {
+        Restore Open-ArtCraftInstallerLease
+        $originalReader = ${function:Open-TrustedFileRead}
+        $script:heldInstaller = $null
+        Mock Open-TrustedFileRead {
+            param($Path)
+            $script:heldInstaller = New-Object IO.MemoryStream
+            return $script:heldInstaller
+        }
+        Mock Assert-ArtCraftInstallerContent {
+            param($Definition, $Target, $Path)
+            Assert $script:heldInstaller.CanRead 'Verification happened without a live content lease.'
+            [pscustomobject]@{ ProductCode = $Target.ProductCode }
+        }
+        Mock Invoke-ArtCraftRecordCore {
+            param($Record, $InstallerPath)
+            Assert $script:heldInstaller.CanRead 'Destructive dispatch outlived the installer lease.'
+            Assert ([bool]$InstallerPath) 'Dispatch did not receive the verified installer path.'
+            return 0
+        }
+        $record = [pscustomobject]@{ PackageId = $definition.PackageId; Stage = 'Prepared'; Target = $target }
+        try {
+            Equal 0 (Invoke-ArtCraftRecord -Record $record)
+            Assert (-not $script:heldInstaller.CanRead) 'Success leaked a content lease.'
+            Mock Invoke-ArtCraftRecordCore {
+                param($Record, $InstallerPath)
+                Assert $script:heldInstaller.CanRead 'Failure dispatch ran without its lease.'
+                throw 'Injected dispatch failure'
+            }
+            Throws { Invoke-ArtCraftRecord -Record $record } 'Injected dispatch failure'
+            Assert (-not $script:heldInstaller.CanRead) 'Dispatch failure leaked a content lease.'
+            Mock Assert-ArtCraftInstallerContent { throw 'Injected verification failure' }
+            Throws { Open-ArtCraftInstallerLease -Definition $definition -Target $target } 'Injected verification failure'
+            Assert (-not $script:heldInstaller.CanRead) 'Verification failure leaked a content lease.'
+        }
+        finally { Mock Open-TrustedFileRead $originalReader }
     }
     Test 'Atomic cache verifies partial file before publication and revalidates cached reuse' {
         Initialize-ArtCraftStorage; Restore Save-ArtCraftInstaller; $script:validated=@(); $script:downloads=0

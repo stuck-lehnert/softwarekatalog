@@ -81,6 +81,8 @@ function Update-InstalledPackagesSnapshot { param($WingetPath, $QueueItemId) }
 function Ensure-RequiredSoftwareQueued { param($TimeoutSeconds); return 0 }
 function Start-QueueWorkerIfAvailable { return $true }
 function Write-Log { param($Message, $Level) }
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
+
 function Set-FileAclAdminsOnly { param($Path) } # Real ACLs are tested natively.
 function Assert-AdminRequestsDirectory {
     $script:directoryChecks++

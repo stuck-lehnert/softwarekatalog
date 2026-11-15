@@ -12,7 +12,12 @@ def bundle(source: Path) -> bytes:
     if len(matches) != 1:
         raise ValueError("Expected exactly one source module loader")
     modules = []
-    for name in ("ArtCraft.Catalog.ps1", "ArtCraft.Provider.ps1"):
+    for name in (
+        "FileSystem.Security.ps1",
+        "WinGet.Trust.ps1",
+        "ArtCraft.Catalog.ps1",
+        "ArtCraft.Provider.ps1",
+    ):
         modules.append((source.parent / "modules" / name).read_bytes().decode("utf-8-sig").rstrip("\r\n"))
     match = matches[0]
     return (text[:match.start()] + "\n\n".join(modules) + "\n" + text[match.end():]).encode("utf-8")

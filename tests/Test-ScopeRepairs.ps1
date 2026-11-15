@@ -14,6 +14,8 @@ foreach ($statement in $ast.EndBlock.Statements) {
         . ([scriptblock]::Create($statement.Extent.Text))
     }
 }
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'modules/WinGet.Trust.ps1')
 $realMsiEvidence = ${function:Get-MsiRegistrationEvidence}
 
 $script:passed = 0
@@ -105,22 +107,22 @@ function Invoke-WingetInstall {
 }
 
 try {
-    Test 'WinGet discovery prefers native ARM64 over newer emulated packages and PATH aliases' {
+    Test 'Plausible WindowsApps names and architecture strings do not authenticate a WinGet path' {
         $arm = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.9.0.0_arm64__8wekyb3d8bbwe\winget.exe'
         $x64 = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_9.99.0.0_x64__8wekyb3d8bbwe\winget.exe'
         $alias = 'C:\Users\SYSTEM\AppData\Local\Microsoft\WindowsApps\winget.exe'
-        Assert ((Select-WingetPath -Candidates @($x64, $alias, $arm) -NativeArchitecture arm64) -eq $arm)
-        Assert ((Select-WingetPath -Candidates @($arm, $x64) -NativeArchitecture x64) -eq $x64)
+        Assert ($null -eq (Select-WingetPath -Candidates @($x64, $alias, $arm) -NativeArchitecture arm64))
+        Assert ($null -eq (Select-WingetPath -Candidates @($arm, $x64) -NativeArchitecture x64))
         Assert ($null -eq (Select-WingetPath -Candidates @($arm, $x64) -NativeArchitecture x86))
     }
-    Test 'WinGet discovery sorts native package versions numerically and retains supported fallbacks' {
+    Test 'Higher path versions and duplicate unauthenticated candidates cannot gain priority' {
         $old = 'C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_1.9.0.0_arm64__8wekyb3d8bbwe\winget.exe'
         $new = $old.Replace('1.9.0.0', '1.23.0.0')
         $x64 = $new.Replace('_arm64_', '_x64_')
         $x86 = $new.Replace('_arm64_', '_x86_')
-        Assert ((Select-WingetPath -Candidates @($old, $new, $new) -NativeArchitecture arm64) -eq $new)
-        Assert ((Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture arm64) -eq $x64)
-        Assert ((Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture x64) -eq $x64)
+        Assert ($null -eq (Select-WingetPath -Candidates @($old, $new, $new) -NativeArchitecture arm64))
+        Assert ($null -eq (Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture arm64))
+        Assert ($null -eq (Select-WingetPath -Candidates @($x86, $x64) -NativeArchitecture x64))
         Assert ($null -eq (Select-WingetPath -Candidates @() -NativeArchitecture arm64))
     }
     Test 'Native OS architecture is independent of PowerShell process bitness' {

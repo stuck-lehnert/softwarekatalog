@@ -84,8 +84,8 @@ $script:ScopeRepairFailures = @()
 $script:MsiInspectionFailures = @()
 
 # <SoftwarekatalogModules>
-# The distribution builder replaces this source-only loader with both modules.
-foreach ($module in @('ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
+# The distribution builder replaces this source-only loader with the modules.
+foreach ($module in @('FileSystem.Security.ps1', 'WinGet.Trust.ps1', 'ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
     $modulePath = Join-Path (Join-Path $PSScriptRoot 'modules') $module
     . ([scriptblock]::Create([IO.File]::ReadAllText($modulePath, [Text.Encoding]::UTF8)))
 }
@@ -108,9 +108,8 @@ function Write-Log {
         [string]$Level = 'INFO'
     )
 
-    Ensure-Directory -Path $LogDir
     $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
+    Write-TrustedText -Path $LogFile -Value ($line + [Environment]::NewLine) -Append
 }
 
 function Get-SoftwarekatalogBuildCommit {
@@ -628,12 +627,13 @@ function Write-TextFile {
         default   { $textEncoding = New-Object System.Text.UTF8Encoding($true) }
     }
 
-    [System.IO.File]::WriteAllText($Path, $Content, $textEncoding)
+    $bytes = $textEncoding.GetPreamble() + $textEncoding.GetBytes($Content)
+    Write-TrustedBytes -Path $Path -Bytes $bytes
 }
 
 function Ensure-QueueDirectories {
     foreach ($path in @($QueueRootDir, $QueuePendingDir, $QueueRunningDir, $QueueSucceededDir, $QueueFailedDir)) {
-        Ensure-Directory -Path $path
+        New-TrustedDirectory -Path $path
     }
 }
 
@@ -807,18 +807,9 @@ function Write-JsonFileAtomic {
     )
 
     $directory = Split-Path -Path $Path -Parent
-    if ($directory) { Ensure-Directory -Path $directory }
+    if ($directory) { New-TrustedDirectory -Path $directory }
 
-    $tempPath = Join-Path $directory ("{0}.{1}.tmp" -f (Split-Path -Path $Path -Leaf), [Guid]::NewGuid().ToString('N'))
-    try {
-        $Value | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $tempPath -Encoding UTF8
-        Move-Item -LiteralPath $tempPath -Destination $Path -Force
-    }
-    finally {
-        if (Test-Path -LiteralPath $tempPath) {
-            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
-        }
-    }
+    Write-TrustedText -Path $Path -Value ($Value | ConvertTo-Json -Depth $Depth)
 }
 
 function Write-QueueItemFile {
@@ -856,7 +847,7 @@ function Read-QueueItemFile {
 
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return $null }
-        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        $raw = Read-TrustedText -Path $Path
         if ([string]::IsNullOrWhiteSpace($raw)) { throw 'Queue item file is empty.' }
         # Validate the root before ConvertFrom-Json can unwrap singleton arrays.
         if (-not $raw.TrimStart().StartsWith('{')) { throw 'Queue item JSON root is not an object.' }
@@ -1030,7 +1021,7 @@ function Migrate-LegacyQueueState {
 
     $legacyPath = Join-Path $BaseDir ("Queue-State.legacy-{0}.json" -f (Get-Date -Format 'yyyyMMddHHmmss'))
     try {
-        $raw = Get-Content -LiteralPath $QueueStatePath -Raw -Encoding UTF8 -ErrorAction Stop
+        $raw = Read-TrustedText -Path $QueueStatePath
         Move-Item -LiteralPath $QueueStatePath -Destination $legacyPath -Force -ErrorAction Stop
         Write-Log "Moved legacy queue state to '$legacyPath'."
 
@@ -1535,31 +1526,25 @@ namespace Softwarekatalog {
 }
 
 function Select-WingetPath {
-    param([string[]]$Candidates, [string]$NativeArchitecture)
+    param([object[]]$Candidates, [string]$NativeArchitecture)
 
-    $preference = switch ($NativeArchitecture) {
-        'arm64' { @('arm64', 'neutral', 'unknown', 'x64', 'x86') }
-        'x64' { @('x64', 'neutral', 'unknown', 'x86') }
-        'x86' { @('x86', 'neutral', 'unknown') }
-        default { @('unknown', 'neutral', 'arm64', 'x64', 'x86') }
+    $lease = Select-TrustedWinGetCandidate -Candidates $Candidates -NativeArchitecture $NativeArchitecture
+    if ($null -eq $lease) { return $null }
+
+    $leaseVariable = Get-Variable -Name TrustedWinGetLeases -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $leaseVariable) {
+        $script:TrustedWinGetLeases = New-Object 'Collections.Generic.List[IDisposable]'
     }
-    $ranked = @()
-    $index = 0
-    foreach ($candidate in @($Candidates | Select-Object -Unique)) {
-        $architecture = 'unknown'
-        $version = [version]'0.0.0.0'
-        if ($candidate -match '(?i)(?:^|[\\/])Microsoft\.DesktopAppInstaller_(?<Version>\d+(?:\.\d+){3})_(?<Architecture>arm64|x64|x86|arm|neutral)_') {
-            $architecture = $Matches.Architecture.ToLowerInvariant()
-            $version = [version]$Matches.Version
-        }
-        $rank = [array]::IndexOf($preference, $architecture)
-        if ($rank -ge 0) {
-            $ranked += [pscustomobject]@{ Path = $candidate; Rank = $rank; Version = $version; Index = $index }
-        }
-        $index++
-    }
-    $selected = $ranked | Sort-Object Rank, @{ Expression = { $_.Version }; Descending = $true }, Index | Select-Object -First 1
-    if ($selected) { return $selected.Path }
+    $script:TrustedWinGetLeases.Add($lease)
+    return $lease.Path
+}
+
+function Close-TrustedWinGetLeases {
+    $leaseVariable = Get-Variable -Name TrustedWinGetLeases -Scope Script -ErrorAction SilentlyContinue
+    if ($null -eq $leaseVariable) { return }
+
+    foreach ($lease in $script:TrustedWinGetLeases) { $lease.Dispose() }
+    $script:TrustedWinGetLeases.Clear()
 }
 
 function Get-WingetPath {
@@ -1582,7 +1567,7 @@ function Get-WingetPath {
         foreach ($package in $packages) {
             $candidate = Join-Path $package.InstallLocation 'winget.exe'
             if (Test-Path -LiteralPath $candidate) {
-                $candidates += $candidate
+                $candidates += [pscustomobject]@{ Path = $candidate; Package = $package }
             }
         }
     }
@@ -1735,7 +1720,7 @@ function Get-BundledSoftwarekatalogSource {
     $match = [regex]::Match($source, $pattern)
     if (-not $match.Success) { return $source } # already bundled deployment
     $root = Split-Path $Path -Parent
-    $modules = foreach ($name in @('ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
+    $modules = foreach ($name in @('FileSystem.Security.ps1', 'WinGet.Trust.ps1', 'ArtCraft.Catalog.ps1', 'ArtCraft.Provider.ps1')) {
         [IO.File]::ReadAllText((Join-Path (Join-Path $root 'modules') $name), [Text.Encoding]::UTF8).TrimEnd([char[]]"`r`n")
     }
     return $source.Substring(0, $match.Index) + ($modules -join "`n`n") + "`n" + $source.Substring($match.Index + $match.Length)
@@ -3502,9 +3487,7 @@ function Uninstall-SystemProfileApplication {
 function Write-ScopeRepairJournal {
     param([object[]]$Entries)
 
-    $tempPath = "$ScopeRepairPath.tmp"
-    ConvertTo-Json -InputObject @($Entries) -Depth 5 | Set-Content -LiteralPath $tempPath -Encoding UTF8
-    Move-Item -LiteralPath $tempPath -Destination $ScopeRepairPath -Force
+    Write-TrustedText -Path $ScopeRepairPath -Value (ConvertTo-Json -InputObject @($Entries) -Depth 5)
 }
 
 function Add-ScopeRepairIntent {
@@ -3512,7 +3495,7 @@ function Add-ScopeRepairIntent {
 
     $entries = @()
     if (Test-Path -LiteralPath $ScopeRepairPath) {
-        $parsedEntries = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $parsedEntries = Read-TrustedText -Path $ScopeRepairPath | ConvertFrom-Json
         $entries = @($parsedEntries)
     }
     if (@($entries | Where-Object { $_.PackageId -eq $PackageId }).Count -eq 0) {
@@ -3535,7 +3518,7 @@ function Invoke-SystemProfileRepairs {
     if (Test-Path -LiteralPath $ScopeRepairPath) {
         # A corrupt journal must not be silently discarded after an uninstall.
         # PS 5.1 emits JSON arrays as one pipeline object; PS 7 enumerates them.
-        $parsedJournal = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $parsedJournal = Read-TrustedText -Path $ScopeRepairPath | ConvertFrom-Json
         $journal = @($parsedJournal)
     }
     $registrations = @(Get-RegisteredApplications)
@@ -3745,11 +3728,11 @@ function Update-WingetPackagesSnapshot {
         [string]$QueueItemId
     )
 
-    Ensure-Directory -Path $BaseDir
+    New-TrustedDirectory -Path $BaseDir
 
-    $tempRoot = if ($env:TEMP) { $env:TEMP } elseif ($env:TMP) { $env:TMP } else { $BaseDir }
-    $tempFile = Join-Path $tempRoot ("selfservice-winget-export-{0}.json" -f [Guid]::NewGuid().ToString('N'))
-    $snapshotTempFile = "$DestinationPath.tmp"
+    # WinGet writes the export itself. Keep it inside the protected service
+    # boundary rather than accepting data from a shared TEMP directory.
+    $tempFile = Join-Path $BaseDir ("winget-export-{0}.json" -f [Guid]::NewGuid().ToString('N'))
 
     $arguments = @(
         'export'
@@ -3799,7 +3782,7 @@ function Update-WingetPackagesSnapshot {
     }
 
     try {
-        $raw = Get-Content -LiteralPath $tempFile -Raw -Encoding UTF8
+        $raw = Read-TrustedText -Path $tempFile
         $export = $raw | ConvertFrom-Json
 
         $packageIds = @()
@@ -3827,8 +3810,7 @@ function Update-WingetPackagesSnapshot {
             InstalledPackageIds  = @($packageIds)
         }
 
-        $snapshot | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $snapshotTempFile -Encoding UTF8
-        Move-Item -LiteralPath $snapshotTempFile -Destination $DestinationPath -Force
+        Write-TrustedText -Path $DestinationPath -Value ($snapshot | ConvertTo-Json -Depth 5)
         Write-Log "WinGet inventory staging written to '$DestinationPath' (count=$(@($packageIds).Count))."
         return $true
     }
@@ -3839,9 +3821,6 @@ function Update-WingetPackagesSnapshot {
     finally {
         if (Test-Path -LiteralPath $tempFile) {
             Remove-Item -LiteralPath $tempFile -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path -LiteralPath $snapshotTempFile) {
-            Remove-Item -LiteralPath $snapshotTempFile -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -3855,7 +3834,7 @@ function Update-InstalledPackagesSnapshot {
     $previous = @()
     if (Test-Path -LiteralPath $InstalledPackagesPath) {
         try {
-            $raw = Get-Content -LiteralPath $InstalledPackagesPath -Raw -Encoding UTF8
+            $raw = Read-TrustedText -Path $InstalledPackagesPath
             if (-not $raw.TrimStart().StartsWith('{')) { throw 'Snapshot root must be an object.' }
             $loaded = $raw | ConvertFrom-Json
             if (-not $loaded.PSObject.Properties['InstalledPackageIds']) { throw 'Snapshot ID list is missing.' }
@@ -3873,7 +3852,7 @@ function Update-InstalledPackagesSnapshot {
         if ($WingetPath) {
             $wingetRefreshed = Update-WingetPackagesSnapshot -WingetPath $WingetPath -DestinationPath $staging -QueueItemId $QueueItemId
             if ($wingetRefreshed) {
-                $loaded = Get-Content -LiteralPath $staging -Raw -Encoding UTF8 | ConvertFrom-Json
+                $loaded = Read-TrustedText -Path $staging | ConvertFrom-Json
                 $previous = @($loaded.InstalledPackageIds)
             }
         }
@@ -3902,15 +3881,7 @@ function Update-InstalledPackagesSnapshot {
         }
         $snapshot = [ordered]@{ GeneratedAt = (Get-Date).ToString('o'); InstalledPackageIds = @($ids | Sort-Object)
             WingetRefreshed = $wingetRefreshed; Packages = @($packages) }
-        $temp = "$InstalledPackagesPath.$([Guid]::NewGuid().ToString('N')).tmp"
-        try {
-            $snapshot | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding UTF8
-            if (Test-Path -LiteralPath $InstalledPackagesPath) {
-                [IO.File]::Replace($temp, $InstalledPackagesPath, [System.Management.Automation.Language.NullString]::Value)
-            }
-            else { [IO.File]::Move($temp, $InstalledPackagesPath) }
-        }
-        finally { if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Force } }
+        Write-TrustedText -Path $InstalledPackagesPath -Value ($snapshot | ConvertTo-Json -Depth 8)
         Write-Log "Installed package snapshot written to '$InstalledPackagesPath' (count=$($ids.Count), ArtCraft=$(@($inventory | Where-Object Healthy).Count), wingetRefreshed=$wingetRefreshed)."
         return $true
     }
@@ -3925,7 +3896,7 @@ function Get-InstalledPackageIdSet {
     }
 
     try {
-        $raw = Get-Content -LiteralPath $InstalledPackagesPath -Raw -Encoding UTF8
+        $raw = Read-TrustedText -Path $InstalledPackagesPath
         if ([string]::IsNullOrWhiteSpace($raw)) {
             return ,$set
         }
@@ -4191,7 +4162,7 @@ function Invoke-ArtCraftLegacyRepairMigration {
     # A previous deployment may have removed a package under the old WinGet
     # repair journal already. Carry that intent into the direct provider too.
     if (-not (Test-Path -LiteralPath $ScopeRepairPath)) { return }
-    $raw = Get-Content -LiteralPath $ScopeRepairPath -Raw -Encoding UTF8
+    $raw = Read-TrustedText -Path $ScopeRepairPath
     if (-not $raw.TrimStart().StartsWith('[')) { throw 'Invalid legacy scope repair journal root.' }
     $parsed = $raw | ConvertFrom-Json
     $journal = @($parsed)
@@ -4210,8 +4181,7 @@ function Invoke-ArtCraftLegacyRepairMigration {
 }
 
 function Invoke-ProcessQueueMode {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
+    Initialize-ServiceStorage
     Ensure-QueueDirectories
 
     $wingetPath = Ensure-WingetAvailable
@@ -4249,8 +4219,7 @@ function Invoke-ProcessQueueMode {
 }
 
 function Invoke-UpgradeAllMode {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
+    Initialize-ServiceStorage
 
     $item = New-QueueItem -Action UpgradeAll -DisplayName 'Softwareupdates (WinGet + ArtCraft)' -Source System -RequestedBy 'System' -RequestedBySid 'System'
     $result = Add-QueueItem -Item $item -TimeoutSeconds 5
@@ -4266,8 +4235,7 @@ function Invoke-UpgradeAllMode {
 }
 
 function Invoke-ApplyPolicyMode {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
+    Initialize-ServiceStorage
 
     $wingetPath = Ensure-WingetAvailable
     $result = Invoke-RequiredSoftwarePolicy -WingetPath $wingetPath
@@ -4275,8 +4243,7 @@ function Invoke-ApplyPolicyMode {
 }
 
 function Invoke-ProcessRequestMode {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
+    Initialize-ServiceStorage
 
     if ([string]::IsNullOrWhiteSpace($AppAlias)) {
         throw 'AppAlias is required for ProcessRequest mode.'
@@ -4447,33 +4414,40 @@ function Get-RequestScalarValue {
     throw "Request is missing $DisplayName."
 }
 
-function Move-RequestFile {
+function Complete-RequestFile {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$DestinationDir,
+        [Parameter(Mandatory)][IO.FileStream]$Stream,
+        [AllowNull()]$Raw,
         [string]$ErrorMessage
     )
 
-    Ensure-Directory -Path $DestinationDir
+    Assert-TrustedFileSystemPath -Path $DestinationDir -Directory
     $leaf = Split-Path -Path $Path -Leaf
+    if ($leaf.Length -gt 180) { $leaf = [guid]::NewGuid().ToString('N') + '.json' }
+
     $destination = Join-Path $DestinationDir $leaf
     if (Test-Path -LiteralPath $destination) {
         $destination = Join-Path $DestinationDir ("{0}-{1}.json" -f [IO.Path]::GetFileNameWithoutExtension($leaf), [Guid]::NewGuid().ToString('N'))
     }
 
-    Microsoft.PowerShell.Management\Move-Item -LiteralPath $Path -Destination $destination -Force -ErrorAction Stop
-    Set-FileAclAdminsOnly -Path $destination
+    # Archive a NEW object, never move or change the source's ACL. Oversized
+    # files and links have no retained payload because they were never read.
+    if ($null -eq $Raw -or [Text.Encoding]::UTF8.GetByteCount([string]$Raw) -gt 32768) {
+        $Raw = [pscustomobject]@{ Rejected = $true; OriginalName = $leaf; PayloadRetained = $false } | ConvertTo-Json
+    }
+    Write-TrustedText -Path $destination -Value $Raw -CreateNew
 
     if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
         $errorPath = $destination + '.error.txt'
-        try {
-            Microsoft.PowerShell.Management\Set-Content -LiteralPath $errorPath -Value $ErrorMessage -Encoding UTF8 -ErrorAction Stop
-            Set-FileAclAdminsOnly -Path $errorPath
-        }
-        catch {
-            Write-Log "Could not write request error file '$errorPath': $($_.Exception.Message)" 'WARN'
-        }
+        $boundedError = $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 2048))
+        Write-TrustedText -Path $errorPath -Value $boundedError -CreateNew
     }
+
+    # Remove only the entry bound to the still-open handle. No later lookup
+    # can redirect cleanup to a replacement file in the public drop.
+    Remove-OpenRequestFile -Stream $Stream
 }
 
 function Test-IsTransientRequestFailureMessage {
@@ -4491,40 +4465,15 @@ function Test-IsTransientRequestFailureMessage {
 }
 
 function Restore-QueueLockFailedRequests {
-    Ensure-Directory -Path $RequestsDir
-    Ensure-Directory -Path $FailedRequestsDir
-
-    $errorFiles = @(Get-ChildItem -LiteralPath $FailedRequestsDir -Filter '*.json.error.txt' -File -ErrorAction SilentlyContinue)
-    foreach ($errorFile in $errorFiles) {
-        try {
-            $message = Get-Content -LiteralPath $errorFile.FullName -Raw -Encoding UTF8 -ErrorAction Stop
-            if (-not (Test-IsTransientRequestFailureMessage -Message $message)) { continue }
-
-            $requestName = $errorFile.Name.Substring(0, $errorFile.Name.Length - '.error.txt'.Length)
-            $requestPath = Join-Path $FailedRequestsDir $requestName
-            if (-not (Test-Path -LiteralPath $requestPath)) { continue }
-
-            $destination = Join-Path $RequestsDir $requestName
-            if (Test-Path -LiteralPath $destination) {
-                $destination = Join-Path $RequestsDir ("{0}-{1}.json" -f [IO.Path]::GetFileNameWithoutExtension($requestName), [Guid]::NewGuid().ToString('N'))
-            }
-
-            Move-Item -LiteralPath $requestPath -Destination $destination -Force -ErrorAction Stop
-            Remove-Item -LiteralPath $errorFile.FullName -Force -ErrorAction SilentlyContinue
-            Write-Log "Restored failed request '$requestName' for retry after transient queue failure."
-        }
-        catch {
-            Write-Log "Could not restore failed request '$($errorFile.Name)': $($_.Exception.Message)" 'WARN'
-        }
-    }
+    # Archives are service-owned diagnostics, not request credentials. Their
+    # original caller cannot be authenticated from the archived file owner.
+    # Keep old failed files as evidence; users can submit a fresh request.
+    # New transient failures retain the original file in its original drop.
+    Write-Log 'Failed request archives remain diagnostic-only; no privileged-owner replay.'
 }
 
 function Invoke-ProcessRequestsMode {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
-    Ensure-Directory -Path $RequestsDir
-    Ensure-Directory -Path $ProcessedRequestsDir
-    Ensure-Directory -Path $FailedRequestsDir
+    Initialize-ServiceStorage
 
     $shouldStartQueue = $false
     $server = Test-ServerOperatingSystem
@@ -4539,24 +4488,25 @@ function Invoke-ProcessRequestsMode {
     ) | Select-Object -First 200
 
     foreach ($file in $files) {
+        $stream = $null
+        $raw = $null
         try {
-            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            $stream = Open-RequestFileRead -Path $file.FullName
+            $information = Get-OpenRequestFileInformation -Stream $stream
+            if ($information.ReparsePoint -or $information.Directory) {
                 throw 'Request file is a reparse point.'
             }
 
-            if ($file.Length -gt 32768) {
-                throw "Request file is too large ($($file.Length) bytes)."
+            if ($information.Links -ne 1) { throw 'Request file has multiple hardlinks.' }
+
+            if ($stream.Length -gt 32768) {
+                throw "Request file is too large ($($stream.Length) bytes)."
             }
 
-            # No concurrent writers/deleters while binding bytes, owner and DACL.
-            $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-            try {
-                if ($stream.Length -gt 32768) { throw 'Request file is too large.' }
-                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 1024, $true)
-                try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
-                $owner = Get-RequestFileOwnerInfo -Path $file.FullName -Stream $stream
-            }
-            finally { $stream.Dispose() }
+            # Bind content, owner, dispatch and cleanup to one no-follow handle.
+            $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8, $true, 1024, $true)
+            try { $raw = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            $owner = Get-RequestFileOwnerInfo -Path $file.FullName -Stream $stream
             if ([string]::IsNullOrWhiteSpace($raw)) {
                 throw 'Request file is empty.'
             }
@@ -4575,7 +4525,7 @@ function Invoke-ProcessRequestsMode {
             $command = $commandValue.Trim().ToLowerInvariant()
             if ($command -in @('refreshstatus','getstatus')) {
                 Write-Log "Accepted status refresh request file '$($file.Name)' owner='$($owner.Name)' sid='$($owner.Sid)'."
-                Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
+                Complete-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir -Stream $stream -Raw $raw
                 $shouldStartQueue = $true
                 continue
             }
@@ -4606,26 +4556,28 @@ function Invoke-ProcessRequestsMode {
             }
             $result = Add-SoftwareRequestToQueue -Action $action -Alias $alias -RequestedBy $owner.Name -RequestedBySid $owner.Sid -Source User -TimeoutSeconds 5
             Write-Log "Accepted request file '$($file.Name)' action=$action alias='$alias' added=$($result.Added) owner='$($owner.Name)' sid='$($owner.Sid)'."
-            Move-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir
+            Complete-RequestFile -Path $file.FullName -DestinationDir $ProcessedRequestsDir -Stream $stream -Raw $raw
             $shouldStartQueue = $true
         }
         catch {
             $message = $_.Exception.Message
-            if ($server -and [string]::Equals($file.DirectoryName, $adminDirectory, [StringComparison]::OrdinalIgnoreCase) -and
-                (Test-IsTransientRequestFailureMessage -Message $message)) {
+            if (Test-IsTransientRequestFailureMessage -Message $message) {
                 # Retain provenance across retries instead of restoring this
                 # privileged request into the public drop after an update.
-                Write-Log "Administrator request '$($file.Name)' deferred: $message" 'WARN'
+                Write-Log "Request '$($file.Name)' deferred in its original drop: $message" 'WARN'
                 continue
             }
             Write-Log "Rejected request file '$($file.Name)': $message" 'WARN'
             try {
-                Move-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -ErrorMessage $message
+                if ($null -ne $stream) {
+                    Complete-RequestFile -Path $file.FullName -DestinationDir $FailedRequestsDir -Stream $stream -Raw $raw -ErrorMessage $message
+                }
             }
             catch {
-                Write-Log "Could not move failed request file '$($file.FullName)': $($_.Exception.Message)" 'WARN'
+                Write-Log "Could not archive rejected request '$($file.FullName)': $($_.Exception.Message)" 'WARN'
             }
         }
+        finally { if ($null -ne $stream) { $stream.Dispose() } }
     }
 
     try {
@@ -4645,11 +4597,7 @@ function Invoke-ProcessRequestsMode {
 }
 
 function Install-Service {
-    Ensure-Directory -Path $BaseDir
-    Ensure-Directory -Path $LogDir
-    Ensure-Directory -Path $RequestsDir
-    Ensure-Directory -Path $ProcessedRequestsDir
-    Ensure-Directory -Path $FailedRequestsDir
+    Initialize-ServiceStorage
 
     Write-Log "Softwarekatalog build commit: $(Get-SoftwarekatalogBuildCommit)."
     Stop-SoftwarekatalogScheduledTasksForUpdate
@@ -4663,26 +4611,6 @@ function Install-Service {
     try { [void](Reset-RunningQueueItems) }
     catch { Write-Log "Could not reset running queue items during install/update: $($_.Exception.Message)" 'WARN' }
     Publish-QueueStateSnapshot
-
-    Set-DirectoryAcl -Path $BaseDir -UsersCanModify:$false
-    $adminDirectory = Get-AdminRequestsDirectory
-    if ((Test-Path -LiteralPath $adminDirectory) -and ((Get-Item -LiteralPath $adminDirectory).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw 'Administrator-Anfrageverzeichnis darf kein Reparse Point sein.'
-    }
-    Ensure-Directory -Path $adminDirectory
-    Set-DirectoryAcl -Path $adminDirectory -UsersCanModify:$false
-    $artCraftRoot = Join-Path $BaseDir 'ArtCraft'
-    Ensure-Directory -Path $artCraftRoot
-    Set-DirectoryAcl -Path $artCraftRoot -UsersCanModify:$false
-    Set-DirectoryAcl -Path $LogDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $QueueRootDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $QueuePendingDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $QueueRunningDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $QueueSucceededDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $QueueFailedDir -UsersCanModify:$false
-    Set-RequestDirectoryAcl -Path $RequestsDir
-    Set-DirectoryAcl -Path $ProcessedRequestsDir -UsersCanModify:$false
-    Set-DirectoryAcl -Path $FailedRequestsDir -UsersCanModify:$false
 
     if (-not $PSCommandPath) {
         throw 'PSCommandPath is empty; cannot determine the source script path.'
@@ -4730,4 +4658,7 @@ catch {
     catch {
     }
     throw
+}
+finally {
+    Close-TrustedWinGetLeases
 }

@@ -34,9 +34,7 @@ function Initialize-ArtCraftStorage {
     Assert-ArtCraftSystem
     $root = Get-ArtCraftRoot
     foreach ($path in @($root, (Join-Path $root 'Cache'), (Join-Path $root 'Logs'))) {
-        Assert-ArtCraftNoReparsePoint $path
-        Ensure-Directory $path
-        Set-DirectoryAcl -Path $path -UsersCanModify $false
+        New-TrustedDirectory -Path $path
     }
 }
 
@@ -65,9 +63,12 @@ function Assert-ArtCraftTarget {
 function Read-ArtCraftState {
     $path = Join-Path (Get-ArtCraftRoot) 'State.json'
     Assert-ArtCraftNoReparsePoint $path
-    if (-not (Test-Path -LiteralPath $path)) { return [pscustomobject]@{ SchemaVersion = 1; Records = @() } }
-    if ((Get-Item -LiteralPath $path).Length -gt 1048576) { throw 'ArtCraft state exceeds its size limit.' }
-    $raw = [IO.File]::ReadAllText($path)
+    if (-not (Test-Path -LiteralPath $path)) {
+        $parent = if (Test-Path -LiteralPath (Get-ArtCraftRoot)) { Get-ArtCraftRoot } else { $BaseDir }
+        Assert-TrustedFileSystemPath -Path $parent -Directory
+        return [pscustomobject]@{ SchemaVersion = 1; Records = @() }
+    }
+    $raw = Read-TrustedText -Path $path -MaximumBytes 1048576
     if (-not $raw.TrimStart().StartsWith('{')) { throw 'ArtCraft state must be an object.' }
     $state = ConvertFrom-Json -InputObject $raw -ErrorAction Stop
     if ($state -isnot [pscustomobject] -or $state.SchemaVersion -is [bool] -or $state.SchemaVersion -is [string] -or $state.SchemaVersion -ne 1 -or $null -eq $state.Records -or
@@ -94,16 +95,7 @@ function Write-ArtCraftState {
     param([Parameter(Mandatory)]$State)
     Assert-ArtCraftSystem
     $path = Join-Path (Get-ArtCraftRoot) 'State.json'
-    Assert-ArtCraftNoReparsePoint $path
-    $temporary = $path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
-    try {
-        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($State | ConvertTo-Json -Depth 16))
-        $file = New-Object IO.FileStream($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $file.Write($bytes,0,$bytes.Length); $file.Flush($true) } finally { $file.Dispose() }
-        if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temporary,$path,[System.Management.Automation.Language.NullString]::Value) }
-        else { [IO.File]::Move($temporary,$path) }
-    }
-    finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
+    Write-TrustedText -Path $path -Value ($State | ConvertTo-Json -Depth 16)
 }
 
 function Get-ArtCraftOwnership { (Read-ArtCraftState).Records }
@@ -389,6 +381,15 @@ function Get-ArtCraftTargetPath {
 
 function Assert-ArtCraftInstaller {
     param([Parameter(Mandatory)]$Definition,[Parameter(Mandatory)]$Target,[Parameter(Mandatory)][string]$Path)
+
+    $stream = Open-TrustedFileRead -Path $Path
+    try { return Assert-ArtCraftInstallerContent -Definition $Definition -Target $Target -Path $Path }
+    finally { $stream.Dispose() }
+}
+
+function Assert-ArtCraftInstallerContent {
+    param([Parameter(Mandatory)]$Definition,[Parameter(Mandatory)]$Target,[Parameter(Mandatory)][string]$Path)
+
     Assert-ArtCraftTarget $Definition $Target
     Assert-ArtCraftNoReparsePoint $Path
     if ((Get-Item -LiteralPath $Path).Length -gt 2147483648) { throw 'Cached ArtCraft MSI exceeds limit.' }
@@ -477,6 +478,35 @@ function Assert-ArtCraftMsiCode {
 
 function Invoke-ArtCraftRecord {
     param([Parameter(Mandatory)]$Record)
+
+    Assert-ArtCraftSystem
+    if ($Record.Stage -in @('Owned', 'Uninstalling')) {
+        return Invoke-ArtCraftRecordCore -Record $Record
+    }
+
+    $definition = Get-ArtCraftDefinition $Record.PackageId
+    $lease = Open-ArtCraftInstallerLease -Definition $definition -Target $Record.Target
+    try { return Invoke-ArtCraftRecordCore -Record $Record -InstallerPath $lease.Path }
+    finally { $lease.Stream.Dispose() }
+}
+
+function Open-ArtCraftInstallerLease {
+    param([Parameter(Mandatory)]$Definition, [Parameter(Mandatory)]$Target)
+
+    $path = Save-ArtCraftInstaller -Definition $Definition -Target $Target
+    $stream = Open-TrustedFileRead -Path $path
+    try {
+        # Reverify after acquiring the lease and retain it until ALL removals,
+        # MSI consumption and post-install verification have finished.
+        $metadata = Assert-ArtCraftInstallerContent -Definition $Definition -Target $Target -Path $path
+        $Target.ProductCode = $metadata.ProductCode
+        return [pscustomobject]@{ Path = $path; Stream = $stream }
+    }
+    catch { $stream.Dispose(); throw }
+}
+
+function Invoke-ArtCraftRecordCore {
+    param([Parameter(Mandatory)]$Record, [string]$InstallerPath)
     $d = Get-ArtCraftDefinition $Record.PackageId
     if ($Record.Stage -eq 'Owned') { return 0 }
     $uninstall = $Record.Stage -eq 'Uninstalling'
@@ -484,7 +514,9 @@ function Invoke-ArtCraftRecord {
     if (-not $uninstall) {
         # Reverify the exact frozen target even on recovery and before EVERY
         # removal. A changed cache/signature never destroys an old installation.
-        $path = Save-ArtCraftInstaller $d $Record.Target
+        if (-not $InstallerPath) { throw 'Missing locked and verified ArtCraft installer.' }
+
+        $path = $InstallerPath
         if ($Record.Target.Architecture -cne (Get-NativeWindowsArchitecture)) { throw 'Recovery target is not native to this OS.' }
         if (-not (Test-ArtCraftMachinePath $Record.InstallLocation)) { throw 'Unsafe recovery destination; removal blocked.' }
         $before = @(Get-ArtCraftInventory | Where-Object { $_.PackageId -ceq $d.PackageId })

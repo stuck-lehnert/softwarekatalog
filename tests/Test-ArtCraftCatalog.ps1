@@ -12,6 +12,8 @@ if ($errors.Count) { throw ($errors | Out-String) }
 foreach ($node in $ast.EndBlock.Statements) {
     if ($node -is [Management.Automation.Language.FunctionDefinitionAst]) { . ([scriptblock]::Create($node.Extent.Text)) }
 }
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
+
 $root=Join-Path ([IO.Path]::GetTempPath()) ('artcraft-catalog-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $root | Out-Null
 $passed=0

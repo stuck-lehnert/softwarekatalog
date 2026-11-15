@@ -25,7 +25,7 @@ class DistributionTests(unittest.TestCase):
             payload = base64.b64decode(match[1], validate=True)
             source = (ROOT / "setup.ps1").read_text(encoding="utf-8-sig")
             modules = "\n\n".join((ROOT / "modules" / n).read_text(encoding="utf-8-sig").rstrip("\r\n")
-                                  for n in ("ArtCraft.Catalog.ps1", "ArtCraft.Provider.ps1")) + "\n"
+                                  for n in ("FileSystem.Security.ps1", "WinGet.Trust.ps1", "ArtCraft.Catalog.ps1", "ArtCraft.Provider.ps1")) + "\n"
             expected = re.sub(r"(?ms)^# <SoftwarekatalogModules>\n.*?^# </SoftwarekatalogModules>\n",
                               lambda _: modules, source)
             self.assertEqual(payload, b"# Softwarekatalog build commit: ci-build-marker\n" +

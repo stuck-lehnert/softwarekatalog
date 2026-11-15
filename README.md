@@ -142,6 +142,10 @@ C:\ProgramData\__Softwarekatalog\Failed\
 
 ### Additional installations on Windows Server
 
+For privileged filesystem, archive, ArtCraft cache/state and WinGet provenance
+hardening, including fail-closed upgrades of questionable existing service
+paths, see [Privileged file and executable trust](docs/filesystem-security.md).
+
 On Windows Server (including domain controllers), only administrators may
 request additional package installations. **Start the catalog or
 `Request-App.ps1` as administrator**: a UAC-filtered administrator session is

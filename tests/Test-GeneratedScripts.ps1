@@ -11,6 +11,8 @@ foreach ($statement in $ast.EndBlock.Statements) {
         . ([scriptblock]::Create($statement.Extent.Text))
     }
 }
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
+
 # Generation must be safe without a Windows UI/session. Only the ACL boundary
 # is replaced here; generated PowerShell is parsed by the current real engine.
 function Set-FileAclAdminsOnly { param($Path) }

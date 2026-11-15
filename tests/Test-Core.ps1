@@ -16,6 +16,8 @@ foreach ($statement in $ast.EndBlock.Statements) {
     }
 }
 
+. (Join-Path $PSScriptRoot 'helpers/PortableFileSystem.ps1')
+
 $script:passed = 0
 $script:failures = @()
 $script:tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('catalog-core-tests-' + [Guid]::NewGuid().ToString('N'))
@@ -120,7 +122,7 @@ function Test([string]$Name, [scriptblock]$Body) {
     $script:aclPaths = @()
     $script:ownerPaths = @()
     $script:workerStarts = 0
-    foreach ($path in @($script:BaseDir, $script:PolicyCatalogRoot, $script:PolicyRequiredRoot)) {
+    foreach ($path in @($script:BaseDir, $script:LogDir, $script:PolicyCatalogRoot, $script:PolicyRequiredRoot)) {
         New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
     try {
@@ -547,8 +549,32 @@ try {
         Assert-Equal $items[0].RequestedBySid 'S-1-5-21-123-456-789-1001'
         Assert-Equal $script:ownerPaths.Count 2
         Assert ($script:ownerPaths -contains $firstPath)
-        Assert-Equal $script:aclPaths.Count 2
+        Assert-Equal $script:aclPaths.Count 0
         Assert-Equal $script:workerStarts 1
+    }
+    foreach ($unsafeKind in @('Hardlink', 'Reparse')) {
+        Test "Request worker rejects $unsafeKind before owner lookup or parsing and creates bounded diagnostics" {
+            $originalInformation = ${function:Get-OpenRequestFileInformation}
+            $script:unsafeRequestInfo = [pscustomobject]@{
+                ReparsePoint = ($unsafeKind -eq 'Reparse')
+                Directory = $false
+                Links = if ($unsafeKind -eq 'Hardlink') { 2 } else { 1 }
+            }
+            Set-Item Function:script:Get-OpenRequestFileInformation -Value {
+                param($Stream)
+                return $script:unsafeRequestInfo
+            }
+            try {
+                [void](Write-TestRequest 'unsafe.json' '{"Command":"Install","AppAlias":"app"}')
+                Invoke-ProcessRequestsMode
+                Assert-Equal $script:ownerPaths.Count 0
+                Assert-Equal $script:aclPaths.Count 0
+                Assert-Equal (Get-JsonCount $script:QueuePendingDir) 0
+                $archive = Read-Json (Join-Path $script:FailedRequestsDir 'unsafe.json')
+                Assert-Equal $archive.PayloadRetained $false
+            }
+            finally { Set-Item Function:script:Get-OpenRequestFileInformation -Value $originalInformation }
+        }
     }
     Test 'Request byte-size limit is inclusive at exactly 32768 bytes without an encoding/BOM dependency' {
         $prefix = '{"Command":"Install","AppAlias":"app","Padding":"'
@@ -612,7 +638,7 @@ try {
         @{ Name = 'oversized'; Raw = ('{"Command":"Install","AppAlias":"app","Padding":"' + ('x' * 32768) + '"}'); Error = 'too large' }
     )
     foreach ($rejected in $rejectedRequests) {
-        Test "Request rejection ($($rejected.Name)) archives raw evidence and never queues or launches" {
+        Test "Request rejection ($($rejected.Name)) archives bounded evidence without changing the original ACL" {
             $path = Write-TestRequest ($rejected.Name + '.json') $rejected.Raw
             Invoke-ProcessRequestsMode
             Assert (-not (Test-Path -LiteralPath $path))
@@ -620,9 +646,14 @@ try {
             Assert-Equal (Get-JsonCount $script:ProcessedRequestsDir) 0
             Assert-Equal (Get-JsonCount $script:QueuePendingDir) 0
             $failedPath = Join-Path $script:FailedRequestsDir ($rejected.Name + '.json')
-            Assert-Equal ((Get-Content -LiteralPath $failedPath -Raw -Encoding UTF8).Trim()) $rejected.Raw
+            $archived = (Get-Content -LiteralPath $failedPath -Raw -Encoding UTF8).Trim()
+            if ($rejected.Name -eq 'oversized') {
+                Assert-Equal ($archived | ConvertFrom-Json).PayloadRetained $false
+                Assert ((Get-Item -LiteralPath $failedPath).Length -lt 1024)
+            }
+            else { Assert-Equal $archived $rejected.Raw }
             Assert ((Get-Content -LiteralPath ($failedPath + '.error.txt') -Raw -Encoding UTF8) -match $rejected.Error)
-            Assert-Equal $script:aclPaths.Count 2
+            Assert-Equal $script:aclPaths.Count 0
             Assert-Equal $script:workerStarts 0
         }
     }
@@ -668,15 +699,19 @@ try {
         $existing = Join-Path $script:FailedRequestsDir 'same.json'
         Set-Content -LiteralPath $existing -Value 'existing evidence'
         $path = Write-TestRequest 'same.json' '{"Command":"Execute"}'
-        Move-RequestFile $path $script:FailedRequestsDir -ErrorMessage 'deliberate error'
+        $stream = Open-RequestFileRead $path
+        try {
+            Complete-RequestFile -Path $path -DestinationDir $script:FailedRequestsDir -Stream $stream -Raw '{"Command":"Execute"}' -ErrorMessage 'deliberate error'
+        }
+        finally { $stream.Dispose() }
         Assert-Equal (Get-JsonCount $script:FailedRequestsDir) 2
         Assert-Equal ((Get-Content -LiteralPath $existing -Raw).Trim()) 'existing evidence'
         $newFiles = @(Get-ChildItem -LiteralPath $script:FailedRequestsDir -Filter 'same-*.json')
         Assert-Equal $newFiles.Count 1
         Assert-Equal ((Get-Content -LiteralPath ($newFiles[0].FullName + '.error.txt') -Raw).Trim()) 'deliberate error'
-        Assert-Equal $script:aclPaths.Count 2
+        Assert-Equal $script:aclPaths.Count 0
     }
-    Test 'Transient request recovery retries only transient failures, handles collisions and keeps permanent evidence' {
+    Test 'Legacy failed archives are never replayed with their privileged archive owner' {
         Ensure-Directory $script:FailedRequestsDir
         [void](Write-TestRequest 'retry.json' '{"Command":"getstatus"}')
         foreach ($entry in @(
@@ -690,13 +725,13 @@ try {
         }
         Set-Content -LiteralPath (Join-Path $script:FailedRequestsDir 'orphan.json.error.txt') -Value 'queue state lock'
         Restore-QueueLockFailedRequests
-        Assert-Equal (Get-JsonCount $script:RequestsDir) 3
-        Assert-Equal (Get-JsonCount $script:FailedRequestsDir) 1
+        Assert-Equal (Get-JsonCount $script:RequestsDir) 1
+        Assert-Equal (Get-JsonCount $script:FailedRequestsDir) 3
         Assert (Test-Path -LiteralPath (Join-Path $script:FailedRequestsDir 'permanent.json.error.txt'))
         Assert (Test-Path -LiteralPath (Join-Path $script:FailedRequestsDir 'orphan.json.error.txt'))
-        Assert (-not (Test-Path -LiteralPath (Join-Path $script:FailedRequestsDir 'retry.json.error.txt')))
+        Assert (Test-Path -LiteralPath (Join-Path $script:FailedRequestsDir 'retry.json.error.txt'))
         Restore-QueueLockFailedRequests
-        Assert-Equal (Get-JsonCount $script:RequestsDir) 3
+        Assert-Equal (Get-JsonCount $script:RequestsDir) 1
         Assert-Equal $script:workerStarts 0
     }
     Test 'A queued item loses permission if its catalog alias is removed before execution' {

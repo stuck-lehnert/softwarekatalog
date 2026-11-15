@@ -31,14 +31,15 @@ if ($WorkerRoot) {
         foreach ($statement in $ast.EndBlock.Statements) {
             if ($statement -is [Management.Automation.Language.FunctionDefinitionAst]) { . ([scriptblock]::Create($statement.Extent.Text)) }
         }
-        foreach ($module in @('ArtCraft.Catalog.ps1','ArtCraft.Provider.ps1')) {
+        foreach ($module in @('FileSystem.Security.ps1','ArtCraft.Catalog.ps1','ArtCraft.Provider.ps1')) {
             . ([scriptblock]::Create([IO.File]::ReadAllText((Join-Path (Join-Path $settings.Repository 'modules') $module), [Text.Encoding]::UTF8)))
         }
         $BaseDir = Join-Path $WorkerRoot 'state'
         $LogDir = Join-Path $WorkerRoot 'logs'
         $LogFile = Join-Path $LogDir 'vendor.log'
         $WingetMutexName = 'Global\Softwarekatalog-Winget'
-        Ensure-Directory $LogDir
+        New-TrustedDirectory -Path $BaseDir
+        New-TrustedDirectory -Path $LogDir
         Invoke-WithWingetLock {
             Initialize-ArtCraftStorage
             $definitions = @(Get-ArtCraftDefinitions | Where-Object { $AllPackages -or $_.Alias -eq 'materialcraft' })
