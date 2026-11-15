@@ -132,9 +132,11 @@ namespace Softwarekatalog {
         }
 
         public static SafeFileHandle OpenRequestDirectory(string path) {
-            // Pin the actual no-follow directory object. Directory write
-            // sharing is not a reliable lock against reparse changes on NTFS.
-            return CheckHandle(CreateFileW(path, 0x000200a1u, 1, IntPtr.Zero,
+            // Bind the actual no-follow directory object, not its pathname.
+            // Allow directory writers: safety comes from the relative no-reparse
+            // child open, not from a directory write-sharing exclusion. The
+            // request FILE itself still denies write/delete sharing below.
+            return CheckHandle(CreateFileW(path, 0x000200a1u, 3, IntPtr.Zero,
                 3, 0x02200000u, IntPtr.Zero));
         }
 
