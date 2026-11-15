@@ -34,7 +34,8 @@ namespace Softwarekatalog {
 
         [StructLayout(LayoutKind.Sequential)]
         private struct FileDisposition {
-            [MarshalAs(UnmanagedType.Bool)] public bool Delete;
+            // FILE_DISPOSITION_INFO uses BOOLEAN (one byte), not Win32 BOOL.
+            public byte Delete;
         }
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -157,7 +158,7 @@ namespace Softwarekatalog {
 
         public static void DeleteOpenedRequest(SafeFileHandle file) {
             FileDisposition disposition = new FileDisposition();
-            disposition.Delete = true;
+            disposition.Delete = 1;
             if (!SetFileInformationByHandle(file, 4, ref disposition, (uint)Marshal.SizeOf(typeof(FileDisposition))))
                 throw new Win32Exception(Marshal.GetLastWin32Error());
         }

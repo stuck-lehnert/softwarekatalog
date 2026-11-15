@@ -75,6 +75,21 @@ Test-Security 'Every privileged mode performs storage preflight as its first ope
     }
 }
 
+Test-Security 'Native filesystem structure sizes match BOOLEAN, DWORD and pointer ABI layouts' {
+    Initialize-FileSystemSecurityNative
+    $type = 'Softwarekatalog.TrustedFileSystemNative' -as [type]
+    $disposition = $type.GetNestedType('FileDisposition', [Reflection.BindingFlags]::NonPublic)
+    $attributes = $type.GetNestedType('SecurityAttributes', [Reflection.BindingFlags]::NonPublic)
+    $expectedAttributes = if ([IntPtr]::Size -eq 8) { 24 } else { 12 }
+    # Avoid Marshal.SizeOf's RuntimeType/Object overload ambiguity in PS7.
+    $dispositionSize = [Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($disposition))
+    $attributesSize = [Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($attributes))
+    $informationSize = [Runtime.InteropServices.Marshal]::SizeOf((New-Object Softwarekatalog.TrustedFileSystemNative+FileInformation))
+    if ($dispositionSize -ne 1 -or $attributesSize -ne $expectedAttributes -or $informationSize -ne 52) {
+        throw 'Filesystem native interop structure sizes disagree with the Windows ABI.'
+    }
+}
+
 if ($env:OS -eq 'Windows_NT') {
     Test-Security 'Real Windows security descriptors use native handles and byte-backed ACE flags in every engine lane' {
         Assert-TrustedFileSystemPath -Path $env:SystemRoot -Directory
