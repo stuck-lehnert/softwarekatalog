@@ -1,9 +1,18 @@
 # Authenticate candidates as data, never by running them (including AppExecLink
 # aliases). Dependencies: FileSystem.Security.ps1's protected no-follow reader.
-# Upstream identity is NOT guessed: microsoft/winget-cli's
+# Exact upstream source identity: microsoft/winget-cli's
 # https://github.com/microsoft/winget-cli/blob/master/src/binver/binver/version.h
 # defines VER_PRODUCTNAME_STR "WinGet CLI", and both original/internal names
-# "winget.exe". These signed resource values distinguish renamed Microsoft EXEs.
+# "winget.exe". Microsoft's shipped DesktopAppInstaller PE uses a DIFFERENT
+# exact pair: InternalName "AppInstallerCLI", ProductName "Microsoft Desktop
+# App Installer", still OriginalFilename "winget.exe". Read from original x64
+# and ARM64 winget.exe members of the official v1.29.380 release MSIX bundle:
+# https://github.com/microsoft/winget-cli/releases/tag/v1.29.380
+# x64 SHA256 ce0bb2b4871cb7f41f40d34ad47e8414a426dc5f6a303c14cee335a71d8602ed
+# ARM64 SHA256 b5fd38f58a202f33c6dd00d0802c8ad09c6129cedd37c83507579bd89ed95fac
+# Match whole profiles, never arbitrary combinations. Resource identity alone
+# NEVER authorizes a candidate: Microsoft Authenticode, root/publisher, held
+# protected read handle and any package provenance remain mandatory below.
 
 function Initialize-WinGetTrustNativeApi {
     if ('Softwarekatalog.WinGetTrustNative' -as [type]) { return }
@@ -597,6 +606,39 @@ function Get-WinGetPackageIdentity {
     [pscustomobject]@{ PackageFamilyName = $family; Architecture = $architecture; Version = $version }
 }
 
+function Assert-WinGetProductIdentity {
+    param([Parameter(Mandatory)]$Metadata)
+
+    $upstreamCli = $Metadata.InternalName -ceq 'winget.exe' -and $Metadata.ProductName -ceq 'WinGet CLI'
+    $appInstallerCli = $Metadata.InternalName -ceq 'AppInstallerCLI' -and
+        $Metadata.ProductName -ceq 'Microsoft Desktop App Installer'
+    if ($Metadata.OriginalFilename -ceq 'winget.exe' -and ($upstreamCli -or $appInstallerCli)) { return }
+
+    # These bytes have not passed Authenticode yet. Bound each diagnostic field
+    # BEFORE escaping, and make it printable ASCII to prevent control/bidi/log
+    # injection or an unbounded exception from attacker-controlled resources.
+    $fields = foreach ($name in @('OriginalFilename','InternalName','ProductName')) {
+        $value = [string]$Metadata.$name
+        $truncated = $value.Length -gt 128
+        if ($truncated) { $value = $value.Substring(0, 128) }
+
+        $escaped = foreach ($character in $value.ToCharArray()) {
+            $code = [int]$character
+            if ($code -lt 32 -or $code -gt 126 -or $code -eq 39 -or $code -eq 92) {
+                '\u{0:x4}' -f $code
+            }
+            else { [string]$character }
+        }
+
+        $display = -join $escaped
+        if ($truncated) { $display += '...' }
+
+        "$name='$display'"
+    }
+
+    throw ('File is not the actual WinGet CLI product. Observed PE identity: ' + ($fields -join ', '))
+}
+
 function Open-TrustedWinGetCandidate {
     param([Parameter(Mandatory)][string]$Path, $Package)
 
@@ -613,11 +655,7 @@ function Open-TrustedWinGetCandidate {
 
         Initialize-WinGetTrustNativeApi
         $metadata = [Softwarekatalog.WinGetTrustNative]::ReadMetadata($stream)
-        # Exact upstream resource values, documented at this module's start.
-        if ($metadata.OriginalFilename -ine 'winget.exe' -or $metadata.InternalName -ine 'winget.exe' -or
-            $metadata.ProductName -cne 'WinGet CLI') {
-            throw 'Microsoft-signed file is not the actual WinGet CLI product.'
-        }
+        Assert-WinGetProductIdentity -Metadata $metadata
 
         $signature = Get-WinGetSignatureEvidence -Stream $stream -Path $fullPath
         if ($signature.AuthenticodeStatus -ne 0 -or $signature.MicrosoftRootStatus -ne 0 -or

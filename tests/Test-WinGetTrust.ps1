@@ -275,6 +275,56 @@ try {
             Assert (-not $record.PackageFamilyName) 'Portable candidate invented package membership.'
         }
     }
+    foreach ($architecture in @('x64','arm64')) {
+        Case "Official released $architecture AppInstallerCLI product profile passes the same complete trust pipeline" {
+            $path = New-TestCandidate -Name "released-profile-$architecture" -Architecture $architecture -Version 1.29.380.0 `
+                -InternalName AppInstallerCLI -ProductName 'Microsoft Desktop App Installer'
+            $package = New-TestPackage $path -Architecture $architecture
+            $before = $script:signatureCalls.Count
+            $record = Assert-TrustedWinGetCandidate $path -Package $package
+            Assert ($record.Architecture -ceq $architecture -and $record.Version -eq [version]'1.29.380.0') 'Released PE metadata was not retained.'
+            Assert ($record.PackageFamilyName -ceq 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe') 'Released profile bypassed exact package identity.'
+            Assert ($script:signatureCalls.Count -eq $before + 1) 'Released profile bypassed the real signature API boundary.'
+        }
+    }
+    Case 'Released product metadata cannot bypass invalid Microsoft Authenticode' {
+        $path = New-TestCandidate -Name released-profile-invalid-signature -InternalName AppInstallerCLI -ProductName 'Microsoft Desktop App Installer'
+        $script:signatures[$path] = [pscustomobject]@{ AuthenticodeStatus=-1; MicrosoftRootStatus=0; SignerOrganization='Microsoft Corporation' }
+        Assert-Throws { Assert-TrustedWinGetCandidate $path } 'valid Microsoft-production Authenticode'
+    }
+    foreach ($profile in @(
+        @('winget.exe','Microsoft Desktop App Installer'),
+        @('AppInstallerCLI','WinGet CLI'),
+        @('AppInstallerCLI.exe','Microsoft Desktop App Installer'),
+        @('AppInstallerCLI','Microsoft Desktop App Installer Other Product')
+    )) {
+        Case "Product identity rejects mixed or partial manufacturer profile $($profile -join '/')" {
+            $path = New-TestCandidate -Name ('mixed-profile-' + $script:passed) -InternalName $profile[0] -ProductName $profile[1]
+            Assert-Throws { Assert-TrustedWinGetCandidate $path } 'not the actual WinGet CLI product'
+        }
+    }
+    foreach ($original in @('AppInstaller.exe','winget.dll','winget.exe.other')) {
+        Case "Released product profile cannot authorize another OriginalFilename $original" {
+            $path = New-TestCandidate -Name ('wrong-original-' + $script:passed) -OriginalFilename $original `
+                -InternalName AppInstallerCLI -ProductName 'Microsoft Desktop App Installer'
+            Assert-Throws { Assert-TrustedWinGetCandidate $path } 'not the actual WinGet CLI product'
+        }
+    }
+    Case 'Rejected PE identity diagnostic is bounded and escapes controls, bidi, quotes and backslashes' {
+        $metadata = [pscustomobject]@{
+            OriginalFilename = 'other.exe'
+            InternalName = "other`r`n'\"
+            ProductName = ([string][char]0x202e) + ('x' * 2000)
+        }
+        $message = ''
+        try { Assert-WinGetProductIdentity $metadata }
+        catch { $message = $_.Exception.Message }
+
+        Assert ($message -match 'Observed PE identity:.*OriginalFilename=.*InternalName=.*ProductName=') 'Rejected resource values are missing from diagnostics.'
+        Assert ($message.Length -lt 2500 -and $message -notmatch '[^\x20-\x7e]') 'Untrusted identity escaped the diagnostic output bound or inserted log controls.'
+        Assert ($message.Contains('\u000d\u000a\u0027\u005c') -and $message.Contains('\u202e')) 'Diagnostic failed to escape controls/quotes/bidi.'
+        Assert ($message.Contains('...') -and $message -notmatch 'Microsoft-signed') 'Diagnostic did not truncate or claimed a not-yet-verified signature.'
+    }
     Case 'Lease keeps the actual read handle alive until caller disposal' {
         $path = New-TestCandidate -Name lease
         $lease = Open-TrustedWinGetCandidate $path
