@@ -91,12 +91,43 @@ namespace Softwarekatalog {
             return CheckHandle(CreateFileW(path, 0x00020080u, share, IntPtr.Zero, 3, flags, IntPtr.Zero));
         }
 
-        public static FileStream OpenRead(string path, bool deleteAccess) {
+        private static SafeFileHandle OpenReadHandle(string path, bool deleteAccess) {
             uint access = 0x80020080u | (deleteAccess ? 0x00010000u : 0u);
-            SafeFileHandle handle = CheckHandle(CreateFileW(path, access, 1, IntPtr.Zero,
+            return CheckHandle(CreateFileW(path, access, 1, IntPtr.Zero,
                 3, 0x00200000u, IntPtr.Zero));
+        }
+
+        public static FileStream OpenRead(string path, bool deleteAccess) {
+            SafeFileHandle handle = OpenReadHandle(path, deleteAccess);
             try { return new FileStream(handle, FileAccess.Read); }
             catch { handle.Dispose(); throw; }
+        }
+
+        public static SafeFileHandle OpenRequestDirectory(string path) {
+            // Deny directory write/delete sharing throughout request handling.
+            // In particular, FSCTL_SET_REPARSE_POINT needs FILE_WRITE_DATA.
+            return CheckHandle(CreateFileW(path, 0x00020080u, 1, IntPtr.Zero,
+                3, 0x02200000u, IntPtr.Zero));
+        }
+
+        private sealed class RequestReadStream : FileStream {
+            private readonly SafeFileHandle directoryLease;
+
+            public RequestReadStream(SafeFileHandle file, SafeFileHandle directory)
+                : base(file, FileAccess.Read) {
+                directoryLease = directory;
+            }
+
+            protected override void Dispose(bool disposing) {
+                try { base.Dispose(disposing); }
+                finally { if (disposing) directoryLease.Dispose(); }
+            }
+        }
+
+        public static FileStream OpenRequestRead(string path, SafeFileHandle directoryLease) {
+            SafeFileHandle file = OpenReadHandle(path, true);
+            try { return new RequestReadStream(file, directoryLease); }
+            catch { file.Dispose(); throw; }
         }
 
         public static FileInformation Information(SafeFileHandle file) {
@@ -434,8 +465,21 @@ function Open-RequestFileRead {
 
     # Only the containing drop is trusted. The source object is intentionally
     # NOT promoted to a trusted file and its DACL is never changed.
-    Assert-TrustedFileSystemPath -Path ([IO.Path]::GetDirectoryName($Path)) -Directory -PublicDrop
-    return [Softwarekatalog.TrustedFileSystemNative]::OpenRead((Get-CanonicalLocalPath $Path), $true)
+    Initialize-FileSystemSecurityNative
+    $canonical = Get-CanonicalLocalPath $Path
+    $parent = [IO.Path]::GetDirectoryName($canonical)
+    $directoryLease = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestDirectory($parent)
+    try {
+        Assert-TrustedFileSystemPath -Path $parent -Directory -PublicDrop
+        Assert-TrustedOpenFile -Handle $directoryLease -Directory -PublicDrop
+
+        # Transfer ownership only after success. The actual FileStream retains
+        # this directory lease through parsing, archiving and handle deletion.
+        $stream = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead($canonical, $directoryLease)
+        $directoryLease = $null
+        return $stream
+    }
+    finally { if ($null -ne $directoryLease) { $directoryLease.Dispose() } }
 }
 
 function Get-OpenRequestFileInformation {

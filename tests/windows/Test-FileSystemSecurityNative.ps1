@@ -8,6 +8,33 @@ if (-not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
     throw 'Native filesystem tests require the actual SYSTEM token.'
 }
 
+if (-not ('Softwarekatalog.Tests.RequestDirectoryProbe' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace Softwarekatalog.Tests {
+    public static class RequestDirectoryProbe {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access, uint share,
+            IntPtr security, uint creation, uint flags, IntPtr template);
+
+        public static SafeFileHandle OpenWrite(string path) {
+            // FILE_WRITE_DATA on a directory: required to set a reparse point.
+            SafeFileHandle handle = CreateFileW(path, 2, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+            if (!handle.IsInvalid) return handle;
+
+            int error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new Win32Exception(error);
+        }
+    }
+}
+'@
+}
+
 function Check-Security($Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
@@ -91,8 +118,27 @@ try {
 
     $valid = Join-Path $RequestsDir 'valid.json'
     [IO.File]::WriteAllText($valid, '{"Command":"GetStatus"}')
+
+    $directoryWriter = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
+    try {
+        Expect-SharingViolation {
+            $unexpected = Open-RequestFileRead -Path $valid
+            $unexpected.Dispose()
+        }
+    }
+    finally { $directoryWriter.Dispose() }
+
     $stream = Open-RequestFileRead -Path $valid
     try {
+        Expect-SharingViolation {
+            $writer = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
+            $writer.Dispose()
+        }
+
+        $newSubmission = Join-Path $RequestsDir 'submitted-during-lease.json'
+        [IO.File]::WriteAllText($newSubmission, '{"Command":"GetStatus"}')
+        [IO.File]::Delete($newSubmission)
+
         Expect-SharingViolation {
             $writer = [IO.File]::Open($valid, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
             $writer.Dispose()
@@ -102,8 +148,11 @@ try {
     }
     finally { $stream.Dispose() }
 
+    $directoryWriter = [Softwarekatalog.Tests.RequestDirectoryProbe]::OpenWrite($RequestsDir)
+    $directoryWriter.Dispose()
+
     Check-Security ((Read-TrustedText (Join-Path $FailedRequestsDir 'valid.json')) -eq '{"Command":"GetStatus"}') 'Valid bounded content was not retained.'
-    Write-Output 'PASS FileSystemNative live request blocks write/name exchange and archives exact bounded content'
+    Write-Output 'PASS FileSystemNative directory/content leases block reparse writers and name exchange; permit child submissions; release after exact bounded archive'
 
     $cache = Join-Path $BaseDir 'ArtCraft\Cache\lease.msi'
     Write-TrustedText -Path $cache -Value 'isolated installer bytes'

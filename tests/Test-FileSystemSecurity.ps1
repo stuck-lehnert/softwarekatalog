@@ -59,6 +59,19 @@ Test-Security 'Public drop permits Users input creation, not delete-child or ACL
     Reject { Assert-TrustedSecuritySummary (New-Summary -Rules @((New-Rule 'S-1-5-11' 2))) -PublicDrop }
 }
 
+Test-Security 'Directory policy exceptions cannot be applied to file handles' {
+    foreach ($flags in @(@{ Ancestor = $true }, @{ PublicDrop = $true })) {
+        try { Assert-TrustedOpenFile -Handle ([object]::new()) @flags }
+        catch {
+            if ($_.Exception.Message -notlike '*exceptions apply only to directory objects*') { throw }
+
+            continue
+        }
+
+        throw 'A directory policy exception reached native file handling.'
+    }
+}
+
 Test-Security 'Inherit-only and deny ACEs do not grant effective parent writes' {
     Assert-TrustedSecuritySummary (New-Summary -Rules @(
         (New-Rule 'S-1-3-0' 0x1f01ff -InheritOnly $true),
