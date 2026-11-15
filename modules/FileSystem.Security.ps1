@@ -236,7 +236,11 @@ function Assert-TrustedSecuritySummary {
             $writes = $writes -band (-bnot 0x00000116)
         }
 
-        if ($writes) { throw "Untrusted filesystem write/delete/ACL grant for '$($rule.Sid)'." }
+        if ($writes) {
+            $maskText = $rule.Mask.ToString('X8')
+            $forbiddenText = $writes.ToString('X8')
+            throw "Untrusted filesystem write/delete/ACL grant for '$($rule.Sid)' (mask=0x$maskText, forbidden=0x$forbiddenText)."
+        }
     }
 }
 
@@ -273,6 +277,7 @@ function Assert-TrustedFileSystemPath {
             Assert-TrustedOpenFile -Handle $handle -Directory:$isDirectory -Ancestor:((-not $leaf) -or $AncestorLeaf) -PublicDrop:($leaf -and $PublicDrop)
         }
     }
+    catch { throw "Untrusted filesystem path '$($parts[$index])': $($_.Exception.Message)" }
     finally {
         for ($index = $handles.Count - 1; $index -ge 0; $index--) { $handles[$index].Dispose() }
     }

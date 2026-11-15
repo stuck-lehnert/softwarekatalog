@@ -93,6 +93,7 @@ Test-Security 'Native filesystem structure sizes match BOOLEAN, DWORD and pointe
 if ($env:OS -eq 'Windows_NT') {
     Test-Security 'Real Windows security descriptors use native handles and byte-backed ACE flags in every engine lane' {
         Assert-TrustedFileSystemPath -Path $env:SystemRoot -Directory
+        Assert-TrustedFileSystemPath -Path $env:ProgramData -Directory -AncestorLeaf
     }
 }
 

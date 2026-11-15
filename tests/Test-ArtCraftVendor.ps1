@@ -103,6 +103,8 @@ New-Item -ItemType Directory -Path $root | Out-Null
 try {
     & icacls.exe $root /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not protect vendor-smoke scratch directory.' }
+    & icacls.exe $root /setowner '*S-1-5-32-544' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not set the trusted owner of the freshly created CI scratch directory.' }
     Set-Content -LiteralPath (Join-Path $root '.artcraft-vendor-smoke') -Value 'Owned by read-only Softwarekatalog vendor smoke'
     @{ Repository = $repo } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'config.json') -Encoding UTF8
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'helpers/WindowsArchitecture.ps1') -Destination (Join-Path $root 'WindowsArchitecture.ps1')
@@ -139,6 +141,13 @@ try {
         throw ('Read-only real-vendor verification failed: ' + (($summary.Cases | Where-Object { -not $_.Success } | ForEach-Object { $_.Error }) -join "`n"))
     }
     Write-Output "$expectedCount real vendor native $ExpectedArchitecture MSI(s) passed SHA256, Valid Authenticode, exact production publisher and MSI identity verification. No installation performed."
+}
+catch {
+    $detail = (($_ | Out-String) + "`n" + $_.ScriptStackTrace)
+    if ($detail.Length -gt 12000) { $detail = $detail.Substring($detail.Length - 12000) }
+    $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+    Write-Output "::error title=ArtCraft vendor SYSTEM verification::$detail"
+    throw
 }
 finally {
     if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
