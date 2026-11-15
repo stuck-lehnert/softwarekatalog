@@ -184,8 +184,8 @@ function Get-FileSystemSecuritySummary {
     catch { throw "Cannot read native filesystem security descriptor: $($_.Exception.ToString())" }
 
     $rules = @()
-    # RawAcl's non-generic enumerator is not consistently adapted by Windows
-    # PowerShell 5.1. Use the typed indexed API, including callback/object ACEs.
+    # Use RawAcl's typed indexed API instead of depending on the shell's
+    # non-generic enumerator adaptation, including callback/object ACEs.
     for ($index = 0; $null -ne $descriptor.DiscretionaryAcl -and $index -lt $descriptor.DiscretionaryAcl.Count; $index++) {
         $ace = $descriptor.DiscretionaryAcl[$index]
         if ($ace -isnot [Security.AccessControl.QualifiedAce]) { throw 'Unsupported filesystem ACE.' }
@@ -194,7 +194,9 @@ function Get-FileSystemSecuritySummary {
             Sid = $ace.SecurityIdentifier.Value
             Mask = $ace.AccessMask
             Allow = ($ace.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed)
-            InheritOnly = (($ace.AceFlags -band [Security.AccessControl.AceFlags]::InheritOnly) -ne 0)
+            # AceFlags has a byte underlying type. PS5.1's enum bitwise binder
+            # can throw InvalidCastException; normalize to integers explicitly.
+            InheritOnly = (([int]$ace.AceFlags -band 0x08) -ne 0)
         }
     }
 

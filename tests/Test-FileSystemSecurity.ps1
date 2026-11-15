@@ -75,4 +75,10 @@ Test-Security 'Every privileged mode performs storage preflight as its first ope
     }
 }
 
+if ($env:OS -eq 'Windows_NT') {
+    Test-Security 'Real Windows security descriptors use native handles and byte-backed ACE flags in every engine lane' {
+        Assert-TrustedFileSystemPath -Path $env:SystemRoot -Directory
+    }
+}
+
 Write-Output "Filesystem security policy: $passed passed."
