@@ -62,12 +62,25 @@ function Get-CiWingetMutationCount {
 Start-Transcript -Path (Join-Path $Root "$Phase.transcript.txt") | Out-Null
 try {
     if ($Phase -eq 'Lifecycle') {
-        Case 'Native Microsoft WinGet provenance, architecture and immutable selection lease' {
-            & (Join-Path $PSScriptRoot 'Test-WinGetTrustNative.ps1') -Root $BaseDir -NativeArchitecture (Get-NativeWindowsArchitecture)
+        # Independent read-only/disposable security fixtures should both emit
+        # evidence even if one fails. Any failure still fails the whole phase.
+        $securityFailures = New-Object 'Collections.Generic.List[string]'
+        try {
+            Case 'Native Microsoft WinGet provenance, architecture and immutable selection lease' {
+                & (Join-Path $PSScriptRoot 'Test-WinGetTrustNative.ps1') -Root $BaseDir -NativeArchitecture (Get-NativeWindowsArchitecture)
+            }
         }
-        Case 'Native request archives and early storage/state/cache trust reject filesystem attacks' {
-            & (Join-Path $PSScriptRoot 'Test-FileSystemSecurityNative.ps1') -Root $BaseDir
+        catch { $securityFailures.Add($_.Exception.Message) }
+
+        try {
+            Case 'Native request archives and early storage/state/cache trust reject filesystem attacks' {
+                & (Join-Path $PSScriptRoot 'Test-FileSystemSecurityNative.ps1') -Root $BaseDir
+            }
         }
+        catch { $securityFailures.Add($_.Exception.Message) }
+
+        if ($securityFailures.Count) { throw ("Native security regression failed: " + ($securityFailures -join '; ')) }
+
         Case 'Actual SYSTEM identity and real MSI installation with per-user defaults into SYSTEM AppData' {
             $arguments = '/i "{0}" ALLUSERS=2 MSIINSTALLPERUSER=1 INSTALLFOLDER="{1}" /qn /norestart /l*v "{2}"' -f $config.Msi, $config.LegacyDir, (Join-Path $Root 'legacy-install.log')
             Check ((Run-Msi $arguments) -eq 0) 'Could not seed the legacy SYSTEM-profile MSI.'

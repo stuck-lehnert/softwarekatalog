@@ -114,6 +114,19 @@ Test-Security 'Native filesystem structure sizes match BOOLEAN, DWORD and pointe
     }
 }
 
+Test-Security 'Native relative requests reject traversal, rooted paths and streams before accessing handles' {
+    foreach ($name in @('', '.', '..', '../victim.json', '..\victim.json', 'C:\victim.json', 'request.json:stream')) {
+        try { [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead($name, $null) }
+        catch {
+            if ($_.Exception.GetBaseException() -isnot [ArgumentException]) { throw }
+
+            continue
+        }
+
+        throw 'An unsafe relative name reached native request handling.'
+    }
+}
+
 if ($env:OS -eq 'Windows_NT') {
     Test-Security 'Real Windows security descriptors use native handles and byte-backed ACE flags in every engine lane' {
         Assert-TrustedFileSystemPath -Path $env:SystemRoot -Directory
