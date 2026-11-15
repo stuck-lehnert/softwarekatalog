@@ -215,7 +215,9 @@ try {
         try { $unexpected = [Softwarekatalog.TrustedFileSystemNative]::OpenRequestRead('victim.json', $directoryLease) }
         catch {
             $cause = $_.Exception.GetBaseException()
-            if ($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -notin @(2, 3, 1920, 4395)) { throw }
+            # STATUS_REPARSE_POINT_NOT_RESOLVED (0xC0000280) maps to
+            # ERROR_CANT_RESOLVE_FILENAME (1921): the bound open refused it.
+            if ($cause -isnot [ComponentModel.Win32Exception] -or $cause.NativeErrorCode -notin @(2, 3, 1920, 1921, 4395)) { throw }
         }
 
         if ($null -ne $unexpected) {
