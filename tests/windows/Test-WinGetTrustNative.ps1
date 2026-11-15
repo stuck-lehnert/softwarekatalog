@@ -17,7 +17,7 @@ function Assert-NativeTrust($Condition, [string]$Message) {
 }
 
 function Assert-NativeDownloadUri([Uri]$Uri) {
-    $allowedHosts = @('api.github.com','github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
+    $allowedHosts = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
     if ($Uri.Scheme -cne 'https' -or $Uri.Port -ne 443 -or $Uri.UserInfo -or $Uri.Host -notin $allowedHosts) {
         throw 'WinGet test download escaped its HTTPS Microsoft GitHub release hosts.'
     }
@@ -44,7 +44,10 @@ function Save-NativeTrustDownload {
                     continue
                 }
 
-                $null = $response.EnsureSuccessStatusCode()
+                if (-not $response.IsSuccessStatusCode) {
+                    throw "Official WinGet download failed with HTTP $([int]$response.StatusCode) at $($Uri.Host)$($Uri.AbsolutePath)."
+                }
+
                 $declaredLength = $response.Content.Headers.ContentLength
                 if ($null -ne $declaredLength -and ($declaredLength -lt 1 -or $declaredLength -gt $MaximumBytes)) {
                     throw 'Native WinGet download exceeds its bounded size.'
@@ -136,6 +139,44 @@ function Read-NativeTrustXml([IO.Stream]$Stream) {
     finally { $reader.Dispose() }
 }
 
+function Get-NativeTrustBundlePackage {
+    param([Xml.XmlDocument]$Manifest, [ValidateSet('x64','arm64')][string]$Architecture)
+
+    $bundleNamespace = 'http://schemas.microsoft.com/appx/2013/bundle'
+    if ($Manifest.DocumentElement.LocalName -cne 'Bundle' -or $Manifest.DocumentElement.NamespaceURI -cne $bundleNamespace) {
+        throw 'Official WinGet bundle has an unsupported bundle manifest schema.'
+    }
+
+    $namespaces = New-Object Xml.XmlNamespaceManager($Manifest.NameTable)
+    $namespaces.AddNamespace('b', $bundleNamespace)
+    $containers = $Manifest.SelectNodes('/b:Bundle/b:Packages', $namespaces)
+    if ($containers.Count -ne 1) { throw 'Official WinGet bundle must have exactly one package container.' }
+
+    # Current real bundles also contain appx/2019/bundle IsStub="true"
+    # application entries for EACH architecture. Those are not full packages.
+    # local-name() alone would count both full and stub and reject every host.
+    $applications = @($containers[0].SelectNodes("*[local-name()='Package' and @Type='application']"))
+    $packages = @($applications | Where-Object {
+        $_.NamespaceURI -ceq $bundleNamespace -and
+        $_.GetAttribute('Architecture') -ceq $Architecture -and
+        $_.GetAttribute('IsStub') -cin @('','false','0')
+    })
+    if ($packages.Count -ne 1) {
+        $available = @($applications | Select-Object -First 16 | ForEach-Object {
+            "file='$($_.GetAttribute('FileName'))', arch='$($_.GetAttribute('Architecture'))', stub='$($_.GetAttribute('IsStub'))', schema='$($_.NamespaceURI)'"
+        }) -join '; '
+        throw "Bundle requires exactly one full native $Architecture application; found $($packages.Count). Available applications: $available"
+    }
+
+    $packageName = $packages[0].GetAttribute('FileName')
+    if (-not $packageName -or $packageName -cne [IO.Path]::GetFileName($packageName) -or
+        $packageName -match '[:\\/]' -or [IO.Path]::GetExtension($packageName) -cne '.msix') {
+        throw 'Full native bundle package entry is not a simple MSIX archive member.'
+    }
+
+    [pscustomobject]@{ FileName = $packageName; Version = $packages[0].GetAttribute('Version') }
+}
+
 function Assert-NativeTrustRejection {
     param([scriptblock]$Body, [string]$Name, [string]$MessagePattern = '.')
 
@@ -212,22 +253,12 @@ $lease = $null
 $originalProtocols = [Net.ServicePointManager]::SecurityProtocol
 try {
     [Net.ServicePointManager]::SecurityProtocol = $originalProtocols -bor [Net.SecurityProtocolType]::Tls12
-    $releasePath = Join-Path $workRoot 'release.json'
-    Save-NativeTrustDownload -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -Destination $releasePath -MaximumBytes 2097152 -TimeoutSeconds 60
-    $release = [IO.File]::ReadAllText($releasePath) | ConvertFrom-Json
-    Assert-NativeTrust (-not $release.draft -and -not $release.prerelease) 'Official latest release is not a stable public release.'
-
+    # GitHub's official stable asset redirect needs no API token and is not
+    # subject to the unauthenticated REST API's shared runner-IP rate limit.
     $assetName = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
-    $assets = @($release.assets | Where-Object { $_.name -ceq $assetName })
-    Assert-NativeTrust ($assets.Count -eq 1) 'Official release does not expose exactly one expected App Installer bundle.'
-    Assert-NativeTrust ($assets[0].size -ge 1 -and $assets[0].size -le 536870912) 'Official bundle size exceeds the 512 MiB test bound.'
-
-    $assetUri = [Uri]$assets[0].browser_download_url
-    Assert-NativeDownloadUri $assetUri
-    Assert-NativeTrust ($assetUri.Host -ceq 'github.com' -and $assetUri.AbsolutePath -cmatch '^/microsoft/winget-cli/releases/download/[^/]+/Microsoft\.DesktopAppInstaller_8wekyb3d8bbwe\.msixbundle$') 'Asset is not the official Microsoft release download.'
+    $assetUri = [Uri]('https://github.com/microsoft/winget-cli/releases/latest/download/' + $assetName)
     $bundlePath = Join-Path $workRoot $assetName
     Save-NativeTrustDownload -Uri $assetUri -Destination $bundlePath -MaximumBytes 536870912
-    Assert-NativeTrust (([IO.FileInfo]$bundlePath).Length -eq $assets[0].size) 'Downloaded bundle length disagrees with release metadata.'
 
     $packagePath = Join-Path $workRoot 'NativePackage.msix'
     $bundle = [IO.Compression.ZipFile]::OpenRead($bundlePath)
@@ -237,13 +268,9 @@ try {
         try { $bundleManifest = Read-NativeTrustXml $manifestStream }
         finally { $manifestStream.Dispose() }
 
-        $packages = @($bundleManifest.SelectNodes("/*[local-name()='Bundle']/*[local-name()='Packages']/*[local-name()='Package']") | Where-Object {
-            $_.GetAttribute('Type') -ceq 'application' -and $_.GetAttribute('Architecture') -ceq $NativeArchitecture
-        })
-        Assert-NativeTrust ($packages.Count -eq 1) 'Bundle does not contain exactly one native application package.'
-        $packageName = $packages[0].GetAttribute('FileName')
-        Assert-NativeTrust ($packageName -and $packageName -ceq [IO.Path]::GetFileName($packageName) -and $packageName -notmatch '[:\\/]') 'Bundle package entry is not a simple archive member.'
-        $packageEntry = Get-NativeTrustZipEntry $bundle $packageName 536870912
+        $selection = Get-NativeTrustBundlePackage -Manifest $bundleManifest -Architecture $NativeArchitecture
+        Write-Output "WinGetNative selected full $NativeArchitecture package '$($selection.FileName)' version $($selection.Version) from $(([IO.FileInfo]$bundlePath).Length)-byte official stable bundle."
+        $packageEntry = Get-NativeTrustZipEntry $bundle $selection.FileName 536870912
         Expand-NativeTrustZipEntry $packageEntry $packagePath 536870912
     }
     finally { $bundle.Dispose() }
@@ -278,7 +305,7 @@ try {
 
     $lease = Open-TrustedWinGetCandidate -Path $wingetPath -Package $package
     Assert-NativeTrust ($lease.Architecture -ceq $NativeArchitecture -and $lease.Stream.CanRead -and -not $lease.Stream.CanWrite) 'Genuine native WinGet lost its authenticated architecture or held read-only handle.'
-    Write-Output "PASS WinGetNative genuine Microsoft release $($release.tag_name) $NativeArchitecture $($lease.Version) passes real filesystem, WinVerifyTrust, Microsoft policy and PE identity"
+    Write-Output "PASS WinGetNative genuine Microsoft stable release $NativeArchitecture $($lease.Version) passes real filesystem, WinVerifyTrust, Microsoft policy and PE identity"
 
     Assert-NativeTrustSharingFailure {
         $writer = [IO.File]::Open($wingetPath, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)

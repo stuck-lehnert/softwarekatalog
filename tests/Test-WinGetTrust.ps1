@@ -6,6 +6,23 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path $PSScriptRoot -Parent) 'modules/WinGet.Trust.ps1')
 Initialize-WinGetTrustNativeApi
 
+# Import only pure native-test helpers, never its SYSTEM/network entry point.
+$nativeTestPath = Join-Path $PSScriptRoot 'windows/Test-WinGetTrustNative.ps1'
+$tokens = $null
+$errors = $null
+$nativeTestAst = [Management.Automation.Language.Parser]::ParseFile($nativeTestPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors -join "`n") }
+
+foreach ($name in @('Assert-NativeDownloadUri','Read-NativeTrustXml','Get-NativeTrustBundlePackage')) {
+    $definition = $nativeTestAst.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
+    }, $true)
+    if ($null -eq $definition) { throw "Native test helper '$name' is missing." }
+
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+
 $script:root = Join-Path ([IO.Path]::GetTempPath()) ('winget-trust-tests-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $script:root | Out-Null
 $script:opened = New-Object 'Collections.Generic.List[IO.FileStream]'
@@ -155,7 +172,82 @@ function New-TestPackage {
         Publisher = $Publisher; Version = [version]'1.27.300.0'; Architecture = $Architecture }
 }
 
+function New-TestBundleManifest {
+    # Models the actual v1.29.380 bundle: foundation full packages plus b5
+    # stubs with the same architecture (and an older package version).
+    $document = New-Object Xml.XmlDocument
+    $document.LoadXml(@'
+<Bundle xmlns="http://schemas.microsoft.com/appx/2013/bundle" xmlns:b5="http://schemas.microsoft.com/appx/2019/bundle" SchemaVersion="5.0">
+  <Packages>
+    <Package Type="resource" Architecture="x64" FileName="AppInstaller_scale-100.msix" />
+    <Package Type="application" Version="1.29.380.0" Architecture="x64" FileName="AppInstaller_x64.msix" />
+    <b5:Package Type="application" Version="1.29.379.0" Architecture="x64" FileName="AppxMetadata\Stub\AppInstaller_x64_stub.msix" IsStub="true" />
+    <Package Type="application" Version="1.29.380.0" Architecture="arm64" FileName="AppInstaller_arm64.msix" />
+    <b5:Package Type="application" Version="1.29.379.0" Architecture="arm64" FileName="AppxMetadata\Stub\AppInstaller_arm64_stub.msix" IsStub="true" />
+    <Package Type="application" Version="1.29.380.0" Architecture="x86" FileName="AppInstaller_x86.msix" />
+    <b5:Package Type="application" Version="1.29.379.0" Architecture="x86" FileName="AppxMetadata\Stub\AppInstaller_x86_stub.msix" IsStub="true" />
+  </Packages>
+</Bundle>
+'@)
+    return ,$document
+}
+
 try {
+    Case 'Native CI downloads the fixed official stable asset without REST API or token dependency' {
+        $source = $nativeTestAst.Extent.Text
+        Assert ($source.Contains('https://github.com/microsoft/winget-cli/releases/latest/download/')) 'Native CI does not use the official latest/download asset.'
+        Assert ($source -notmatch 'https://api\.github\.com|ConvertFrom-Json') 'Native CI still requires the rate-limited release API.'
+        Assert-NativeDownloadUri ([Uri]'https://github.com/microsoft/winget-cli/releases/latest/download/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle')
+        Assert-Throws { Assert-NativeDownloadUri ([Uri]'https://api.github.com/repos/microsoft/winget-cli/releases/latest') } 'escaped its HTTPS'
+    }
+    foreach ($architecture in @('x64','arm64')) {
+        Case "Native CI selects full $architecture from genuine-layout bundle containing same-architecture stubs" {
+            $manifest = New-TestBundleManifest
+            $selected = Get-NativeTrustBundlePackage -Manifest $manifest -Architecture $architecture
+            Assert ($selected.FileName -ceq "AppInstaller_$architecture.msix" -and $selected.Version -ceq '1.29.380.0') 'Stub, resource or wrong architecture replaced the native full package.'
+        }
+    }
+    Case 'Native bundle selection rejects duplicate full packages with useful architecture and file diagnostics' {
+        $manifest = New-TestBundleManifest
+        $full = $manifest.SelectSingleNode("//*[local-name()='Package' and @FileName='AppInstaller_x64.msix']")
+        $null = $full.ParentNode.AppendChild($full.CloneNode($true))
+        Assert-Throws { Get-NativeTrustBundlePackage $manifest x64 } 'full native x64.*found 2.*AppInstaller_x64.msix'
+    }
+    Case 'Native bundle selection cannot fall back to an extension stub when the full native package is absent' {
+        $manifest = New-TestBundleManifest
+        $full = $manifest.SelectSingleNode("//*[local-name()='Package' and @FileName='AppInstaller_arm64.msix']")
+        $null = $full.ParentNode.RemoveChild($full)
+        Assert-Throws { Get-NativeTrustBundlePackage $manifest arm64 } 'full native arm64.*found 0.*AppInstaller_arm64_stub.msix'
+    }
+    Case 'Native bundle selection rejects foreign-schema full packages instead of local-name matching' {
+        $manifest = New-TestBundleManifest
+        $full = $manifest.SelectSingleNode("//*[local-name()='Package' and @FileName='AppInstaller_x64.msix']")
+        $foreign = $manifest.CreateElement('Package', 'https://example.invalid/not-bundle')
+        foreach ($attribute in $full.Attributes) { $foreign.SetAttribute($attribute.Name, $attribute.Value) }
+        $null = $full.ParentNode.ReplaceChild($foreign, $full)
+        Assert-Throws { Get-NativeTrustBundlePackage $manifest x64 } 'found 0.*not-bundle'
+    }
+    Case 'Native bundle selection rejects unsupported root schema' {
+        $manifest = New-TestBundleManifest
+        $manifest.LoadXml($manifest.OuterXml.Replace('http://schemas.microsoft.com/appx/2013/bundle','https://example.invalid/not-bundle'))
+        Assert-Throws { Get-NativeTrustBundlePackage $manifest x64 } 'unsupported bundle manifest schema'
+    }
+    foreach ($stub in @('true','1','unexpected')) {
+        Case "Native bundle selection never accepts foundation package with IsStub=$stub" {
+            $manifest = New-TestBundleManifest
+            $full = $manifest.SelectSingleNode("//*[local-name()='Package' and @FileName='AppInstaller_x64.msix']")
+            $full.SetAttribute('IsStub', $stub)
+            Assert-Throws { Get-NativeTrustBundlePackage $manifest x64 } 'found 0'
+        }
+    }
+    foreach ($path in @('../AppInstaller_x64.msix','AppxMetadata\AppInstaller_x64.msix','C:AppInstaller_x64.msix','AppInstaller_x64.exe')) {
+        Case "Native bundle package name cannot escape fixed MSIX extraction: $path" {
+            $manifest = New-TestBundleManifest
+            $full = $manifest.SelectSingleNode("//*[local-name()='Package' and @FileName='AppInstaller_x64.msix']")
+            $full.SetAttribute('FileName', $path)
+            Assert-Throws { Get-NativeTrustBundlePackage $manifest x64 } 'simple MSIX archive member'
+        }
+    }
     Case 'Native verification structures preserve Windows pointer alignment and signer-chain offsets' {
         foreach ($layout in @(
             @('TrustFile',32,16), @('TrustData',88,52), @('ProviderSigner',64,44),
