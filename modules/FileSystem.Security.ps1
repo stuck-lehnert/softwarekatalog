@@ -180,9 +180,14 @@ function Get-CanonicalLocalPath {
 function Get-FileSystemSecuritySummary {
     param([Parameter(Mandatory)]$Handle)
 
-    $descriptor = [Softwarekatalog.TrustedFileSystemNative]::Security($Handle)
+    try { $descriptor = [Softwarekatalog.TrustedFileSystemNative]::Security($Handle) }
+    catch { throw "Cannot read native filesystem security descriptor: $($_.Exception.ToString())" }
+
     $rules = @()
-    foreach ($ace in $descriptor.DiscretionaryAcl) {
+    # RawAcl's non-generic enumerator is not consistently adapted by Windows
+    # PowerShell 5.1. Use the typed indexed API, including callback/object ACEs.
+    for ($index = 0; $null -ne $descriptor.DiscretionaryAcl -and $index -lt $descriptor.DiscretionaryAcl.Count; $index++) {
+        $ace = $descriptor.DiscretionaryAcl[$index]
         if ($ace -isnot [Security.AccessControl.QualifiedAce]) { throw 'Unsupported filesystem ACE.' }
 
         $rules += [pscustomobject]@{
